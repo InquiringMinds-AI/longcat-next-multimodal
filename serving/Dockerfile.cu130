@@ -1,0 +1,40 @@
+# LongCat-Next multimodal overlay on the CURRENT sglang cu130 base (sm_121/GB10-capable).
+# Base proven to compile+run Triton on sm_121 (the cu129 image could not).
+# Strategy: drop in the 6 new longcat_next files + apply the port's MM-hook patches.
+# The dead 4-bit quant branches in longcat_flash are runtime-gated and inert under w8a8_int8,
+# so they're left in for the first build and cleaned up later.
+FROM lmsysorg/sglang:v0.5.12.post1-cu130
+
+ARG SG=/sgl-workspace/sglang/python/sglang/srt
+
+# --- new multimodal files (verbatim from the port; not present in base) ---
+COPY new_files/longcat_next_mm.py        ${SG}/models/longcat_next_mm.py
+COPY new_files/longcat_next_audio.py     ${SG}/models/longcat_next_audio.py
+COPY new_files/longcat_next_visual.py    ${SG}/models/longcat_next_visual.py
+COPY new_files/longcat_next_heads.py     ${SG}/models/longcat_next_heads.py
+COPY new_files/longcat_next_processor.py ${SG}/models/longcat_next_processor.py
+COPY new_files/proc_longcat_next.py      ${SG}/multimodal/processors/longcat_next.py
+
+# --- multimodal deps: the checkpoint's model_type=longcat_next needs trust_remote_code,
+#     whose HF modeling file imports librosa; also needed for audio modalities ---
+RUN pip install --no-cache-dir librosa soundfile
+
+# --- MM-hook patches onto base LongCat-Flash files (all dry-run-verified to apply) ---
+COPY patches/ /tmp/patches/
+RUN cd /sgl-workspace/sglang && \
+    patch -p1 < /tmp/patches/configs_longcat_flash.patch && \
+    patch -p1 < /tmp/patches/n_gram_embedding.patch && \
+    patch -p1 < /tmp/patches/model_config.patch && \
+    patch -p1 < /tmp/patches/longcat_flash.full.patch
+
+# --- GB10 fix: sglang routes int8 MoE to a CPU op when the HOST is ARM64 (_is_cpu_arm64),
+#     even on GPU. Require actually-on-CPU so the GPU/Triton path runs on the GB10. ---
+RUN sed -i 's/use_intel_amx_backend(layer) or _is_cpu_arm64:/use_intel_amx_backend(layer) or (_is_cpu_arm64 and _is_cpu):/' \
+    ${SG}/layers/quantization/w8a8_int8.py
+
+# --- smoke test: the arch must auto-register and be flagged multimodal ---
+RUN python3 -c "import sglang.srt.models.longcat_next_mm as m; print('import OK:', m.__name__)" && \
+    python3 -c "from sglang.srt.models.registry import ModelRegistry; \
+archs=ModelRegistry.get_supported_archs(); \
+assert 'LongcatNextForCausalLM' in archs, ('NOT REGISTERED', sorted(a for a in archs if 'ongcat' in a)); \
+print('OK registered: LongcatNextForCausalLM')"

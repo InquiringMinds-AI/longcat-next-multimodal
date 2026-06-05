@@ -1,0 +1,26 @@
+# Alternative to run.sh. Set WEIGHTS_DIR to the downloaded weights, then: docker compose up
+# (build once with: docker compose build)
+services:
+  longcat-next:
+    build: .
+    image: longcat-next-gb10
+    container_name: longcat-next
+    runtime: nvidia
+    gpus: all
+    ports:
+      # SECURITY DEFAULT: loopback only. To expose on a network, change to "0.0.0.0:8090:8090"
+      # (or a host IP) AND set LCN_API_KEY below — otherwise the API is unauthenticated.
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - ${WEIGHTS_DIR:?set WEIGHTS_DIR to the downloaded weights directory}:/workspace/model:ro
+      - ./outputs:/workspace/outputs
+    environment:
+      - LCN_OUTPUT_DIR=/workspace/outputs
+      # Required bearer token IF you expose the port off-loopback (clients send
+      # `Authorization: Bearer <secret>`). Leave unset for the loopback-only default.
+      - LCN_API_KEY=${LCN_API_KEY:-}
+      # optional tuning (defaults are model-card values):
+      # - MEM_FRACTION=0.7
+      # - IMAGE_GEN_CFG_SCALE=3.0
+      # - LCN_VERBOSE=0
+    restart: "no"
