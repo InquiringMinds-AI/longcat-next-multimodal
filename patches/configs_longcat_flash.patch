@@ -1,0 +1,16 @@
+diff --git a/python/sglang/srt/configs/longcat_flash.py b/python/sglang/srt/configs/longcat_flash.py
+index a0f887d..2cabdb8 100644
+--- a/python/sglang/srt/configs/longcat_flash.py
++++ b/python/sglang/srt/configs/longcat_flash.py
+@@ -107,6 +107,10 @@ class LongcatFlashConfig(PretrainedConfig):
+         self.hidden_act = "silu"
+         self.use_ngram_embedding = ngram_vocab_size_ratio is not None
+         if self.use_ngram_embedding:
+-            self.ngram_embedding_m = int(ngram_vocab_size_ratio * vocab_size)
++            # Use text_vocab_size for hash function (not vocab_size which may include multimodal tokens)
++            # text_vocab_size comes through kwargs from config.json
++            text_vs = kwargs.pop('text_vocab_size', vocab_size)
++            self.text_vocab_size = text_vs
++            self.ngram_embedding_m = int(ngram_vocab_size_ratio * text_vs)
+             self.ngram_embedding_n = emb_neighbor_num
+             self.ngram_embedding_k = emb_split_num

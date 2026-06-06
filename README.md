@@ -1,102 +1,181 @@
-# LongCat-Next on DGX Spark — full-modality multimodal generation
+<!-- LANG -->
+**English** | [中文](README.zh-CN.md)
 
-Running Meituan's **LongCat-Next** (75B-total / ~A3B-active any-to-any multimodal MoE,
-LongCat-Flash-Lite backbone + MLA attention + N-gram over-embedding, native discrete
-RVQ tokenizers for vision & audio) **end-to-end on a single NVIDIA DGX Spark (GB10,
-128 GB unified memory)** — every understanding *and* generation modality.
+# LongCat-Next on DGX Spark (GB10) — all-modality serving
 
-> **Milestone (2026-06-04).** This repository marks the point at which the *full feature
-> set* was validated working on this hardware. Before this, it was an assumption and a
-> hope. Now, on one GB10:
->
-> | Capability | Status |
-> |---|---|
-> | Understanding — text / image / audio / video → text | ✅ working |
-> | Text generation | ✅ working |
-> | **Image generation** (text → image) | ✅ faithful for natural prompts (operator-judged) |
-> | **Audio generation** (voice-clone speech synthesis) | ✅ intelligible, voice-consistent (operator-judged) |
+[Meituan **LongCat-Next**](https://huggingface.co/meituan-longcat) — a 75B-total / ~A3B-active
+any-to-any multimodal MoE (LongCat-Flash backbone + MLA attention + N-gram over-embedding, native
+RVQ tokenizers for vision and audio) — running **every modality through a single SGLang process on
+one NVIDIA DGX Spark (GB10, `sm_121`)**, behind an **OpenAI-compatible API**:
 
-## The key finding: precision was the lever
+| capability | OpenAI endpoint | status |
+|---|---|:--:|
+| text generation (+ `stream`) | `POST /v1/chat/completions` | ✅ |
+| image / audio / video **understanding** | `POST /v1/chat/completions` | ✅ |
+| **image generation** (text → image) | `POST /v1/images/generations` | ✅ |
+| **voice-clone audio generation** | `POST /v1/audio/speech` | ✅ |
+| tool / function calling | `POST /v1/chat/completions` (`tools`) | ✅ |
 
-Generation looked *broken* for months — image gen produced "trippy abstract art,"
-audio gen produced a "drone." We chased calibration, sampling (CFG, top-k, per-level
-top-k, negative prompts), prompt format, and decode — all of which only changed the
-*flavor* of the wrongness. A teacher-forcing probe then showed the conditional was
-**sound** (fed correct history, the head's argmax reconstructed the source subject); the
-free-run failure was the **rank-4 imprecision of 4-bit NVFP4 compounding into
-autoregressive drift**.
+<sub>(LongCat-Next has no video *generation* — video is understanding-only.)</sub>
 
-**The fix:** load the original BF16 weights as **bitsandbytes int8** and run the model's
-own `generate()`. At 8-bit the *same* pipeline yields faithful images and intelligible
-voice-cloned speech. The entire "broken generation" era was a 4-bit precision artifact —
-the image *tiling* and the audio *drone* were the **same** RVQ level-0 (coarse-layer)
-collapse, exactly as the paper (arXiv 2603.27538, *Lexicalizing Modalities as Discrete
-Tokens*) predicts for its shared RVQ-summation tokenizers.
+Quantized to **`w8a8_int8`** (8-bit weights + per-token int8 activations) — the floor for coherent
+image/audio generation; 4-bit collapses both. One self-contained ~90 GB model, fitting under the GB10
+unified-memory ceiling, validated end-to-end by a [7/7 self-test](#self-test). See `examples/` for a
+sample generated image and voice clip before you download anything.
 
-## How to run (8-bit canonical path — the validated recipe)
+> **How this was built** — getting all of this working took two distinct debugging wins that
+> presented as the *same* symptom: a 4-bit **precision floor**, then a **structural** root cause that
+> masqueraded as precision once serving moved to 8-bit, plus an adversarial multi-agent review that
+> caught a silent MoE scaling bug. The full arc is in **[research/FINDINGS.md](research/FINDINGS.md)**.
 
-Inside `lmsysorg/sglang:v0.5.12.post1-cu130` (aarch64), with the BF16 model at
-`~/models/LongCat-Next`:
+> Built for the GB10/`sm_121` (the cu130 SGLang base is the one whose Triton compiles for `sm_121`).
+> Not expected to run unchanged on other GPUs.
 
+## Prerequisites
+- NVIDIA **DGX Spark (GB10)**, driver + **NVIDIA Container Toolkit** (`--gpus all` works), **Docker**
+- **~100 GB free disk** for the weights
+- Run **headless** (screen off, remote/SSH) for maximum memory headroom
+
+## 1. Download the weights (Hugging Face)
 ```bash
-pip install --break-system-packages transformers==4.57.1 "huggingface-hub<1.0" \
-            accelerate bitsandbytes==0.49.2 librosa soundfile torchcodec
-pip uninstall -y --break-system-packages kernels    # 4.57.1 needs hub<1.0, which breaks kernels 0.14.1
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download <HF_ORG>/<HF_REPO> --local-dir ./longcat-next-gb10-weights
+```
+The weights directory is **self-contained** (~90 GB): quantized backbone + tokenizers + image
+decoder + audio vocoder. Nothing else to fetch.
+
+## 2. Build the image
+```bash
+docker build -t longcat-next-gb10 .
+```
+Layers the LongCat-Next overlay + GB10 fixes onto `lmsysorg/sglang:v0.5.12.post1-cu130` (the base
+pull is the only large download here).
+
+## 3. Run the server
+```bash
+./run.sh ./longcat-next-gb10-weights
+```
+First start loads ~90 GB (a few minutes). When you see `The server is fired up and ready to roll!`,
+the API is live on `http://localhost:8090` and is **OpenAI-compatible across every modality**
+(works with the `openai` SDK / LangChain):
+
+| modality | OpenAI endpoint |
+|---|---|
+| text | `POST /v1/chat/completions` |
+| image / video / audio **understanding** | `POST /v1/chat/completions` (`image_url` / `video_url` / `input_audio` content parts) |
+| **image generation** | `POST /v1/images/generations` |
+| **voice-clone TTS** | `POST /v1/audio/speech` (`voice`: `en`, `zh`, or a container path to a reference clip) |
+
+The native SGLang `/generate` is also exposed (passthrough); the bundled `gen_*`/`understand_*`
+scripts use it. Generated files also land in `./outputs/`.
+
+## Security
+
+This server has **no built-in authentication**, so the defaults keep it off the network:
+
+- **Loopback by default.** `run.sh` and `docker-compose.yml` publish the port on `127.0.0.1:8090`
+  only — reachable from the host, not the LAN.
+- **To expose it on a network**, set both an interface and a key:
+  ```bash
+  LCN_BIND=0.0.0.0 LCN_API_KEY=$(openssl rand -hex 24) ./run.sh ./longcat-next-gb10-weights
+  ```
+  With `LCN_API_KEY` set, every endpoint except `GET /health` requires `Authorization: Bearer <key>`.
+  (`run.sh` warns if you bind off-loopback without a key.)
+- **The native SGLang admin surface is not exposed.** The passthrough proxy is default-deny: only
+  inference/read endpoints (`/generate`, `/get_model_info`, `/v1/models`, …) pass through; mutating
+  control endpoints (`/flush_cache`, `/update_weights*`, profiling, etc.) return `404`.
+- **TTS reference clips are path-contained.** A custom `voice` path must resolve under the bundled
+  voices dir or the mounted output dir (or `LCN_VOICE_DIR`); arbitrary container paths are rejected.
+
+## 4. Test each modality (OpenAI endpoints)
+
+**Text**
+```bash
+curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"longcat-next","messages":[{"role":"user","content":"Name two oceans."}],"max_tokens":24}'
 ```
 
-- **Load:** `BitsAndBytesConfig(load_in_8bit=True, llm_int8_skip_modules=[...heads,tokenizers,lm_head,router...])`,
-  `device_map={"":0}` (fits on-GPU, no offload).
-- **Quirks the scripts handle:** a `Qwen2RMSNorm`→`Qwen2_5_VLRMSNorm` shim; an SDPA
-  varlen fallback patched into every `modular_longcat*` module (the container's
-  `flash_attn` is `None`), including the lazily-loaded image refiner; `model.text_tokenizer = tok`.
-- **Generate:** build the prompt (image-gen ends with `<longcat_img_start>`; audio-gen
-  uses the spk_syn chat template ending in `<longcat_audiogen_start>`), then
-  `model.generate(...)`. Decode via the model's built-in `decode_visual_ids_and_save` /
-  `decode_audio_ids_and_save`.
+**Image generation** (returns base64 PNG, OpenAI images schema)
+```bash
+curl -s localhost:8090/v1/images/generations -H 'Content-Type: application/json' \
+  -d '{"prompt":"A photograph of a red apple on a wooden table.","response_format":"b64_json"}'
+```
 
-See `scripts/q8_unified.py` for one load serving all five task types, and
-`scripts/q8_imagegen.py` / `scripts/q8_audio.py` for the single-modality drivers.
+**Voice-clone TTS** (returns audio/wav; `voice`=`en`|`zh`|a container path)
+```bash
+curl -s localhost:8090/v1/audio/speech -H 'Content-Type: application/json' \
+  -d '{"input":"The quick brown fox jumps over the lazy dog.","voice":"en"}' -o speech.wav
+```
 
-## Hardware reality
+**Image / video / audio understanding** — `/v1/chat/completions` with an `image_url`,
+`video_url`, or `input_audio` content part (standard OpenAI multimodal messages), e.g.:
+```bash
+curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model":"longcat-next","max_tokens":80,
+  "messages":[{"role":"user","content":[
+    {"type":"text","text":"Describe this image."},
+    {"type":"image_url","image_url":{"url":"data:image/png;base64,<BASE64>"}}]}]}'
+```
 
-- 8-bit footprint is **~110 GB allocated / ~114.6 GB reserved** — *right at* the GB10
-  crash-to-off ceiling (~110–115 GB). Near-zero margin; safe for a single process, tight
-  for sustained serving. (The BF16-kept multimodal modules — tokenizers, decoders, the
-  282k-row embedding — are the consumers, not KV cache.)
-- **MLA makes KV cache nearly free** (~16 KB/token: 14 layers × (kv_lora_rank 512 +
-  rope 64) × 2B), so context is never the constraint here.
-- Full **BF16 from disk is blocked** on GB10: accelerate `device_map` offload leaves
-  ~7,870 expert weights on `meta` (disk-offload broken for this custom MoE). 8-bit
-  on-GPU is the working substitute. See `scripts/bf16_imagegen.py` for the attempt.
+> Also available: the bundled scripts `gen_image.py`, `gen_audio.py`, `understand_video.py`
+> (under `/workspace/scripts/`) and the native SGLang `/generate` endpoint.
+> Text chat supports **`stream: true`** (SSE), like the OpenAI API.
 
-## Layout
+## Self-test
 
-- `scripts/` — the **8-bit canonical path** (`q8_*.py`, the breakthrough) + the
-  generation/decode machinery (`gen_*`, `persistent_*`, `decode_*`, `teacher_force_image.py`).
-- `overlay/` — the earlier **sglang 4-bit NVFP4 port** modules + launchers (the original
-  effort; superseded for *generation* by the 8-bit canonical path, but it carries the
-  serving infrastructure — see "next").
-- `calibration/` — streaming per-expert NF4 calibration on Spark (`stream_calibrate.py`)
-  + sequence builders. (Calibration turned out **not** to be the generation lever;
-  precision was. Kept for completeness.)
+Verify every modality works end-to-end on your machine:
+```bash
+docker exec longcat-next python3 /workspace/scripts/selftest.py
+```
+Prints PASS/FAIL for text, image gen, image understanding, audio gen, audio understanding, and video
+understanding; exits non-zero if any fail.
 
-## Known residuals (not precision-related)
+## Tuning (env vars)
 
-- Abstract / empty-background / single-object-on-blank prompts (e.g. "a red circle on
-  white") still degrade — a composition/OOD issue, not precision.
-- Background **text-bleed** (garbled signs/watermarks) survives 8-bit — a model/training trait.
+Set at `docker run -e …` (or in `docker-compose.yml`). Defaults are the model-card values:
+`MEM_FRACTION` (0.7), `MAX_TOTAL_TOKENS` (8192), `IMAGE_GEN_CFG_SCALE` (3.0),
+`IMAGE_GEN_TEMPERATURE`/`IMAGE_GEN_TOP_K`/`IMAGE_GEN_TOP_P`, `AUDIO_GEN_TEMPERATURE`/`AUDIO_GEN_TOP_K`,
+`REFINER_STEPS` (10; raise toward 28 for max image fidelity at ~1.5× latency),
+and `LCN_VERBOSE=1` for per-step debug logging.
 
-## Next: real serving
+## Example outputs
 
-`q8_unified.py` is a **capability proof-of-concept** (one load, route by modality), not a
-server — no batching, concurrency, per-call sampling, or prefix-cache reuse. Those
-features *are* a serving stack, and the `overlay/` sglang port already implements them
-(continuous batching, RadixAttention prefix cache, async concurrency, per-request
-`SamplingParams`, OpenAI API). The original port's generation looked dead because it ran
-at 4-bit; now that precision is known to be the fix, the production path is **the sglang
-port at 8-bit** — leveraging its serving infrastructure with the now-validated precision.
+See `examples/` for a sample generated image and voice-clone clip, so you know the expected quality
+before downloading the weights.
 
-## Credit
+## Troubleshooting
 
-LongCat-Next and its tokenizers © Meituan (MIT). sglang © the SGLang team (Apache-2.0).
-This repo is the Spark bring-up, debugging, and the 8-bit generation recipe.
+- **Cold start ~5–8 min** (loads ~90 GB). `GET /health` returns `503 {"status":"loading"}` until
+  ready, then `200 {"status":"ok"}`. A `503 "backend unavailable"` from any endpoint means it's still loading.
+- **Box powers off mid-run** → you crossed the GB10 unified-memory ceiling (~115 GB). Serve
+  headless, don't run other heavy GPU work alongside, and don't raise `MEM_FRACTION`.
+- **First image is slow (~4–5 min)** — 1369 visual tokens + diffusion refine; audio is near-real-time.
+
+## Notes
+- **Memory ceiling.** GB10 unified memory has a hard ceiling (~115 GB headless) beyond which the box
+  powers off. This config runs well under it; keep the machine headless while serving.
+- **Audio length is model-decided** — output runs as long as the text requires, with no task-length
+  floor; a ~40s (1000-frame) safety backstop only guards against runaway generation.
+- **First image** ~4–5 min (1369 visual tokens + diffusion refine); audio is near-real-time.
+
+## Repository layout
+
+```
+.                       the runnable package (this README, Dockerfile, run.sh, …)
+├── gateway.py          OpenAI-compatible gateway fronting SGLang (all modalities + tools)
+├── longcat_tools.py    tool-calling: TS-namespace prompt build + <longcat_tool_call> XML parse
+├── entrypoint.sh       SGLang + gateway process supervision
+├── new_files/          the LongCat-Next SGLang overlay (models / layers / processors)
+├── patches/            container build patches
+├── quantize/           the w8a8_int8 export tooling (how the weights were made)
+├── test/               selftest.py + per-modality example clients
+├── voices/             TTS reference clips (en: public-domain LibriVox, zh: Meituan MIT)
+├── examples/           a sample generated image + voice clip
+└── research/           HOW THIS WAS BUILT — the engineering narrative + proof tooling
+    ├── FINDINGS.md       the debugging arc (start here)
+    └── oracle/           the bnb-int8 capability proof + soundness probes
+```
+
+## Credits & license
+Model: **Meituan LongCat-Next** (MIT). Serving stack: **SGLang**. English demo voice: public-domain
+**LibriVox** narration. Chinese demo voice: Meituan's LongCat example clip (MIT). See [LICENSE](LICENSE).

@@ -1,9 +1,21 @@
+# Python
 __pycache__/
 *.pyc
+
+# Editor / backup
 *.bak
 *.bak-*
-*.pt
-*.wav
-*.png
+
+# Model weights — downloaded separately from Hugging Face (see README)
+longcat-next-gb10-weights/
 *.safetensors
+*.gguf
+*.pt
+
+# Generated artifacts at runtime
+outputs/
 /tmp/
+
+# NOTE: examples/ and voices/ media (*.png / *.wav) are intentionally tracked —
+# they ship with the package (demo outputs + TTS reference clips). No blanket
+# *.png / *.wav ignore here.

@@ -1,9 +1,0 @@
-# TEXT-PROOF ONLY: temporarily de-register LongcatNext as multimodal so sglang skips
-# AutoProcessor (which breaks under transformers 5.6 on this model's processor auto_map).
-# Lets us validate int8 MoE serving / kernel / footprint on text WITHOUT the multimodal
-# processor. The MLA/attention special-cases (lines 608/775) are left intact.
-# NOT the production image — the real fix is porting LongcatNextProcessor to transformers 5.6.
-FROM sglang-longcat:cu130
-RUN sed -i '/^[[:space:]]*"LongcatNextForCausalLM",[[:space:]]*$/d' \
-    /sgl-workspace/sglang/python/sglang/srt/configs/model_config.py && \
-    grep -c LongcatNext /sgl-workspace/sglang/python/sglang/srt/configs/model_config.py
