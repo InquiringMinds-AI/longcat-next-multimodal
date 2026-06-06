@@ -283,8 +283,11 @@ class LongcatFlashMoE(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
         )
-        # smooth_scale ships as ones (SmoothQuant was a no-op detour, not the precision fix). Kept as
-        # a persistent buffer because the shipped checkpoint contains it; the divide below is identity.
+        # Per-channel SmoothQuant scales (alpha=0.5) for the MoE gate/up projections. The checkpoint's
+        # int8 expert gate/up weights were re-quantized with these scales absorbed (W*s), and the
+        # forward divides the matching activations by smooth_scale, so (X/s)*(W*s) == X*W holds at int8.
+        # LOAD-BEARING — the divide below is NOT identity; the real scales load from
+        # model-smoothscale.safetensors. The ones() here is just the pre-load default.
         self.register_buffer("smooth_scale", torch.ones(config.hidden_size, dtype=torch.float32), persistent=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

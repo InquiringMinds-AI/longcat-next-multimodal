@@ -6,7 +6,7 @@
 [Meituan **LongCat-Next**](https://huggingface.co/meituan-longcat) — a 75B-total / ~A3B-active
 any-to-any multimodal MoE (LongCat-Flash backbone + MLA attention + N-gram over-embedding, native
 RVQ tokenizers for vision and audio) — running **every modality through a single SGLang process on
-one NVIDIA DGX Spark (GB10, `sm_121`)**, behind an **OpenAI-compatible API**:
+a single NVIDIA GB10 system (`sm_121`)**, behind an **OpenAI-compatible API**:
 
 | capability | OpenAI endpoint | status |
 |---|---|:--:|
@@ -18,28 +18,30 @@ one NVIDIA DGX Spark (GB10, `sm_121`)**, behind an **OpenAI-compatible API**:
 
 <sub>(LongCat-Next has no video *generation* — video is understanding-only.)</sub>
 
-Quantized to **`w8a8_int8`** (8-bit weights + per-token int8 activations) — the floor for coherent
-image/audio generation; 4-bit collapses both. One self-contained ~90 GB model, fitting under the GB10
-unified-memory ceiling, validated end-to-end by a [7/7 self-test](#self-test). See `examples/` for a
+Quantized to **`w8a8_int8`** (8-bit weights + per-token int8 activations) — switching to 8-bit is what
+made image and audio generation coherent (4-bit collapsed both). We didn't re-test 4-bit after later
+fixes, so it's the *validated* setting, not a proven minimum. One self-contained ~90 GB model that runs
+comfortably on a GB10, validated end-to-end by a [7/7 self-test](#self-test). See `examples/` for a
 sample generated image and voice clip before you download anything.
 
-> **How this was built** — getting all of this working took two distinct debugging wins that
-> presented as the *same* symptom: a 4-bit **precision floor**, then a **structural** root cause that
-> masqueraded as precision once serving moved to 8-bit, plus an adversarial multi-agent review that
-> caught a silent MoE scaling bug. The full arc is in **[research/FINDINGS.md](research/FINDINGS.md)**.
+> **How this was built** — getting all of this working took two separate fixes that looked like one
+> bug (incoherent generation): switching to 8-bit, then a **structural** fix in the serving path (a
+> dropped spatial anchor) — plus an adversarial multi-agent review that caught a silent MoE scaling
+> bug. The full arc is in **[research/FINDINGS.md](research/FINDINGS.md)**.
 
-> Built for the GB10/`sm_121` (the cu130 SGLang base is the one whose Triton compiles for `sm_121`).
-> Not expected to run unchanged on other GPUs.
+> Built for the GB10 superchip (`sm_121`) — validated on a DGX Spark, expected to run on any
+> GB10-based system (the dependency is the chip, not the product). The cu130 SGLang base is the one
+> whose Triton compiles for `sm_121`; not expected to run on other GPUs.
 
 ## Prerequisites
-- NVIDIA **DGX Spark (GB10)**, driver + **NVIDIA Container Toolkit** (`--gpus all` works), **Docker**
+- NVIDIA **GB10 system** (e.g. DGX Spark), driver + **NVIDIA Container Toolkit** (`--gpus all` works), **Docker**
 - **~100 GB free disk** for the weights
 - Run **headless** (screen off, remote/SSH) for maximum memory headroom
 
 ## 1. Download the weights (Hugging Face)
 ```bash
 pip install -U "huggingface_hub[cli]"
-huggingface-cli download <HF_ORG>/<HF_REPO> --local-dir ./longcat-next-gb10-weights
+huggingface-cli download InquiringMinds-AI/LongCat-Next-w8a8-int8-GB10 --local-dir ./longcat-next-gb10-weights
 ```
 The weights directory is **self-contained** (~90 GB): quantized backbone + tokenizers + image
 decoder + audio vocoder. Nothing else to fetch.
@@ -130,10 +132,22 @@ docker exec longcat-next python3 /workspace/scripts/selftest.py
 Prints PASS/FAIL for text, image gen, image understanding, audio gen, audio understanding, and video
 understanding; exits non-zero if any fail.
 
+## Context length
+
+Defaults to the model's **native 128k** (`max_total_tokens` 131072). MLA makes the KV cache cheap
+(~16 KB/token), so long context is nearly free — the limiter is just `--mem-fraction-static`, which is
+set to fit the full 128k pool.
+
+Set **`LCN_YARN=1`** to extend to **256k via YaRN** (RoPE factor 2). It's opt-in because YaRN can
+slightly affect short-context / generation quality; the default keeps the unscaled 128k path. Both
+modes pass the self-test and stay well under the GB10's memory headroom (128k peaks ~95 GB, 256k
+~101 GB during a full generation pass). Verified: a 28k-token prompt recalls a fact planted at its start.
+
 ## Tuning (env vars)
 
-Set at `docker run -e …` (or in `docker-compose.yml`). Defaults are the model-card values:
-`MEM_FRACTION` (0.7), `MAX_TOTAL_TOKENS` (8192), `IMAGE_GEN_CFG_SCALE` (3.0),
+Set at `docker run -e …` (or in `docker-compose.yml`):
+`MEM_FRACTION` (0.72; 0.74 under `LCN_YARN`), `MAX_TOTAL_TOKENS` (131072; 262144 under `LCN_YARN`),
+`LCN_YARN` (0), `IMAGE_GEN_CFG_SCALE` (3.0),
 `IMAGE_GEN_TEMPERATURE`/`IMAGE_GEN_TOP_K`/`IMAGE_GEN_TOP_P`, `AUDIO_GEN_TEMPERATURE`/`AUDIO_GEN_TOP_K`,
 `REFINER_STEPS` (10; raise toward 28 for max image fidelity at ~1.5× latency),
 and `LCN_VERBOSE=1` for per-step debug logging.
@@ -147,13 +161,13 @@ before downloading the weights.
 
 - **Cold start ~5–8 min** (loads ~90 GB). `GET /health` returns `503 {"status":"loading"}` until
   ready, then `200 {"status":"ok"}`. A `503 "backend unavailable"` from any endpoint means it's still loading.
-- **Box powers off mid-run** → you crossed the GB10 unified-memory ceiling (~115 GB). Serve
-  headless, don't run other heavy GPU work alongside, and don't raise `MEM_FRACTION`.
+- **Box powers off mid-run** → you're using too much GPU memory; serve headless, don't run other
+  heavy GPU work alongside, and don't raise `MEM_FRACTION`.
 - **First image is slow (~4–5 min)** — 1369 visual tokens + diffusion refine; audio is near-real-time.
 
 ## Notes
-- **Memory ceiling.** GB10 unified memory has a hard ceiling (~115 GB headless) beyond which the box
-  powers off. This config runs well under it; keep the machine headless while serving.
+- **Optimized for headless GB10 operation** at time of publishing — serve with the screen off /
+  remote-only for maximum memory headroom.
 - **Audio length is model-decided** — output runs as long as the text requires, with no task-length
   floor; a ~40s (1000-frame) safety backstop only guards against runaway generation.
 - **First image** ~4–5 min (1369 visual tokens + diffusion refine); audio is near-real-time.

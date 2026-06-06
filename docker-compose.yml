@@ -19,8 +19,10 @@ services:
       # Required bearer token IF you expose the port off-loopback (clients send
       # `Authorization: Bearer <secret>`). Leave unset for the loopback-only default.
       - LCN_API_KEY=${LCN_API_KEY:-}
-      # optional tuning (defaults are model-card values):
-      # - MEM_FRACTION=0.7
+      # optional tuning:
+      # - LCN_YARN=1          # extend context 128k -> 256k via YaRN (opt-in; see README)
+      # - MEM_FRACTION=0.72   # 0.74 is the default under LCN_YARN
+      # - MAX_TOTAL_TOKENS=131072
       # - IMAGE_GEN_CFG_SCALE=3.0
       # - LCN_VERBOSE=0
     restart: "no"

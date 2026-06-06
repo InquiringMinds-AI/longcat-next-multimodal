@@ -1,15 +1,17 @@
 # Findings — the road to working all-modality serving
 
-The engineering arc behind this project, recorded so the reasoning is legible and the
-eliminated hypotheses don't get re-chased. The short version: getting every modality of
-LongCat-Next working on one GB10 took **two** distinct debugging wins that presented as the
-*same* symptom — incoherent generation — but had unrelated root causes. The first was a
-**precision floor**; the second was a **structural omission** that only surfaced once
-precision was no longer the problem.
+The engineering arc behind this project. The short version: getting every modality of
+LongCat-Next working on one GB10 took two debugging wins that looked like the same bug —
+incoherent generation. We moved to 8-bit, then found and fixed a structural omission in the
+serving generation loop.
+
+One note on precision: 8-bit (`w8a8_int8`) is what we validated. An earlier 4-bit (NVFP4)
+attempt generated incoherently, but it ran on the still-buggy serving pipeline and was never
+retried after the fixes below — so 8-bit is the validated setting, not a proven floor.
 
 ---
 
-## Act I — generation looked broken, and precision was the lever
+## Act I — generation looked broken; moving to 8-bit produced coherent output
 
 For weeks, generation produced output that was color- and texture-plausible but
 structurally wrong: **images "tiled" into abstract fur/texture with no global composition;
@@ -50,12 +52,11 @@ over 324×8 steps. A *sharpness* deficit in the 4-bit conditional, not content-b
 
 ### The fix
 
-Load the original BF16 weights as **bitsandbytes int8** and run the model's own
-`generate()`. At 8-bit the *same* pipeline produced faithful images and intelligible
-voice-cloned speech (operator-judged). Image *tiling* and audio *drone* were the **same**
-defect — RVQ level-0 (coarse-layer) collapse — and 8-bit crossed the floor for both at
-once. This matches the shared-RVQ-summation tokenizer behavior described in arXiv
-2603.27538, *Lexicalizing Modalities as Discrete Tokens*.
+Loading the BF16 weights as **bitsandbytes int8** and running the model's own `generate()`
+produced faithful images and intelligible voice-cloned speech. The image tiling and audio
+drone looked like one defect — RVQ level-0 (coarse-layer) collapse — consistent with the
+shared-RVQ-summation tokenizer behavior in arXiv 2603.27538, *Lexicalizing Modalities as
+Discrete Tokens*.
 
 `oracle/q8_unified.py` is the capability proof: one 8-bit load serving all five task types.
 **But it is not a server** — no batching, concurrency, per-request sampling, or prefix
@@ -66,13 +67,15 @@ cache. It proved the model *can*; it didn't make the model *serve*.
 ## Act II — at 8-bit, on a real server, images still tiled — and precision wasn't it
 
 Moving the validated 8-bit precision into a real SGLang serving stack (continuous batching,
-RadixAttention, OpenAI API), the backbone now ran at `w8a8_int8` — **8-bit, the precision
-question already settled.** And the images *still tiled.*
+RadixAttention, OpenAI API), the backbone now ran at `w8a8_int8` — **already at 8-bit, the
+precision we'd moved to in Act I.** And the images *still tiled.*
 
-The reflex was to suspect precision again. It wasn't. The serving leg ran entirely at
-8-bit; the precision floor had been crossed in Act I. Chasing it again — a SmoothQuant
-detour on the gate/up projections — had **zero effect**, which only re-confirmed precision
-was not the serving lever.
+The reflex was to suspect precision again. But the serving leg ran entirely at 8-bit — the
+same precision that had produced coherent generation in Act I — so precision wasn't the
+variable that changed here. (SmoothQuant on the MoE gate/up
+projections is part of the int8 quant recipe — it migrates activation outliers into the
+weights — but it is a quantization-quality measure, not the fix for this bug; see the model
+card for what it is and does.)
 
 The real cause was **structural**. The HF oracle's `prepare_inputs_for_generation`
 auto-inserts a spatial anchor between the prompt and `image_start`:
@@ -123,10 +126,10 @@ generation, and tool calling — behind an **OpenAI-compatible API**, quantized 
 
 ## Hardware reality (constant throughout)
 
-- The 8-bit footprint sits **right under the GB10 unified-memory ceiling (~115 GB
-  headless)**, beyond which the box powers fully off (not an OOM-kill — a power-down). The
-  consumers are the BF16-kept multimodal modules (tokenizers, decoders, the 282k-row
-  over-embedding), **not** KV cache.
+- The 8-bit footprint runs headless on one GB10 with comfortable margin. Worth knowing when
+  budgeting: the memory is consumed by the BF16-kept multimodal modules (tokenizers, decoders,
+  the 282k-row over-embedding), **not** KV cache — so leave headroom there, not for context.
+  (Over-allocating GPU memory on this box is unusually unforgiving; serve headless.)
 - **MLA makes KV cache nearly free** (~16 KB/token), so context length is never the
   constraint here — the levers that make serving fit are `--mem-fraction-static` and the
   paged KV pool, not cache eviction.

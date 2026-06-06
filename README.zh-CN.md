@@ -3,7 +3,7 @@
 
 # 在 DGX Spark (GB10) 上运行 LongCat-Next —— 全模态推理服务
 
-在单台 **NVIDIA DGX Spark（GB10，`sm_121`）** 上，通过**单个 SGLang 进程**运行[美团 **LongCat-Next**](https://huggingface.co/meituan-longcat)（75B 总参 / ~A3B 激活的任意到任意多模态 MoE），并提供**兼容 OpenAI 的全模态接口**：
+在单台 **NVIDIA GB10 系统（`sm_121`）** 上，通过**单个 SGLang 进程**运行[美团 **LongCat-Next**](https://huggingface.co/meituan-longcat)（75B 总参 / ~A3B 激活的任意到任意多模态 MoE），并提供**兼容 OpenAI 的全模态接口**：
 
 | 能力 | OpenAI 接口 | 状态 |
 |---|---|:--:|
@@ -15,22 +15,22 @@
 
 <sub>（LongCat-Next 不支持视频**生成**，视频仅支持理解。）</sub>
 
-量化为 **`w8a8_int8`**（8-bit 权重 + 逐 token int8 激活）—— 这是图像/音频生成保持连贯的下限；4-bit 会导致两者都崩溃。单个自包含约 90 GB 模型，稳定低于 GB10 内存上限，并通过 [7/7 自检](#自检)端到端验证。
+量化为 **`w8a8_int8`**（8-bit 权重 + 逐 token int8 激活）—— 切换到 8-bit 正是图像与音频生成变得连贯的关键（4-bit 下两者都崩溃）。我们未在后续修复之后重新测试 4-bit，因此 8-bit 是*经过验证*的设置，而非已证实的下限。单个自包含约 90 GB 模型，在单台 GB10 上稳定运行，并通过 [7/7 自检](#自检)端到端验证。
 
-> **构建历程** —— 让全部模态跑通经历了两个表现为*同一症状*的独立调试突破：一个 4-bit **精度下限**，以及在转入 8-bit 服务后伪装成精度问题的**结构性**根因，外加一次发现了静默 MoE 缩放 bug 的对抗式多智能体评审。完整历程见 **[research/FINDINGS.md](research/FINDINGS.md)**。
+> **构建历程** —— 让全部模态跑通，需要解开两个看似同一症状（生成不连贯）的独立问题：切换到 8-bit，以及服务流程中的一处**结构性**修复（被丢弃的空间锚点）—— 外加一次发现了静默 MoE 缩放 bug 的对抗式多智能体评审。完整历程见 **[research/FINDINGS.md](research/FINDINGS.md)**。
 
-> 专为 GB10/`sm_121` 构建（只有 cu130 的 SGLang 基础镜像能为 `sm_121` 编译 Triton）。
-> 在其他 GPU 上不保证可直接运行。
+> 专为 GB10 超级芯片（`sm_121`）构建 —— 已在 DGX Spark 上验证，预期可在任何基于 GB10 的机器上运行
+> （依赖的是芯片而非具体产品）。只有 cu130 的 SGLang 基础镜像能为 `sm_121` 编译 Triton；在其他 GPU 上不保证运行。
 
 ## 环境要求
-- NVIDIA **DGX Spark（GB10）**、驱动 + **NVIDIA Container Toolkit**（`--gpus all` 可用）、**Docker**
+- NVIDIA **GB10 系统**（如 DGX Spark）、驱动 + **NVIDIA Container Toolkit**（`--gpus all` 可用）、**Docker**
 - **约 100 GB 可用磁盘空间**用于权重
 - 建议**无头运行**（关闭屏幕、仅远程/SSH）以获得最大内存余量
 
 ## 1. 下载权重（Hugging Face）
 ```bash
 pip install -U "huggingface_hub[cli]"
-huggingface-cli download <HF_ORG>/<HF_REPO> --local-dir ./longcat-next-gb10-weights
+huggingface-cli download InquiringMinds-AI/LongCat-Next-w8a8-int8-GB10 --local-dir ./longcat-next-gb10-weights
 ```
 权重目录是**自包含的**（约 90 GB）：量化主干 + 分词器 + 图像解码器 + 音频声码器。无需额外下载。
 
@@ -116,10 +116,20 @@ docker exec longcat-next python3 /workspace/scripts/selftest.py
 ```
 逐项打印文本、图像生成、图像理解、音频生成、音频理解、视频理解的 PASS/FAIL；任一失败则以非零码退出。
 
+## 上下文长度
+
+默认即模型**原生 128k**（`max_total_tokens` 131072）。MLA 使 KV 缓存非常廉价（约 16 KB/token），
+因此长上下文几乎免费 —— 限制因素只是 `--mem-fraction-static`，已设为可容纳完整 128k 池。
+
+设置 **`LCN_YARN=1`** 可通过 YaRN（RoPE 因子 2）扩展到 **256k**。这是可选项，因为 YaRN 可能略微
+影响短上下文 / 生成质量；默认保留未缩放的 128k 路径。两种模式都通过自检，且都稳妥低于 GB10 的显存余量
+（完整生成过程中 128k 峰值约 95 GB，256k 约 101 GB）。已验证：一段 28k token 的提示能正确召回置于开头的事实。
+
 ## 调参（环境变量）
 
-在 `docker run -e …`（或 `docker-compose.yml`）中设置，默认值即 model card 中的取值：
-`MEM_FRACTION`（0.7）、`MAX_TOTAL_TOKENS`（8192）、`IMAGE_GEN_CFG_SCALE`（3.0）、
+在 `docker run -e …`（或 `docker-compose.yml`）中设置：
+`MEM_FRACTION`（0.72；`LCN_YARN` 下为 0.74）、`MAX_TOTAL_TOKENS`（131072；`LCN_YARN` 下为 262144）、
+`LCN_YARN`（0）、`IMAGE_GEN_CFG_SCALE`（3.0）、
 `IMAGE_GEN_TEMPERATURE`/`IMAGE_GEN_TOP_K`/`IMAGE_GEN_TOP_P`、`AUDIO_GEN_TEMPERATURE`/`AUDIO_GEN_TOP_K`、
 `REFINER_STEPS`（10；调高至 28 可获得最高图像保真度，延迟约 1.5 倍），
 以及 `LCN_VERBOSE=1`（逐步调试日志）。
@@ -132,11 +142,11 @@ docker exec longcat-next python3 /workspace/scripts/selftest.py
 
 - **冷启动约 5–8 分钟**（加载约 90 GB）。就绪前 `GET /health` 返回 `503 {"status":"loading"}`，
   就绪后返回 `200 {"status":"ok"}`；任何接口返回 `503 "backend unavailable"` 表示仍在加载。
-- **运行中整机断电** → 触碰了 GB10 统一内存上限（约 115 GB）。请无头运行、不要同时跑其他重度 GPU 任务、不要调高 `MEM_FRACTION`。
+- **运行中整机断电** → GPU 显存占用过高；请无头运行、不要同时跑其他重度 GPU 任务、不要调高 `MEM_FRACTION`。
 - **首张图像较慢（约 4–5 分钟）** —— 1369 个视觉 token + 扩散精修；音频接近实时。
 
 ## 注意事项
-- **内存上限。** GB10 统一内存存在硬性上限（无头约 115 GB），超过会导致整机断电关机。本配置远低于该上限；推理时请保持无头运行。
+- **面向无头 GB10 运行优化**（发布时）—— 请以关屏 / 纯远程方式运行，以获得最大显存余量。
 - **音频时长由模型决定** —— 输出长度匹配文本所需，没有任务长度下限；仅有约 40 秒（1000 帧）的安全上限用于防止失控生成。
 - **首张图像**约需 4–5 分钟（1369 个视觉 token + 扩散精修）；音频接近实时。
 
