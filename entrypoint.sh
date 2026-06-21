@@ -26,6 +26,7 @@ fi
 
 python3 -m sglang.launch_server \
   --model-path "$MODEL_PATH" \
+  --served-model-name "${LCN_MODEL_NAME:-longcat-next}" \
   --port "$INTERNAL" --host 127.0.0.1 \
   --trust-remote-code \
   --json-model-override-args "$OVERRIDE" \
