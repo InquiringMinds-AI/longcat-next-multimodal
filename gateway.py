@@ -27,6 +27,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoTokenizer
 from longcat_tools import build_tools_system_block, parse_tool_calls
+from anthropic_route import router as anthropic_router
 
 SGLANG = "http://localhost:%s" % os.environ.get("SGLANG_INTERNAL_PORT", "30000")
 MODEL = os.environ.get("MODEL_PATH", "/workspace/model")
@@ -45,11 +46,20 @@ AUDIO_INSTR = "用这个声音合成以下内容："
 # Optional bearer-token auth. Unset (default) => no auth, which is safe ONLY because run.sh/compose
 # publish to 127.0.0.1 by default. If you expose the port on a network, set LCN_API_KEY.
 API_KEY = os.environ.get("LCN_API_KEY", "").strip()
+# LCN_AGENT=1 = agentic/understanding profile: image+audio GENERATION endpoints are
+# refused so their heads never lazily allocate (~25GB on a 128GB GB10) — that budget is
+# instead spent on the full-context KV pool (see entrypoint.sh). Understanding of all
+# modalities (image/audio/video INPUT) still works.
+AGENT_MODE = os.environ.get("LCN_AGENT", "0").strip() == "1"
 # Catch-all proxy is DEFAULT-DENY: only inference/read-only SGLang endpoints pass through. The
 # mutating admin surface (/flush_cache, /update_weights*, /release_memory_occupation, /*_profile,
 # session + expert-distribution control, …) is NOT exposed — it could DoS or hijack the server.
 PROXY_ALLOW = {"generate", "get_model_info", "get_server_info", "health", "health_generate",
                "v1/models", "v1/completions", "v1/embeddings", "encode", "classify"}
+if AGENT_MODE:
+    # raw /generate could carry generation-head prompts (<longcat_img_start> etc.) and
+    # lazily allocate the ~25GB heads agent mode exists to avoid — close it too.
+    PROXY_ALLOW = PROXY_ALLOW - {"generate"}
 # Custom TTS reference clips must resolve UNDER one of these dirs (the bundled voices, or the
 # user-mounted output dir) — a raw `voice` path would otherwise read any file in the container.
 VOICE_DIRS = tuple(os.path.realpath(d) for d in
@@ -57,6 +67,7 @@ VOICE_DIRS = tuple(os.path.realpath(d) for d in
 
 tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
 app = FastAPI(title="LongCat-Next OpenAI gateway")
+app.include_router(anthropic_router)  # Anthropic Messages API (/v1/messages) — Claude Code etc.
 _client = httpx.AsyncClient(timeout=httpx.Timeout(1800.0))
 
 
@@ -66,6 +77,8 @@ async def _auth(request: Request, call_next):
     if API_KEY and request.url.path != "/health":
         hdr = request.headers.get("authorization", "")
         token = hdr[7:].strip() if hdr[:7].lower() == "bearer " else ""
+        # Anthropic-native clients (Claude Code with ANTHROPIC_API_KEY) send x-api-key instead.
+        token = token or request.headers.get("x-api-key", "").strip()
         if not hmac.compare_digest(token, API_KEY):
             return JSONResponse({"error": {"message": "invalid or missing API key"}}, status_code=401)
     return await call_next(request)
@@ -143,6 +156,9 @@ async def _gen_one_image(prompt, sampling):
 
 @app.post("/v1/images/generations")
 async def images_generations(req: Request):
+    if AGENT_MODE:
+        return JSONResponse({"error": {"message": "image generation is disabled in agent mode "
+                            "(LCN_AGENT=1); its memory budget funds the full-context KV pool"}}, status_code=403)
     body = await req.json()
     if body.get("response_format") == "url":
         # Reject BEFORE generating: we have no public file server, so "url" could only return an
@@ -163,6 +179,9 @@ async def images_generations(req: Request):
 
 @app.post("/v1/audio/speech")
 async def audio_speech(req: Request):
+    if AGENT_MODE:
+        return JSONResponse({"error": {"message": "audio generation is disabled in agent mode "
+                            "(LCN_AGENT=1); its memory budget funds the full-context KV pool"}}, status_code=403)
     body = await req.json()
     text = body.get("input", "")
     voice = str(body.get("voice", "en"))

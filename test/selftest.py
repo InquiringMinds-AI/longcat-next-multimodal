@@ -10,6 +10,12 @@ import base64, json, os, sys, time
 import requests
 
 BASE = "http://localhost:%s" % os.environ.get("PORT", "8090")
+# authenticated deployments (LCN_API_KEY set) require the bearer on every request
+_KEY = os.environ.get("LCN_API_KEY", "").strip()
+_session = requests.Session()
+if _KEY:
+    _session.headers["Authorization"] = "Bearer " + _KEY
+requests = _session  # route module-level requests.post/get through the session
 OUT = os.environ.get("LCN_OUTPUT_DIR", "/tmp")
 VOICE = "/workspace/scripts/voices/en_reference.wav"
 results = []

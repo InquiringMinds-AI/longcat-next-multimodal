@@ -78,9 +78,32 @@ def build_tools_system_block(tools):
     return block
 
 
-# ---- output parsing: <longcat_tool_call> XML -> OpenAI tool_calls ----
-_TC = re.compile(r"<longcat_tool_call>(.*?)</longcat_tool_call>", re.DOTALL)
+# ---- output parsing: <longcat_tool_call> -> OpenAI tool_calls ----
+# The model emits TWO syntaxes inside <longcat_tool_call> (prompt-dependent, both trained):
+#   1. XML args:  name\n<longcat_arg_key>k</longcat_arg_key><longcat_arg_value>v</longcat_arg_value>...
+#   2. TS call :  functions.name({key: "value", ...})   — JS object literal (keys often
+#      unquoted), and generation may STOP right after ')' with no closing tag.
+# So the block regex tolerates a missing </longcat_tool_call>, and each block tries the
+# XML pair syntax first, then the TS-call syntax.
+_TC = re.compile(r"<longcat_tool_call>(.*?)(?:</longcat_tool_call>|(?=<longcat_tool_call>)|$)", re.DOTALL)
 _PAIR = re.compile(r"<longcat_arg_key>(.*?)</longcat_arg_key>\s*<longcat_arg_value>(.*?)</longcat_arg_value>", re.DOTALL)
+_TS_CALL = re.compile(r"^\s*([\w.]+)\s*\((.*)\)\s*$", re.DOTALL)
+_UNQUOTED_KEY = re.compile(r'([,{]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:')
+
+
+def _parse_object_literal(s):
+    """JS-ish object literal -> dict (strict JSON first, then quote bare keys). None on failure."""
+    s = s.strip()
+    if not s:
+        return {}
+    for candidate in (s, _UNQUOTED_KEY.sub(r'\1"\2":', s)):
+        try:
+            v = json.loads(candidate)
+            if isinstance(v, dict):
+                return v
+        except Exception:
+            pass
+    return None
 
 
 def _arg_type(name, key, tools):
@@ -91,6 +114,20 @@ def _arg_type(name, key, tools):
     return None
 
 
+def _strip_ns(name):
+    # model calls via the TS namespace ("functions.get_weather"); OpenAI clients expect the
+    # bare declared name -> strip a leading "functions." / "multi_tool_use." namespace prefix.
+    for ns in ("functions.", "multi_tool_use."):
+        if name.startswith(ns):
+            return name[len(ns):]
+    return name
+
+
+def _one_call(name, args):
+    return {"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+
+
 def parse_tool_calls(text, tools):
     """Return (normal_text, tool_calls[]). tool_calls in OpenAI shape (arguments = JSON string)."""
     if "<longcat_tool_call>" not in text:
@@ -99,26 +136,38 @@ def parse_tool_calls(text, tools):
     normal = text[:idx].strip()
     calls = []
     for block in _TC.findall(text):
-        m = re.match(r"([^\n<]+)", block.strip())
+        block = block.strip()
+        pairs = _PAIR.findall(block)
+        if pairs:  # syntax 1: XML arg pairs
+            m = re.match(r"([^\n<(]+)", block)
+            if not m:
+                continue
+            name = _strip_ns(m.group(1).strip())
+            args = {}
+            for k, v in pairs:
+                k, v = k.strip(), v.strip()
+                t = _arg_type(name, k, tools)
+                if t and t != "string":
+                    try:
+                        v = json.loads(v)
+                    except Exception:
+                        pass
+                args[k] = v
+            if name:
+                calls.append(_one_call(name, args))
+            continue
+        m = _TS_CALL.match(block)  # syntax 2: TS-style call with object-literal args
         if not m:
             continue
-        name = m.group(1).strip()
-        # model calls via the TS namespace ("functions.get_weather"); OpenAI clients expect the
-        # bare declared name -> strip a leading "functions." / "multi_tool_use." namespace prefix.
-        for ns in ("functions.", "multi_tool_use."):
-            if name.startswith(ns):
-                name = name[len(ns):]
-        args = {}
-        for k, v in _PAIR.findall(block):
-            k, v = k.strip(), v.strip()
-            t = _arg_type(name, k, tools)
-            if t and t != "string":
-                try:
-                    v = json.loads(v)
-                except Exception:
-                    pass
-            args[k] = v
-        if name:
-            calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
-                          "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+        name, args = _strip_ns(m.group(1).strip()), _parse_object_literal(m.group(2))
+        if args is None or not name:
+            continue
+        if name == "parallel" and isinstance(args.get("tool_uses"), list):
+            # multi_tool_use.parallel wrapper -> expand into individual calls
+            for tu in args["tool_uses"]:
+                tn = _strip_ns(str(tu.get("recipient_name", "")).strip())
+                if tn:
+                    calls.append(_one_call(tn, tu.get("parameters") or {}))
+        else:
+            calls.append(_one_call(name, args))
     return normal, calls

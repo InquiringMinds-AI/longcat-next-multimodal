@@ -7,6 +7,9 @@ services:
     container_name: longcat-next
     runtime: nvidia
     gpus: all
+    # SGLang passes multimodal pixel tensors between processes via /dev/shm; Docker's
+    # 64MB default SIGBUS-crashes multi-image requests. tmpfs allocates lazily.
+    shm_size: "32gb"
     ports:
       # SECURITY DEFAULT: loopback only. To expose on a network, change to "0.0.0.0:8090:8090"
       # (or a host IP) AND set LCN_API_KEY below — otherwise the API is unauthenticated.

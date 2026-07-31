@@ -146,6 +146,39 @@ generation, and tool calling — behind an **OpenAI-compatible API**, quantized 
   6-bit (modelopt MXFP6) is unproven on sm_121 and the size win is small because the
   precision-sensitive mass is the expert bulk. 8-bit stands.
 
+## The stability + agent campaign (2026-07-30)
+
+Triggered by field feedback from a DGX-class user: long image-bearing conversations froze
+their node (or earlyoom killed the container), root-caused by them to PyTorch CUDA
+allocator fragmentation in the vision encoder. Reproduced, fixed, and extended here:
+
+- **`/dev/shm` SIGBUS (new find):** the first multi-image request killed SGLang outright —
+  it ships pixel tensors between processes via `/dev/shm`, and every launcher ran with
+  Docker's 64 MB default. `--shm-size=32g` everywhere; tmpfs allocates lazily.
+- **Fragmentation repro + fix:** 80-turn multi-image soak, host `MemAvailable` sampled per
+  turn. One image per turn: flat (no leak). Images accumulating in history (the real-world
+  shape): −7.6 GB and still declining. With `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`:
+  −2.9 GB converging to flat. Now the entrypoint default.
+- **Generation heads cost ~25 GB, lazily, outside `--mem-fraction-static`:** measured
+  25.9 → 1.5 GB free on first image generation. This is why the all-modality profile keeps
+  0.72 — and why `LCN_AGENT=1` (generation endpoints refused) can afford 0.75 = the full
+  131072-token KV pool.
+- **Radix cache re-enabled** (viable only with the allocator fix): 7/7 modality selftest,
+  and a 15.6k-token shared prefix drops from 5.9 s to 0.36 s (16×) — the enabler for
+  agentic clients that resend a big system prompt every turn.
+- **Anthropic Messages route** (`anthropic_route.py`): Claude Code drives the model
+  end-to-end (multi-turn tool loops, streaming). Two parser findings along the way: the
+  model emits TWO tool-call syntaxes (XML arg pairs AND TS-style `functions.name({...})`
+  with unquoted keys and no closing tag — both now parsed), and the chat template's
+  `arguments.items()` breaks on OpenAI-style JSON-string arguments, so tool-use history is
+  pre-rendered into message content as canonical XML instead.
+- **Speed verdicts (bench: 3 workloads × 3 runs, temp 0):** bf16 KV ~21 tok/s decode.
+  fp8 KV (`LCN_KV_DTYPE=fp8_e4m3`) works — 124,720-token pool (2.3×) at the same
+  fraction — but decodes at ~12.5 tok/s (−41%): capacity-over-speed opt-in, not default.
+  CUDA graph capture fails on this port (even bs 8). NGRAM speculative decoding
+  CUDA-faults inside the n-gram input embedding (draft positions violate its history-hash
+  indexing) — would need a draft-aware embedding layer.
+
 ## Where the earlier exploration lives
 
 The original 4-bit NVFP4 SGLang port (the `overlay/` modules) and the streaming per-expert

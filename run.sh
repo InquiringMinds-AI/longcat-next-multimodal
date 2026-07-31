@@ -20,7 +20,10 @@ if [ "$BIND" != "127.0.0.1" ] && [ -z "${LCN_API_KEY:-}" ]; then
   echo "         from the network. Set LCN_API_KEY=<secret> unless this network is fully trusted." >&2
 fi
 mkdir -p outputs
-docker run --rm -it --gpus all \
+# --shm-size: SGLang moves multimodal pixel tensors between processes via /dev/shm.
+# Docker's 64MB default SIGBUS-crashes the server on multi-image requests; tmpfs is
+# lazily allocated so the generous ceiling costs nothing until used.
+docker run --rm -it --gpus all --shm-size=32g \
   -v "$(realpath "$WEIGHTS")":/workspace/model:ro \
   -v "$(pwd)/outputs":/workspace/outputs \
   -e LCN_OUTPUT_DIR=/workspace/outputs \

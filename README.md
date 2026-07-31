@@ -143,11 +143,61 @@ slightly affect short-context / generation quality; the default keeps the unscal
 modes pass the self-test and stay well under the GB10's memory headroom (128k peaks ~95 GB, 256k
 ~101 GB during a full generation pass). Verified: a 28k-token prompt recalls a fact planted at its start.
 
+## Memory stability on unified memory (important)
+
+Two fixes ship in the container/launchers — keep both if you write your own launcher:
+
+- **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** (entrypoint default). Without it, the
+  vision encoder fragments the CUDA caching allocator across long image-bearing conversations and
+  the fragmented segments are never returned — on unified-memory hosts (GB10) that eats *system*
+  RAM until the node freezes or an OOM killer fires. Measured on an 80-turn multi-image soak:
+  −7.6 GB and still declining without the flag, −2.9 GB converging to flat with it.
+- **`--shm-size=32g`** (run.sh / compose / your `docker run`). SGLang moves multimodal pixel
+  tensors between processes via `/dev/shm`; Docker's 64 MB default SIGBUS-crashes the server on the
+  first request that carries several images. tmpfs allocates lazily — the ceiling is free.
+
+Also measured: the image/audio **generation** heads lazily allocate **~25 GB on first use**,
+outside `--mem-fraction-static`. The all-modality default budgets for that (see Agent mode for the
+alternative).
+
+## Agent mode & Claude Code
+
+`LCN_AGENT=1` trades the generation heads for the **full native context**: image/audio *generation*
+endpoints return 403 (so their ~25 GB is never allocated) and `MEM_FRACTION` defaults to 0.75,
+which funds the entire 131072-token KV pool (~3.9 GB; the all-modality default 0.72 profiles to
+~55k tokens). Understanding of image/audio/video **input still works**. With the radix cache this
+is the profile for agentic clients that resend a large system prompt every turn — measured: a
+15.6k-token prefix costs ~5.9 s cold and **~0.36 s warm** (16×).
+
+The gateway also speaks the **Anthropic Messages API** (`POST /v1/messages`, streaming and tool
+calling included), so Anthropic-native clients work directly. Claude Code:
+
+```bash
+export ANTHROPIC_BASE_URL=http://<host>:8090
+export ANTHROPIC_AUTH_TOKEN=<your LCN_API_KEY>
+export ANTHROPIC_MODEL=longcat-next
+export ANTHROPIC_SMALL_FAST_MODEL=longcat-next
+claude
+```
+
+Honest calibration: the model handles real agentic tool loops (write/read/run, error recovery,
+multi-turn) but is a 75B-A3B — expect occasional path/argument slips on long random strings, and
+review its work. `test/test_anthropic.py` self-tests the route end-to-end.
+
 ## Tuning (env vars)
 
 Set at `docker run -e …` (or in `docker-compose.yml`):
-`MEM_FRACTION` (0.72; 0.74 under `LCN_YARN`), `MAX_TOTAL_TOKENS` (131072; 262144 under `LCN_YARN`),
-`LCN_YARN` (0), `IMAGE_GEN_CFG_SCALE` (3.0),
+`MEM_FRACTION` (0.72; 0.74 under `LCN_YARN`; +0.03 with `LCN_AGENT=1`),
+`MAX_TOTAL_TOKENS` (131072; 262144 under `LCN_YARN`),
+`LCN_YARN` (0), `LCN_AGENT` (0) — full-context agent profile, disables generation endpoints,
+`LCN_RADIX` (1) — radix/prefix cache; set 0 to restore the old disabled behavior,
+`LCN_KV_DTYPE` (unset) — e.g. `fp8_e4m3` halves KV bytes → ~2× token capacity at the same
+mem-fraction; validate output quality on your workload first,
+`LCN_CUDAGRAPH` (0) — **leave off**: graph capture fails on this port ("operation failed during
+capture"); the gate exists for retesting after overlay changes,
+`LCN_NGRAM` (0) — **leave off**: NGRAM speculative decoding CUDA-faults in the model's n-gram
+input embedding (draft positions violate its history-hash indexing); needs a draft-aware layer,
+`IMAGE_GEN_CFG_SCALE` (3.0),
 `IMAGE_GEN_TEMPERATURE`/`IMAGE_GEN_TOP_K`/`IMAGE_GEN_TOP_P`, `AUDIO_GEN_TEMPERATURE`/`AUDIO_GEN_TOP_K`,
 `REFINER_STEPS` (10; raise toward 28 for max image fidelity at ~1.5× latency),
 and `LCN_VERBOSE=1` for per-step debug logging.
@@ -177,7 +227,8 @@ before downloading the weights.
 ```
 .                       the runnable package (this README, Dockerfile, run.sh, …)
 ├── gateway.py          OpenAI-compatible gateway fronting SGLang (all modalities + tools)
-├── longcat_tools.py    tool-calling: TS-namespace prompt build + <longcat_tool_call> XML parse
+├── anthropic_route.py  Anthropic Messages API (/v1/messages) — Claude Code & friends
+├── longcat_tools.py    tool-calling: TS-namespace prompt build + <longcat_tool_call> parse (both syntaxes)
 ├── entrypoint.sh       SGLang + gateway process supervision
 ├── new_files/          the LongCat-Next SGLang overlay (models / layers / processors)
 ├── patches/            container build patches

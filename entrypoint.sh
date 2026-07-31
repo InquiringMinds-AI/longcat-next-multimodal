@@ -3,7 +3,14 @@
 # SGLang runs on an internal port; an OpenAI-compatible gateway (all modalities) serves PORT.
 # If EITHER process exits, the container is torn down (don't serve a dead backend) so an
 # orchestrator/restart policy can recover it.
-# Env: MODEL_PATH, PORT, MEM_FRACTION, MAX_TOTAL_TOKENS, LCN_YARN.
+# Env: MODEL_PATH, PORT, MEM_FRACTION, MAX_TOTAL_TOKENS, LCN_YARN, LCN_RADIX.
+# Allocator: expandable segments, so freed vision-encoder allocations return to the
+# system instead of accumulating as fragmented CUDA segments. On unified-memory hosts
+# (GB10/DGX Spark) that fragmentation consumes SYSTEM RAM across long image-bearing
+# conversations until the node freezes — reported in the field, root-caused to the
+# PyTorch CUDA caching allocator. Overridable by setting the var before launch.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 INTERNAL="${SGLANG_INTERNAL_PORT:-30000}"
 export SGLANG_INTERNAL_PORT="$INTERNAL"
 export MODEL_PATH="${MODEL_PATH:-/workspace/model}"
@@ -14,7 +21,15 @@ export MODEL_PATH="${MODEL_PATH:-/workspace/model}"
 # limiter is --mem-fraction-static (weights ~88 GB + KV pool); we raise it just enough.
 OVERRIDE='{"architectures":["LongcatNextForCausalLM"]}'
 DEFAULT_TOKENS=131072
+# MEASURED BUDGET (128GB GB10): image/audio GENERATION heads lazily allocate ~25GB on
+# first use, OUTSIDE --mem-fraction-static. All-modality serving therefore keeps the
+# static fraction at 0.72 (~55k-token KV pool, ~5GB headroom after generation warmup).
+# LCN_AGENT=1 (agentic/understanding profile): generation endpoints are disabled at the
+# gateway, freeing that ~25GB to fund the FULL native context — 0.75 = 131072 tokens
+# (~3.9GB KV). Raising the fraction in an all-modality deployment ends near 1GB free
+# after the first image generation — global-OOM territory on unified memory.
 DEFAULT_MEMFRAC=0.72
+[ "${LCN_AGENT:-0}" = "1" ] && DEFAULT_MEMFRAC=0.75
 if [ "${LCN_YARN:-0}" = "1" ]; then
   # Override rope_parameters (NOT rope_scaling): transformers 4.57 rebuilds rope_parameters from a
   # rope_scaling override and drops rope_theta, which the model reads -> KeyError. Setting
@@ -22,7 +37,33 @@ if [ "${LCN_YARN:-0}" = "1" ]; then
   OVERRIDE='{"architectures":["LongcatNextForCausalLM"],"max_position_embeddings":262144,"rope_parameters":{"rope_type":"yarn","rope_theta":10000000,"factor":2.0,"original_max_position_embeddings":131072}}'
   DEFAULT_TOKENS=262144
   DEFAULT_MEMFRAC=0.74
+  [ "${LCN_AGENT:-0}" = "1" ] && DEFAULT_MEMFRAC=0.78
 fi
+
+# CUDA graphs: LEAVE DISABLED — capture fails on this model port ("operation failed
+# during capture" even at bs 8; the overlay's custom decode path is not capture-safe).
+# The env gate remains for retesting after engine/overlay changes.
+GRAPH_FLAG="--disable-cuda-graph"
+[ "${LCN_CUDAGRAPH:-0}" = "1" ] && GRAPH_FLAG="--cuda-graph-max-bs ${LCN_CUDAGRAPH_BS:-8}"
+
+# NGRAM lookup speculative decoding: BROKEN on this port — the model's n-gram input
+# embedding (n_gram_embedding.py) hits a CUDA illegal memory access when the NGRAM
+# worker's verify batches flow through it (draft positions violate its history-hash
+# indexing). Gate kept for retesting if the embedding layer is made draft-aware.
+NGRAM_FLAGS=""
+[ "${LCN_NGRAM:-0}" = "1" ] && NGRAM_FLAGS="--speculative-algorithm NGRAM --speculative-num-draft-tokens ${LCN_NGRAM_DRAFT:-4}"
+
+# KV cache dtype (opt-in): LCN_KV_DTYPE=fp8_e4m3 halves KV bytes -> ~2x token capacity
+# at the same mem-fraction. Validate quality on your workload before trusting it.
+KV_FLAGS=""
+[ -n "${LCN_KV_DTYPE:-}" ] && KV_FLAGS="--kv-cache-dtype ${LCN_KV_DTYPE}"
+
+# Radix (prefix) cache: ON by default — warm-prefix reuse is what makes agentic clients
+# (Claude Code re-sends a ~15k-token system prompt every turn) responsive. Viable only
+# WITH the expandable_segments allocator above (radix keeps KV resident, which amplified
+# the fragmentation leak). LCN_RADIX=0 restores the old disabled behavior.
+RADIX_FLAG="--disable-radix-cache"
+[ "${LCN_RADIX:-1}" = "1" ] && RADIX_FLAG=""
 
 python3 -m sglang.launch_server \
   --model-path "$MODEL_PATH" \
@@ -33,7 +74,7 @@ python3 -m sglang.launch_server \
   --mem-fraction-static "${MEM_FRACTION:-$DEFAULT_MEMFRAC}" \
   --max-total-tokens "${MAX_TOTAL_TOKENS:-$DEFAULT_TOKENS}" \
   --attention-backend flashinfer \
-  --disable-cuda-graph --disable-radix-cache --skip-server-warmup \
+  $GRAPH_FLAG $RADIX_FLAG $NGRAM_FLAGS $KV_FLAGS --skip-server-warmup \
   --watchdog-timeout 600 &
 SGLANG_PID=$!
 
