@@ -193,8 +193,14 @@ local w8a8 shards — the sidecar (rows 131125:) was simply never extracted.
         claim). D3 KEPT on faithfulness grounds (LCN_TRANSCRIPT_GREEDY=1
         reverts). Residual first-frame variance now presumed MODEL BASELINE
         (all known mechanical divergences fixed; failures are wrong-content
-        picks, not missing content). Optional polish if wanted: gateway
-        opt-in leading pause (the proven damage absorber).
+        picks, not missing content).
+        Text lead-in A/B (owner ears, n=1 each, 2026-07-31): dash lead ("— ")
+        rendered silent and delivered an INTACT onset; "Mm." absorbed the
+        damage audibly then went clean; ellipsis was HARMFUL (content
+        substitution: "Self reflection"->"research" — damage landed inside
+        the first word). Confirms the absorber theory; silence-FRAME injection
+        (LCN_TTS_SILENCE_FRAMES, engine-level deterministic absorber) is the
+        favored mechanism — owner A/B pending.
       * IMAGES: "overall, better coherence" — windowsill PRESENT (adherence
         fixed on that prompt), bird proportions look right, market now has
         BOTH people (adherence improved). Residual geometry flaws remain
