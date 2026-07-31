@@ -76,6 +76,21 @@ TRANSCRIPT_GREEDY = os.environ.get("LCN_TRANSCRIPT_GREEDY", "0") == "1"
 TRANSCRIPT_TEMPERATURE = _envf("LCN_TRANSCRIPT_TEMPERATURE", 0.5)
 TRANSCRIPT_TOP_K = _envi("LCN_TRANSCRIPT_TOP_K", 5)
 TRANSCRIPT_TOP_P = _envf("LCN_TRANSCRIPT_TOP_P", 0.85)
+# First-frame conditioning (owner idea, 2026-07-31): the acoustic head's frame-0
+# distribution is its shakiest (onset garble/wrong-content picks). Injecting known
+# silence as the first frame(s) gives frame N real in-distribution history before
+# the model's first free sample. There is NO canonical single silence code — the
+# VQ varies frame-to-frame even on digital silence — so injection replays the
+# head of the checkpoint's own encoded-silence sequence
+# (quantize/extract_silence_frames.py). LCN_TTS_SILENCE_FRAMES=N injects the
+# first N frames (~80ms leading near-silence each; default 0 = off).
+_SILENCE_SEQ = [
+    [1761, 3757, 234, 692, 64, 144, 483, 504],
+    [2490, 1417, 165, 373, 113, 812, 47, 675],
+    [1182, 785, 1568, 871, 732, 787, 420, 367],
+    [3608, 2959, 105, 491, 387, 336, 420, 675],
+]
+TTS_SILENCE_FRAMES = _envi("LCN_TTS_SILENCE_FRAMES", 0)
 # End-of-audio is confirmed by this many CONSECUTIVE level-0 end-flags (canonical guard):
 # an isolated/stray end-flag is re-sampled to a real acoustic code so the model speaks for
 # exactly as long as its task needs — no arbitrary minimum-length floor.
@@ -1510,7 +1525,15 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 # decides its own length; no minimum-frame floor. The end-flag frame is
                 # NOT stored (it carries no audio).
                 hs = hidden_states[i:i+1]  # [1, hidden_size]
-                audio_ids = self._generate_audio_codebook_step(hs, state)
+                if state.step_count < TTS_SILENCE_FRAMES:
+                    # First-frame conditioning: replay encoded-silence frames so the
+                    # model's first FREE sample sees real audio history.
+                    raw = _SILENCE_SEQ[min(state.step_count, len(_SILENCE_SEQ) - 1)]
+                    audio_ids = (torch.tensor(raw, dtype=torch.long,
+                                              device=self.audio_offset_vals.device)
+                                 + self.audio_offset_vals)
+                else:
+                    audio_ids = self._generate_audio_codebook_step(hs, state)
                 if audio_ids is not None:
                     state.accumulated_ids.append(audio_ids)
                     state.step_count += 1
