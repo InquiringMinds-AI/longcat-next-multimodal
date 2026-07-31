@@ -77,9 +77,12 @@ rebase would force re-porting, so this gate comes first.
       v512's silent word-drop is arguably worse than v516's audible garble; combined
       with the end-behavior delta (v512 clause-truncates, v516 speaks further), v516
       is MORE faithful on both clip edges. (2) The "robotic prosody throughout" from
-      the original review DID NOT REPRODUCE — all six captures ran with radix OFF;
-      last session's listening was presumably radix ON (launcher default). Radix-ON
-      v516 captures (temp-0 + cold/warm prod pair) in flight to close that confound.
+      the original review DID NOT REPRODUCE — and the owner subsequently clarified
+      (2026-07-31) that "robotic" meant TEMPO/CADENCE, not tone: careful radio-
+      broadcast-style word separation, "probably a prosodic effect of the words being
+      used rather than a failure." The prosody arm of the regression is thereby
+      WITHDRAWN as a serving defect. Radix-ON v516 captures (temp-0 + cold/warm prod
+      pair) still in flight as confirmation that the default config is also clean.
       If prosody stays clean: rebase quality-UNBLOCKED; the shared onset bug becomes
       its own roadmap item (prime suspect: the latent half-open-vs-inclusive mm
       offset handling at the audio boundaries, plus cold n-gram history at
