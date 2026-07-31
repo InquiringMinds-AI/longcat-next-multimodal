@@ -204,8 +204,16 @@ local w8a8 shards — the sidecar (rows 131125:) was simply never extracted.
         INJECTION N=2 OWNER VERDICT (2026-07-31): "the utterances are perfect"
         — ALL FIVE sentences intact, onset defect fully absorbed. One issue:
         the model EXTENDS injected silence by momentum (20-40% of each clip was
-        silent lead). Refinement in test: N=1 + energy-based post-vocode lead
-        trim (LCN_TTS_TRIM_LEAD_MS=150) targeting one syllable's worth of lead.
+        silent lead). SECOND ISSUE (owner, hedged "I think"): SPEAKER IDENTITY
+        drifted in the N=2 set — male AND female voices where every prior set
+        held one consistent female clone. Plausible mechanism: injected frames
+        are encoded DIGITAL silence = speaker-neutral history at exactly the
+        identity-anchoring early frames; the onset garble may partly have BEEN
+        the anchoring process. Ladder: (a) N=1 + trim in test (doubles as the
+        identity test); (b) if drift persists -> dash-lead + trim (model-
+        GENERATED silence is identity-anchored by construction, dash onset was
+        intact); (c) speaker-colored lead frames (encode a known-good clip's
+        own opening) as the injection variant.
       * IMAGES: "overall, better coherence" — windowsill PRESENT (adherence
         fixed on that prompt), bird proportions look right, market now has
         BOTH people (adherence improved). Residual geometry flaws remain
