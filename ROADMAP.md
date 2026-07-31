@@ -68,10 +68,22 @@ rebase would force re-porting, so this gate comes first.
       transcripts STOP AT THE FIRST CLAUSE; v516 clips run 5.1-7.3s and speak further.
       Audio-end behavior differs across versions (possibly the latent half-open-vs-
       inclusive mm offset issue) — v516 may actually be MORE complete here.
-      Remaining suspects, reordered: decode-numerics drift (toggle test running),
-      NgramEmbeddingManager token-table lifecycle (new ne_skip_token_table_update
-      path at the chunked-prefill->decode boundary — static content-equivalent but
-      overlap-timing-sensitive per upstream's own comment). ALSO FOUND (latent, both versions): overlay emits
+      OWNER EAR VERDICT on the six paired clips (2026-07-31) — REFRAMES THE BLOCKER:
+      every v512 clip SKIPS the word "Self" entirely (silent omission of the first
+      word); v516 clips damage but attempt the onset ("elf reflection" / "coal. Self
+      reflection" — junk syllable then the full correct word / "helf reflection");
+      NO prosodic issues in ANY of the six. Conclusions: (1) the onset defect is a
+      SHARED audio-start boundary bug present in BOTH builds in different forms —
+      v512's silent word-drop is arguably worse than v516's audible garble; combined
+      with the end-behavior delta (v512 clause-truncates, v516 speaks further), v516
+      is MORE faithful on both clip edges. (2) The "robotic prosody throughout" from
+      the original review DID NOT REPRODUCE — all six captures ran with radix OFF;
+      last session's listening was presumably radix ON (launcher default). Radix-ON
+      v516 captures (temp-0 + cold/warm prod pair) in flight to close that confound.
+      If prosody stays clean: rebase quality-UNBLOCKED; the shared onset bug becomes
+      its own roadmap item (prime suspect: the latent half-open-vs-inclusive mm
+      offset handling at the audio boundaries, plus cold n-gram history at
+      generation start). ALSO FOUND (latent, both versions): overlay emits
       half-open mm offsets where upstream treats them inclusive -> pad clobbers
       <longcat_audio_end>; fix offsets to inclusive when touching this area.
       v0.5.12 image remains :latest / shipping; v0.5.16 work lives in :v0516.
