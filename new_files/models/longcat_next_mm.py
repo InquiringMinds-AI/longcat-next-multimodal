@@ -69,6 +69,13 @@ AUDIO_GEN_TEMPERATURE = _envf("AUDIO_GEN_TEMPERATURE", 0.5)
 AUDIO_GEN_TOP_K = _envi("AUDIO_GEN_TOP_K", 5)
 AUDIO_GEN_TOP_P = _envf("AUDIO_GEN_TOP_P", 0.85)
 AUDIO_GEN_REPETITION_PENALTY = _envf("AUDIO_GEN_REPETITION_PENALTY", 1.3)
+# Transcript recitation (the audio-text phase the acoustic head conditions on).
+# The original samples it with the request's params (TTS recipe: 0.5/5/0.85);
+# LCN_TRANSCRIPT_GREEDY=1 reverts to the earlier argmax recitation.
+TRANSCRIPT_GREEDY = os.environ.get("LCN_TRANSCRIPT_GREEDY", "0") == "1"
+TRANSCRIPT_TEMPERATURE = _envf("LCN_TRANSCRIPT_TEMPERATURE", 0.5)
+TRANSCRIPT_TOP_K = _envi("LCN_TRANSCRIPT_TOP_K", 5)
+TRANSCRIPT_TOP_P = _envf("LCN_TRANSCRIPT_TOP_P", 0.85)
 # End-of-audio is confirmed by this many CONSECUTIVE level-0 end-flags (canonical guard):
 # an isolated/stray end-flag is re-sampled to a real acoustic code so the model speaks for
 # exactly as long as its task needs — no arbitrary minimum-length floor.
@@ -1298,15 +1305,37 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                         # separately in 'generating' mode.) max_transcript_steps is a runaway backstop,
                         # NOT a task-length floor — the transcript ends whenever the model wants.
                         nl = logits_output.next_token_logits[batch_idx]
-                        lm_argmax = nl.argmax().item()
+                        # Pick the transcript token the way the ORIGINAL does: sample
+                        # with the TTS recipe's params (detection runs on the SAMPLED
+                        # token — original M:725 — never on argmax). We sample here,
+                        # pre-scheduler, and emit one-hot so detection == emission.
+                        # LCN_TRANSCRIPT_GREEDY=1 restores plain argmax recitation.
+                        if TRANSCRIPT_GREEDY:
+                            picked = nl.argmax().item()
+                        else:
+                            work = nl.float().clone()
+                            work[self._audiogen_end_id] = float('-inf')  # never a valid pick
+                            work = work / max(TRANSCRIPT_TEMPERATURE, 1e-5)
+                            if TRANSCRIPT_TOP_K > 0:
+                                kth = torch.topk(work, min(TRANSCRIPT_TOP_K, work.shape[-1]))[0][-1]
+                                work[work < kth] = float('-inf')
+                            if TRANSCRIPT_TOP_P < 1.0:
+                                sorted_logits, sorted_idx = torch.sort(work, descending=True)
+                                probs = torch.softmax(sorted_logits, dim=-1)
+                                cum = torch.cumsum(probs, dim=-1)
+                                sorted_logits[cum - probs > TRANSCRIPT_TOP_P] = float('-inf')
+                                work = torch.full_like(work, float('-inf')).scatter_(
+                                    -1, sorted_idx, sorted_logits)
+                            picked = torch.multinomial(
+                                torch.softmax(work, dim=-1), 1).item()
                         transcript_should_end = (
-                            lm_argmax in (self._audiotext_pad_id, 2)
+                            picked in (self._audiotext_pad_id, 2)
                             or state.transcript_steps >= state.max_transcript_steps
                         )
                         if transcript_should_end:
-                            if lm_argmax == self._audiotext_pad_id:
+                            if picked == self._audiotext_pad_id:
                                 reason = "natural (audiotext_pad)"
-                            elif lm_argmax == 2:
+                            elif picked == 2:
                                 reason = "EOS"
                             else:
                                 reason = f"max ({state.max_transcript_steps})"
@@ -1316,17 +1345,20 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                             nl[self._audiotext_start_id] = 0.0
                             state.transcript_done = True
                         else:
-                            # Continue: emit the argmax of the valid logits (EOS / audiogen_end masked
-                            # out) as a one-hot. The emitted token passes through to the scheduler ->
-                            # N-gram token table, so the next step's hash context is correct.
-                            nl[2] = float('-inf')  # mask EOS
-                            nl[self._audiogen_end_id] = float('-inf')  # mask audiogen_end
-                            emit_id = nl.argmax().item()
+                            # Emit the picked token as a one-hot. It passes through to the
+                            # scheduler -> N-gram token table, so the next step's hash
+                            # context is correct.
+                            if picked in (2, self._audiogen_end_id):
+                                # safety (greedy path): re-pick with both masked
+                                masked = nl.clone()
+                                masked[2] = float('-inf')
+                                masked[self._audiogen_end_id] = float('-inf')
+                                picked = masked.argmax().item()
                             if _LCN_VERBOSE and state.transcript_steps <= 12:
                                 logger.info(f"[AudioGen] req={req_idx}: transcript step {state.transcript_steps}, "
-                                           f"emit={emit_id} ('{self._decode_token(emit_id)}')")
+                                           f"emit={picked} ('{self._decode_token(picked)}')")
                             nl[:] = float('-inf')
-                            nl[emit_id] = 0.0
+                            nl[picked] = 0.0
                 elif forced_token >= 0:
                     logits_output.next_token_logits[batch_idx, :] = float('-inf')
                     logits_output.next_token_logits[batch_idx, forced_token] = 0.0
