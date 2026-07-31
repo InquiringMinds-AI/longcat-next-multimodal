@@ -200,7 +200,12 @@ local w8a8 shards — the sidecar (rows 131125:) was simply never extracted.
         substitution: "Self reflection"->"research" — damage landed inside
         the first word). Confirms the absorber theory; silence-FRAME injection
         (LCN_TTS_SILENCE_FRAMES, engine-level deterministic absorber) is the
-        favored mechanism — owner A/B pending.
+        favored mechanism.
+        INJECTION N=2 OWNER VERDICT (2026-07-31): "the utterances are perfect"
+        — ALL FIVE sentences intact, onset defect fully absorbed. One issue:
+        the model EXTENDS injected silence by momentum (20-40% of each clip was
+        silent lead). Refinement in test: N=1 + energy-based post-vocode lead
+        trim (LCN_TTS_TRIM_LEAD_MS=150) targeting one syllable's worth of lead.
       * IMAGES: "overall, better coherence" — windowsill PRESENT (adherence
         fixed on that prompt), bird proportions look right, market now has
         BOTH people (adherence improved). Residual geometry flaws remain
