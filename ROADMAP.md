@@ -201,6 +201,11 @@ local w8a8 shards — the sidecar (rows 131125:) was simply never extracted.
         the first word). Confirms the absorber theory; silence-FRAME injection
         (LCN_TTS_SILENCE_FRAMES, engine-level deterministic absorber) is the
         favored mechanism.
+        N=1 + TRIM OWNER VERDICT (2026-07-31): "these all work" — zero garble,
+        all female, natural; residual = accent/tone variation ("plausibly the
+        same speaker, but if they were doing impressions") — generic-silence
+        anchoring still dilutes the clone slightly. Reference-voice lead build
+        (request-time derivation, drop-in voices) in capture.
         INJECTION N=2 OWNER VERDICT (2026-07-31): "the utterances are perfect"
         — ALL FIVE sentences intact, onset defect fully absorbed. One issue:
         the model EXTENDS injected silence by momentum (20-40% of each clip was
