@@ -22,8 +22,15 @@ class NgramEmbedding(torch.nn.Module):
         over_embedding_k: int,
         over_embedding_n: int,
         word_vocab_size: int = None,
+        eos_token_id: int = 2,
     ):
         super().__init__()
+        # sglang >=0.5.16 compute_n_gram_ids requires eos_token_id: tokens before an
+        # eos are excluded from the n-gram context (no hashing across turn boundaries).
+        # LCN_NGRAM_EOS=-1 restores the v0.5.12 semantics (no exclusion — a sentinel
+        # that matches no token); generation quality is sensitive to this because the
+        # checkpoint was produced/validated under the old cross-boundary hashing.
+        self.eos_token_id = int(os.environ.get("LCN_NGRAM_EOS", eos_token_id))
         assert (
             over_embedding_n > 1
         ), f"over_embedding_n must be > 1, got {over_embedding_n}"
@@ -231,6 +238,7 @@ class NgramEmbedding(torch.nn.Module):
                 row_indices=forward_batch.req_pool_indices,
                 column_starts=ngram_embedding_info.column_starts,
                 n_gram_ids=self.oe_n_gram_ids[: len(input_ids)],
+                eos_token_id=self.eos_token_id,
             )
 
         # [13, seq_len, hidden_dim]

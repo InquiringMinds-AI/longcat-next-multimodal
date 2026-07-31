@@ -4,7 +4,9 @@
 # The cu130 base is the one that compiles + runs Triton for sm_121 (the cu129 image cannot).
 # Build:  docker build -t longcat-next-gb10 .
 # Run:    see run.sh  (mount the weights dir at /workspace/model)
-FROM lmsysorg/sglang:v0.5.12.post1-cu130
+# Rebased v0.5.12.post1 -> v0.5.16 (2026-07-31): overlay three-way-merged; upstream still
+# has no multimodal LongCat-Next — this overlay remains the only any-to-any path.
+FROM lmsysorg/sglang:v0.5.16-cu130
 
 ARG SG=/sgl-workspace/sglang/python/sglang/srt
 
@@ -24,7 +26,10 @@ COPY new_files/processors/longcat_next.py       ${SG}/multimodal/processors/long
 COPY new_files/hf_transformers/processor.py     ${SG}/utils/hf_transformers/processor.py
 
 # --- audio deps (mel extraction + wav I/O for the cosy24k vocoder) ---
-RUN pip install --no-cache-dir librosa soundfile
+# scipy pinned: the vocoder's STFT window comes from scipy.signal.get_window, and the
+# scipy 1.18 resolution that rode in with the v0.5.16 base coincided with a garbled
+# first-word onset in TTS output (human-ear regression test). Pin to the known-good.
+RUN pip install --no-cache-dir librosa soundfile "scipy==1.17.1"
 
 # --- base-config patches: recognize model_type=longcat_next + build the nested
 #     visual/audio mm sub-configs the tokenizers need ---

@@ -128,9 +128,41 @@ def _one_call(name, args):
             "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
 
 
+# Syntax 3 (imitation): under Anthropic-style agent prompts (Claude Code) the model
+# sometimes mimics the prompt's own examples instead of its trained format, emitting
+#   <function_calls>[{"name": "Write", "parameters": {...}}, ...]</function_calls>
+# as plain text (observed with trailing junk after the JSON array — parse tolerantly).
+_FC_BLOCK = re.compile(r"<function_calls>\s*(\[.*?)(?:</function_calls>|$)", re.DOTALL)
+
+
+def _parse_imitation_calls(text):
+    m = _FC_BLOCK.search(text)
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    # progressive right-trim: the array may carry stray trailing characters
+    for end in range(len(raw), max(len(raw) - 20, 1), -1):
+        try:
+            arr = json.loads(raw[:end])
+            break
+        except Exception:
+            arr = None
+    if not isinstance(arr, list):
+        return None
+    calls = []
+    for e in arr:
+        if isinstance(e, dict) and e.get("name"):
+            args = e.get("parameters") if isinstance(e.get("parameters"), dict) else e.get("input", {})
+            calls.append(_one_call(_strip_ns(str(e["name"])), args or {}))
+    return (text[:m.start()].strip(), calls) if calls else None
+
+
 def parse_tool_calls(text, tools):
     """Return (normal_text, tool_calls[]). tool_calls in OpenAI shape (arguments = JSON string)."""
     if "<longcat_tool_call>" not in text:
+        imit = _parse_imitation_calls(text)
+        if imit:
+            return imit
         return text, []
     idx = text.find("<longcat_tool_call>")
     normal = text[:idx].strip()

@@ -13,8 +13,33 @@ multimodal processors, MoE runner, triton version). **Decide: stay on 0.5.12 or 
 Everything below patches files whose location and content depend on this choice — a later
 rebase would force re-porting, so this gate comes first.
 
-- [ ] Survey upstream SGLang main + releases for LongCat-Next / longcat_flash changes
-- [ ] Decision recorded here; if rebasing: port overlay, re-run selftest + soaks
+- [x] Survey upstream SGLang main + releases for LongCat-Next / longcat_flash changes
+      (2026-07-31: upstream v0.5.16 has the longcat_flash TEXT lineage + its own leaner
+      n_gram_embedding — still ZERO multimodal Next support; the overlay stays necessary.
+      v0.5.16-cu130 image published 2026-07-25; drift bounded: 166 diff-lines in
+      longcat_flash.py across the four releases vs our ~178-line overlay delta.)
+- [x] **Decision: REBASE to v0.5.16-cu130** — front-loads the base so #3 and #4 land on
+      the final foundation; inherits two months of engine fixes; port risk bounded by the
+      test battery (selftest, soak, Anthropic tests, live Claude Code loop).
+- [ ] Port overlay to v0.5.16, full revalidation — **IN PROGRESS, BLOCKED on a TTS
+      quality regression** (2026-07-31). Port state: three-way merges done; eos_token_id
+      wired through (env `LCN_NGRAM_EOS`, -1 = legacy hashing); Claude-imitation tool
+      dialect parser added after live CC runs surfaced it; scipy pinned 1.17.1.
+      Validation: automated battery ALL GREEN (7/7 selftest, 6/6 degeneracy, 5/5
+      anthropic, 3/3 live CC, 40-turn soak converging-flat) — but HUMAN review caught
+      generation regressions the battery could not: (a) image quality — FIXED, root
+      cause was the v0.5.16 n-gram EOS-break (neutralized via LCN_NGRAM_EOS=-1; keep -1
+      the default: the checkpoint was trained under cross-boundary hashing); (b) TTS
+      voice-clone — STILL REGRESSED: garbled first word ("Self"->"helf/pulf/uf-") +
+      subtly robotic prosody throughout. ELIMINATED: n-gram eos (both paths verified
+      env-covered), scipy 1.18, our overlay code (identical), mm offset machinery
+      (agent-diffed byte-identical across tags). REMAINING SUSPECTS: v0.5.16 sampler
+      backend changes (fits whole-clip prosody + onset-worst signature; TTS samples at
+      temp 0.5 top_k 5), token-table lifecycle in the new NgramEmbeddingManager,
+      DeepGemm numeric drift. ALSO FOUND (latent, both versions): overlay emits
+      half-open mm offsets where upstream treats them inclusive -> pad clobbers
+      <longcat_audio_end>; fix offsets to inclusive when touching this area.
+      v0.5.12 image remains :latest / shipping; v0.5.16 work lives in :v0516.
 
 ## 2. Incremental streaming (orthogonal — gateway only, no relaunch risk)
 
@@ -56,7 +81,12 @@ reason #1 settles first).
 - [ ] Ship configs under `patches/`, COPY into the image's triton config dir
 - [ ] Before/after decode bench (same 3-workload suite)
 
-## 5. Performance experiments (after #3/#4 — otherwise measured twice)
+## 5. Performance experiments (after #3/#4 and ALL fixes — no moving targets)
+
+- [ ] **mem-fraction headroom mapping (all-modality)**: 0.72 is inherited, not derived —
+      each +0.01 buys ~40k KV tokens here. With gen heads warmed, drive image-gen +
+      multi-image understanding while sampling MemAvailable at 1s; step 0.72→0.73→0.74
+      until the measured floor drops below ~2.5–3GB margin; ship the last safe value.
 
 - [ ] **DeepGemm accuracy flag**: launches warn `scale_fmt is not ue8m0 — might cause
       accuracy degradation on Blackwell`. A/B DeepGemm on/off for quality + speed;
