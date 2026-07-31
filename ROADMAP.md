@@ -142,8 +142,17 @@ local w8a8 shards — the sidecar (rows 131125:) was simply never extracted.
 - [x] Extraction script shipped (`quantize/extract_codebook_embeddings.py`) +
       README step 1 note (2026-07-31). HF model card note still pending; option:
       upload the 931MB sidecar to the HF weights repo so downloads are turnkey.
-- [ ] Re-examine the onset defect and image hard-prompt quality AFTER this fix —
-      earlier verdicts (quant-bound imagery, shared onset bug) may need revision
+- [x] Re-examined post-fix (owner review of 4-image + 5-sentence sets, 2026-07-31):
+      IMAGE geometry/adherence failure class SURVIVES the sidecar (extra ear, folded
+      laptop bezel, missing person, ambiguous hands; simplest prompt scored "cat
+      looks great" pre-set, "third ear" in this set — single stochastic samples, so
+      no honest claim of sidecar improvement or harm on imagery; the failure class
+      is simply still present). AUDIO onset unchanged in character: 2/5 sentences
+      flawless, damage confined to first 0-2 phonemes, no phoneme-class correlation
+      (two vowel-onset sentences went opposite ways) — stochastic head-of-clip loss.
+      Sidecar retained on restore-original-mechanics grounds; it is NOT a quality
+      fix for either standing defect. Root-cause hunt continues (onset boundary
+      instrumentation; imagery presumed model/quant-bound pending contrary evidence).
 
 ## 2. Incremental streaming (orthogonal — gateway only, no relaunch risk)
 
