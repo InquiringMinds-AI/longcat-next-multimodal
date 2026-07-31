@@ -191,6 +191,13 @@ local w8a8 shards — the sidecar (rows 131125:) was simply never extracted.
         residual class is presumed model/quant-bound (single-sample caveat).
       D2 confirmed as a real composition-adherence defect; both boundary fixes
       VALIDATED as improvements and retained.
+      Baseline calibration (owner, 2026-07-31): the ORIGINAL stand-up samples
+      were never perfect either — his acceptance bar then was "recognizable
+      subjects rather than abstract art." D2 was in the serving path from day
+      one, so no prior era had clean raster initiation; the current post-fix
+      state is plausibly this deployment's best-ever image quality, and the
+      residual geometry class has existed since stand-up (consistent with
+      model/quant bound).
 
 ## 2. Incremental streaming (orthogonal — gateway only, no relaunch risk)
 
