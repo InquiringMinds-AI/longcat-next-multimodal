@@ -81,8 +81,12 @@ rebase would force re-porting, so this gate comes first.
       (2026-07-31) that "robotic" meant TEMPO/CADENCE, not tone: careful radio-
       broadcast-style word separation, "probably a prosodic effect of the words being
       used rather than a failure." The prosody arm of the regression is thereby
-      WITHDRAWN as a serving defect. Radix-ON v516 captures (temp-0 + cold/warm prod
-      pair) still in flight as confirmation that the default config is also clean.
+      WITHDRAWN as a serving defect. (Owner corollary: test texts like "all systems
+      nominal" carry strong non-conversational register priors — broadcast cadence is
+      faithful rendering, not a fault. Methodology: use conversational-register
+      sentences for ear checks unless register itself is under test.) Radix-ON v516
+      captures (temp-0 + cold/warm prod pair) still in flight as confirmation that
+      the default config is also clean.
       If prosody stays clean: rebase quality-UNBLOCKED; the shared onset bug becomes
       its own roadmap item (prime suspect: the latent half-open-vs-inclusive mm
       offset handling at the audio boundaries, plus cold n-gram history at
