@@ -32,6 +32,7 @@
 
 import concurrent.futures
 import logging
+import os
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -325,6 +326,21 @@ class LongcatFlashMoE(nn.Module):
         # Clamp expert indices to real experts (identity experts set to -1 by zero_experts_compute_triton)
         topk_idx_clamped = topk_idx.clamp(min=0, max=self.num_experts - 1)
         topk_output = StandardTopKOutput(topk_weights, topk_idx_clamped, _)
+
+        # Env-gated routing capture for MoE kernel tuning: the sep tuner
+        # (benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py)
+        # needs REAL topk distributions. Set LCN_DUMP_TOPK_DIR and send two
+        # >=4096-token prefills; inert in normal serving.
+        _dump_dir = os.environ.get("LCN_DUMP_TOPK_DIR")
+        if _dump_dir and hidden_states.shape[0] >= 4096:
+            if not hasattr(self, "_topk_save_idx"):
+                self._topk_save_idx = 0
+            if self._topk_save_idx <= 1:
+                torch.save(
+                    topk_idx_clamped,
+                    f"{_dump_dir}/topk_ids_layer{self.layer_id}_idx{self._topk_save_idx}.pt",
+                )
+            self._topk_save_idx += 1
 
         _expert_in = hidden_states / self.smooth_scale.to(hidden_states.dtype)
         final_hidden_states = self.experts(_expert_in, topk_output)

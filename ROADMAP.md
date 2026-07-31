@@ -382,9 +382,28 @@ tuned path is the shipping path (config files are also keyed by triton version �
 reason #1 settles first).
 
 - [ ] Targeted `tuning_fused_moe_triton_sep.py` sweep (both up and down proj; artifacts
-      on a mounted volume, never in an `--rm` container)
-- [ ] Ship configs under `patches/`, COPY into the image's triton config dir
-- [ ] Before/after decode bench (same 3-workload suite)
+      on a mounted volume, never in an `--rm` container) — RUNNING since 2026-07-31
+      ~14:36 in container `lcn-moe-tune` on Spark (image :v0516-spec, entrypoint
+      quantize/tune_moe_gb10.sh staged at ~/longcat-outputs/tune_moe_gb10.sh; topk
+      captures in ~/longcat-outputs/topk_ids, 14 MoE layers x2 from a 16k-token
+      diverse doc+code prompt). OWNER DECISION 2026-07-31: run the FULL 18-batch-size
+      ladder to completion (~2.5-3 days measured — M=4096 alone ~19h at 36s/config;
+      the tuner walks batch sizes sequentially, largest first) rather than rescope to
+      decode-only M; he'll work on non-Spark things meanwhile. Serving is DOWN for
+      the duration (tuner owns the GPU; Yuki stack also down). The tuner is
+      SESSION-INDEPENDENT: if the CC session dies, check `docker logs lcn-moe-tune`
+      and ~/longcat-outputs/moe_configs/ for the two JSONs
+      (E=256,N=1024,device_name=NVIDIA_GB10,dtype=int8_w8a8,per_channel_quant=True
+      .json + _down). Runtime engine loads them from
+      configs/triton_3_6_0/ under the moe_runner/triton_utils dir (or
+      SGLANG_MOE_CONFIG_DIR env).
+- [ ] Ship configs: repo new_files/moe_configs/ + Dockerfile COPY into
+      ${SG}/layers/moe/moe_runner/triton_utils/configs/triton_3_6_0/; verify launch
+      log says "Using MoE kernel config from ..." (today's builds warn it's missing)
+- [ ] Before/after decode bench (baselines: 21.5 tok/s eager / 22.4 graphs, 400-token
+      essay probe x3) + rebench with LCN_CUDAGRAPH=1 (kernel time shrinking amplifies
+      the graph win) + battery; kernel configs change scheduling not math, so temp-0
+      spot check suffices unless drift appears
 
 ## 5. Performance experiments (after #3/#4 and ALL fixes — no moving targets)
 
