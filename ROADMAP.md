@@ -21,8 +21,13 @@ rebase would force re-porting, so this gate comes first.
 - [x] **Decision: REBASE to v0.5.16-cu130** — front-loads the base so #3 and #4 land on
       the final foundation; inherits two months of engine fixes; port risk bounded by the
       test battery (selftest, soak, Anthropic tests, live Claude Code loop).
-- [ ] Port overlay to v0.5.16, full revalidation — **IN PROGRESS, BLOCKED on a TTS
-      quality regression** (2026-07-31). Port state: three-way merges done; eos_token_id
+- [x] Port overlay to v0.5.16, full revalidation — **SHIPPED 2026-07-31**: merged to
+      master, pushed, image promoted to :latest on Spark (:v0512-final = rollback
+      tag). Owner verdict: "a genuine improvement." Final battery on the shipped
+      build: 7/7 selftest, 5/5 anthropic, 6/6 degeneracy. The investigation that
+      unblocked it also root-caused and fixed two day-one generation defects (D1
+      onset, D2 raster start — see below) and restored the codebook sidecar.
+      History of the blocker (kept for the record): port state: three-way merges done; eos_token_id
       wired through (env `LCN_NGRAM_EOS`, -1 = legacy hashing); Claude-imitation tool
       dialect parser added after live CC runs surfaced it; scipy pinned 1.17.1.
       Validation: automated battery ALL GREEN (7/7 selftest, 6/6 degeneracy, 5/5
