@@ -15,6 +15,17 @@ INTERNAL="${SGLANG_INTERNAL_PORT:-30000}"
 export SGLANG_INTERNAL_PORT="$INTERNAL"
 export MODEL_PATH="${MODEL_PATH:-/workspace/model}"
 
+# NGRAM spec decode implies the AGENT profile: generation and speculative
+# verify rounds cannot coexist (the multimodal state machines only run on
+# plain-decode forwards, and a plain-decode fallback under a spec-configured
+# scheduler leaves a half-built batch — crashes in the eager buffer fill).
+# Agent mode 403s gen at the gateway AND disables the model's gen machinery,
+# which is exactly the deployment NGRAM is for (repetitive agent loops).
+if [ "${LCN_NGRAM:-0}" = "1" ] && [ "${LCN_AGENT:-0}" != "1" ]; then
+  echo "[entrypoint] LCN_NGRAM=1 implies the agent profile — enabling LCN_AGENT=1"
+  export LCN_AGENT=1
+fi
+
 # Context length. Default is the model's NATIVE 128k (max_position_embeddings=131072). Set
 # LCN_YARN=1 to extend to 256k via YaRN (RoPE factor 2) — opt-in because YaRN can slightly
 # affect short-context / generation quality. KV is cheap here (MLA, ~16 KB/token), so the
@@ -40,18 +51,23 @@ if [ "${LCN_YARN:-0}" = "1" ]; then
   [ "${LCN_AGENT:-0}" = "1" ] && DEFAULT_MEMFRAC=0.78
 fi
 
-# CUDA graphs: LEAVE DISABLED — capture fails on this model port ("operation failed
-# during capture" even at bs 8; the overlay's custom decode path is not capture-safe).
-# The env gate remains for retesting after engine/overlay changes.
+# CUDA graphs (decode): the overlay's decode path was made capture-safe in the
+# 2026-07 ngram rework — the layer's ignored-mask branch is now branch-free and
+# the multimodal state machines are gated behind the gen-trigger latch (zero
+# host syncs on steady-state text decode; generation batches veto graph replay
+# via patches/decode_graph_gen_veto.patch and run eager). Prefill graphs stay
+# OFF — the multimodal prefill forward (encoders, gen-entry detection) is
+# host-driven and has not been made capture-safe.
 GRAPH_FLAG="--disable-cuda-graph"
-[ "${LCN_CUDAGRAPH:-0}" = "1" ] && GRAPH_FLAG="--cuda-graph-max-bs ${LCN_CUDAGRAPH_BS:-8}"
+[ "${LCN_CUDAGRAPH:-0}" = "1" ] && GRAPH_FLAG="--cuda-graph-max-bs ${LCN_CUDAGRAPH_BS:-8} --disable-prefill-cuda-graph"
 
-# NGRAM lookup speculative decoding: BROKEN on this port — the model's n-gram input
-# embedding (n_gram_embedding.py) hits a CUDA illegal memory access when the NGRAM
-# worker's verify batches flow through it (draft positions violate its history-hash
-# indexing). Gate kept for retesting if the embedding layer is made draft-aware.
+# NGRAM lookup speculative decoding: reworked 2026-07 — verify batches now get
+# correct hash-table geometry (patches/ngram_spec_verify.patch: TARGET_VERIFY
+# column_starts + draft/accept table writes). Implies LCN_AGENT=1 (see above).
+# CHAIN drafts only: the hash kernel walks history linearly, so bfs breadth is
+# pinned to 1 (a branching tree would corrupt the hash context).
 NGRAM_FLAGS=""
-[ "${LCN_NGRAM:-0}" = "1" ] && NGRAM_FLAGS="--speculative-algorithm NGRAM --speculative-num-draft-tokens ${LCN_NGRAM_DRAFT:-4}"
+[ "${LCN_NGRAM:-0}" = "1" ] && NGRAM_FLAGS="--speculative-algorithm NGRAM --speculative-num-draft-tokens ${LCN_NGRAM_DRAFT:-4} --speculative-ngram-min-bfs-breadth 1 --speculative-ngram-max-bfs-breadth 1"
 
 # KV cache dtype (opt-in): LCN_KV_DTYPE=fp8_e4m3 halves KV bytes -> ~2x token capacity
 # at the same mem-fraction. Validate quality on your workload before trusting it.

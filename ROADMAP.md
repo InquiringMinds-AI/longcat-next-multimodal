@@ -269,11 +269,108 @@ speculative decoding each die in `n_gram_embedding.py` forward, which contains
 (capture poison) and history-hash indexing that draft positions violate (illegal
 memory access). Make the layer branch-free and draft-position-safe.
 
-- [ ] Tensorize the ignored-mask path (no `.any()`, no data-dependent branching)
-- [ ] Audit gather/hash indexing for out-of-history positions (clamp or mask)
-- [ ] Re-test CUDA graph capture (`LCN_CUDAGRAPH=1`) — currently fails even at bs 8
-- [ ] Re-test NGRAM spec decode (`LCN_NGRAM=1`) — currently illegal-access faults
-- [ ] Quality check: outputs identical pre/post rework (temp-0 diff on fixed prompts)
+2026-07-31 root-cause pass (v0.5.16 base — much of the old diagnosis is stale on
+this base; upstream now ships NgramEmbeddingInfo buffers wired into the decode
+CUDA-graph runner, including NGRAM-verify graph capture):
+* CAPTURE poisons were OURS, not the kernel's: (a) the overlay layer's
+  `if ignored_mask.any():` host sync (base v0.5.16 forward is branch-free);
+  (b) the mm model's Step-3 state machines running per-element `.item()`
+  loops on EVERY decode — also a 2-sync/token latency tax on plain text.
+* NGRAM illegal access root-caused from source: TARGET_VERIFY is_extend()=True,
+  so `_init_ngram_embedding_info` read extend_prefix_lens/extend_seq_lens,
+  which hand-built verify batches never populate → NgramEmbeddingInfo.create
+  leaves column_starts UNINITIALIZED (torch.empty) → OOB table indexing.
+  (Garbage token VALUES can't crash — the hash is %-bounded; garbage COLUMNS can.)
+* The hash kernel reads context ONLY from its token table (its `tokens` arg is
+  dead code), so spec drafts must be table-written before a verify forward.
+  Drafts are a TREE; the kernel walks linearly → chain drafts only
+  (bfs breadth pinned to 1) makes linear writes semantically exact.
+* CUDA graph replay skips the model's Python forward entirely → any batch that
+  might need the mm state machines must veto replay and run eager.
+
+Implementation (all in-tree; image :v0516-graph):
+- [x] Layer: branch-free ignored-mask (`torch.where`, no host sync)
+- [x] Gen-trigger latch: post-sample on-GPU scan of sampled ids for the two
+      gen-ENTRY tokens (audiogen_start/image_start) + async 1-byte flag to
+      pinned host memory, folded into a STICKY latch read at the next forward
+      (= the step the trigger arrives as input — one step late is exactly on
+      time). Latch consumed on observation; 64-step decay guard for triggers
+      whose request died. Step-3 loops now gated on
+      (gen states non-empty | latch) → ZERO host syncs on steady-state text
+      decode. Scan hooks: ngram manager update_after_decode (normal path) +
+      spec worker accept path.
+- [x] patches/decode_graph_gen_veto.patch: can_run_graph consults
+      model.lcn_cuda_graph_veto() (gen active or trigger pending → eager)
+- [x] patches/ngram_spec_verify.patch: TARGET_VERIFY branch in
+      _init_ngram_embedding_info (column_starts=seq_lens, req_lens=
+      draft_token_num); NGRAM worker writes drafts pre-verify + accepted
+      tokens post-verify via lcn_write_spec_tokens (same specials-to-zero
+      hashing rule); gen-active rounds fall back to plain decode (same veto)
+- [x] entrypoint: LCN_CUDAGRAPH=1 now also pins --disable-prefill-cuda-graph
+      (mm prefill forward is host-driven, not capture-safe); LCN_NGRAM=1 pins
+      bfs breadth 1 (chain drafts)
+Results (2026-07-31, image :v0516-spec = both phases):
+- [x] CUDA graph capture WORKS: bs [1,2,4,8], 34s capture, +2.79GB. Full
+      battery GREEN with graphs on (7/7, 5/5, 6/6) — gen artifacts produced,
+      proving the veto→eager path fires (log split: 124 graphed / 63 eager
+      batches, no decay warnings). MemAvailable after gen warmup 4.36GB
+      (was ~5GB pre-graphs; thinner but above the ~3GB floor). Decode bench
+      bs=1: 22.4 tok/s graphs vs 21.5 eager = +4.2% (MoE-GEMM-bound as
+      expected; the win compounds after #4 tuning).
+- [x] GRAPH REPLAY IS BIT-IDENTICAL TO EAGER (temp-0, 3 prompts) — stronger
+      than expected; no graph-numerics caveat needed.
+- [x] NGRAM spec decode NO LONGER CRASHES; verbatim-repetition probe: correct
+      output at 39.6 tok/s (+84% vs 21.5; implies ~1.8x mean accept). Novel
+      prose: accept len ~1.0-1.4, ~7-9% overhead — canonical prompt-lookup
+      shape; keep opt-in, document as agent/repetitive-workload lever.
+- [x] Temp-0 identity gate: REFRAMED — this engine's temp-0 output is
+      RADIX-STATE-DEPENDENT (same build, same prompt: warm-vs-cold radix
+      flips prompt 1 at ~char 170; warm repeats are stable). The pre-rework
+      baseline was captured on a warm long-lived container, so cross-build
+      bitwise identity is unattainable by that comparator; 2/3 prompts
+      matched anyway. Spec-vs-nospec temp-0 also diverges (verify runs the
+      prefill attention kernel — different numerics, same near-tie flips);
+      accept-rate + verbatim-repetition correctness is the discriminating
+      instrument for hash-geometry correctness, and it passes.
+- [x] AIRTIGHT rework gate PASSED: cold first-run temp-0 capture from the
+      pre-rework :latest image is BIT-IDENTICAL (3/3 prompts) to the rework
+      build's cold first-run. The rework is output-preserving; every earlier
+      divergence was radix-state, as diagnosed.
+- [x] NGRAM + generation DO NOT COMPOSE — design changed to NGRAM⇒AGENT:
+      the first attempt (spec worker falls back to plain decode while gen
+      active) CRASHED the engine on the first gen decode round — under a
+      spec-configured scheduler, decode batches arrive WITHOUT input_ids
+      (the verify rewrite is what sets them from draft tokens), so the
+      skipped rewrite left a half-built batch (registry fill: positions
+      dst=(0,) src=(1,); named via temporary fill_from instrumentation).
+      Fixing that means reimplementing spec-shaped KV-slot accounting for
+      plain rounds — deep allocator risk for a combination with no real
+      deployment: gen serving doesn't want spec, agent serving 403s gen.
+      SHIPPED DESIGN: LCN_NGRAM=1 implies LCN_AGENT=1 (entrypoint pairs +
+      loud log); the model itself disables the gen machinery under
+      LCN_AGENT=1 (no state entry from prefill markers, no trigger latch
+      work) — closes a pre-existing leak where raw gen markers in a chat
+      prompt could strand a gen state on a reused req_pool_idx. The
+      worker patch keeps only the draft/accept table writes.
+- [x] Battery on the NGRAM⇒agent config: degeneracy 6/6, anthropic 5/5
+      (incl. tool_call + roundtrip), gen endpoints 403 as designed, audio
+      UNDERSTANDING passes; selftest image/video-understanding "failures"
+      are a cascade (they reuse the 403'd generated image — bare
+      `assert img_b64`), not real. Repetition probe: 46.9 tok/s.
+      ONE REAL OBSERVATION: the selftest tool_calling probe missed once
+      (model answered in prose, no tool call) on the cold corpus; manual
+      re-probe 6/6 OK + anthropic tool checks green. Spec decode makes
+      temp-0 output corpus-state-dependent, so occasional near-tie flips
+      are expected-class; at n≈9 the miss rate is not distinguishable
+      from rare-but-real. Documented as a caveat on the opt-in flag —
+      selftest under NGRAM needs an agent-mode variant if this mode
+      graduates.
+- [x] Owner eyes/ears on gen review sets (2026-07-31): "images are good,
+      maybe better. they still have defects though. the audio is good too."
+      — generation paths confirmed non-regressed (residual geometry defect
+      class persists, the known model/quant-bound baseline). GATE PASSED.
+- [ ] Decide ship defaults (likely: both features stay opt-in env gates;
+      LCN_AGENT deployments are the natural place for LCN_CUDAGRAPH=1)
 
 ## 4. MoE kernel tuning (after #3 — tune the final decode path once)
 

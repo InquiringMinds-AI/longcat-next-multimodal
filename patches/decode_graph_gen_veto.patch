@@ -1,0 +1,17 @@
+--- a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+@@ -504,6 +504,14 @@
+         if forward_batch.replace_embeds is not None:
+             return False
+ 
++        # LongCat-Next overlay: graph replay skips the model's Python
++        # multimodal state machines entirely, so any batch that might need
++        # them (active image/audio generation, or a just-sampled gen-entry
++        # trigger) must run the eager forward.
++        _lcn_veto = getattr(self.model_runner.model, "lcn_cuda_graph_veto", None)
++        if _lcn_veto is not None and _lcn_veto():
++            return False
++
+         ragged_layout = (
+             resolve_ragged_verify_layout(forward_batch)
+             if self.ragged_verify_mode

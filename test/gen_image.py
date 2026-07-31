@@ -17,10 +17,12 @@ ids = (tok(PROMPT, add_special_tokens=False).input_ids
 print("[gen_image] prompt=%r" % PROMPT, flush=True)
 before = set(glob.glob(f"{OUT}/longcat_img_*.png"))
 t0 = time.time()
+_key = os.environ.get("LCN_API_KEY", "").strip()
+_hdrs = {"Authorization": f"Bearer {_key}"} if _key else {}
 r = requests.post(f"http://localhost:{PORT}/generate",
                   json={"input_ids": ids,
                         "sampling_params": {"max_new_tokens": 1500, "temperature": 0.5, "top_k": 1024, "top_p": 0.75}},
-                  timeout=900)
+                  headers=_hdrs, timeout=900)
 print("[gen_image] HTTP %d in %ds" % (r.status_code, time.time() - t0), flush=True)
 new = sorted(set(glob.glob(f"{OUT}/longcat_img_*.png")) - before)
 print("[gen_image] NEW PNG(s):", new, flush=True)

@@ -298,6 +298,36 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         self._image_gen_states: Dict[int, ImageGenState] = {}
         self._tokenizer = None  # lazy-loaded for diagnostic logging
 
+        # --- Gen-trigger latch: sync-free steady-state text decode ---
+        # The decode state machines (Step 3) used to run per-element .item()
+        # loops on EVERY decode step to spot a gen-entry token. Those host
+        # syncs are a per-token latency tax and abort CUDA graph capture.
+        # Instead, the post-sample hook (lcn_trigger_scan, called from the
+        # ngram manager's update_after_decode — never inside a graph) tests
+        # each step's sampled ids for the two gen-ENTRY tokens on-GPU and
+        # async-copies a one-byte flag to pinned memory. The NEXT forward —
+        # the step where the trigger arrives as *input* — reads the latch and
+        # runs the eager state machine. One step "late" is exactly on time.
+        # Mid-generation steps are covered by the non-empty state dicts.
+        # The latch is STICKY: set at fold-in, cleared only when a state
+        # machine observes the trigger token in its input (interleaved batches
+        # may read the latch before the trigger-carrying batch forwards), with
+        # a decay guard for triggers whose request died before its next step.
+        self._trigger_ids_gpu = None  # lazy — needs the runtime device
+        self._trigger_host = None
+        self._trigger_event = None
+        self._trigger_armed = False
+        self._trigger_sticky = False
+        self._trigger_decay = 0
+
+        # Agent profile (LCN_AGENT=1): generation is disabled at the GATEWAY
+        # (403), but raw gen markers in a chat prompt could still create a gen
+        # state here — which NGRAM verify rounds would never advance, leaking
+        # stale per-req_pool_idx state onto reused slots. Disable the gen
+        # machinery in the model too: no state entry, no trigger latch work.
+        # (LCN_NGRAM=1 implies LCN_AGENT=1 — see entrypoint.)
+        self._lcn_gen_disabled = os.environ.get("LCN_AGENT", "0").strip() == "1"
+
         # KV pool references for dual-path CFG (set by model_runner after load)
         self._model_runner = None
 
@@ -1185,6 +1215,63 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                     audio_items.append(item)
         return image_items, audio_items
 
+    # --- Gen-trigger latch (see __init__ comment) ---
+
+    def lcn_trigger_scan(self, next_token_ids: torch.Tensor):
+        """Post-sample hook: latch whether any just-sampled token is a
+        gen-ENTRY trigger (audiogen_start / image_start). Called from the
+        ngram manager's update_after_decode with the RAW sampled ids (before
+        the hash-table zeroing — the triggers are >= the text vocab and would
+        be zeroed away). Never runs inside CUDA graph capture."""
+        if self._lcn_gen_disabled:
+            return
+        dev = next_token_ids.device
+        if self._trigger_ids_gpu is None or self._trigger_ids_gpu.device != dev:
+            self._trigger_ids_gpu = torch.tensor(
+                [self._audiogen_start_id, self._image_start_id],
+                dtype=torch.int64, device=dev,
+            )
+            self._trigger_host = torch.zeros(1, dtype=torch.uint8, pin_memory=True)
+            self._trigger_event = torch.cuda.Event()
+        hit = torch.isin(
+            next_token_ids.to(torch.int64), self._trigger_ids_gpu
+        ).any()
+        self._trigger_host.copy_(hit.reshape(1).to(torch.uint8), non_blocking=True)
+        self._trigger_event.record()
+        self._trigger_armed = True
+
+    def _lcn_fold_trigger(self):
+        """Fold the last scan's async flag into the sticky latch. The event
+        wait covers a 1-byte D2H enqueued right after the previous step's
+        sampling — effectively always landed by now (bounded by one decode
+        step's GPU tail in deep overlap)."""
+        if self._trigger_armed:
+            self._trigger_event.synchronize()
+            if bool(self._trigger_host[0]):
+                self._trigger_sticky = True
+                self._trigger_decay = 0
+            self._trigger_armed = False
+
+    def lcn_gen_watch_active(self) -> bool:
+        """True when the decode state machines must run this forward."""
+        if self._lcn_gen_disabled:
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            # CUDA graph capture runs this forward once with a dummy batch:
+            # no host waits, and the captured graph must be the sync-free
+            # text path (gen batches veto replay and run eager).
+            return False
+        self._lcn_fold_trigger()
+        return bool(
+            self._audio_gen_states or self._image_gen_states
+        ) or self._trigger_sticky
+
+    def lcn_cuda_graph_veto(self) -> bool:
+        """Graph replay veto (consulted by the decode graph runner patch):
+        graphed decode skips the Python state machines entirely, so any batch
+        that might need them must run eager."""
+        return self.lcn_gen_watch_active()
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1303,16 +1390,39 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             hidden_states, aux_hidden_states = hidden_states
 
         # --- Step 3: Multimodal generation state machine (decode only) ---
+        # Gated by the gen-trigger latch: on steady-state text decode the
+        # per-element .item() loops are skipped entirely (no host syncs — the
+        # path CUDA graphs capture). The latch guarantees the loops run on the
+        # step where a gen-entry trigger arrives as input.
+        _run_sm = is_decode and self.lcn_gen_watch_active()
         audio_logit_overrides = {}  # batch_idx → forced_token_id
-        if is_decode and self.audio_head is not None:
+        if _run_sm and self.audio_head is not None:
             audio_logit_overrides = self._audio_gen_decode_step(
                 input_ids, hidden_states, forward_batch
             )
         image_logit_overrides = {}
-        if is_decode and self.visual_head is not None:
+        if _run_sm and self.visual_head is not None:
             image_logit_overrides = self._image_gen_decode_step(
                 input_ids, hidden_states, forward_batch
             )
+        if (
+            _run_sm
+            and self._trigger_sticky
+            and not self._audio_gen_states
+            and not self._image_gen_states
+        ):
+            # Latch set but no trigger observed and no state entered — the
+            # trigger-carrying batch hasn't forwarded yet (interleaving), or
+            # its request died first. Decay so a dead trigger can't pin the
+            # engine to the eager path forever.
+            self._trigger_decay += 1
+            if self._trigger_decay >= 64:
+                logger.warning(
+                    "[GenTrigger] latch decayed after 64 decode steps with no "
+                    "trigger observed — clearing (request likely aborted)"
+                )
+                self._trigger_sticky = False
+                self._trigger_decay = 0
 
         # --- Step 4: Compute logits ---
         # The original model SKIPS lm_head during active visual/audio codebook
@@ -1514,6 +1624,7 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             if token == self._audiogen_start_id:
                 # Enter audio mode — start transcript phase
                 # Let lm_head generate text normally (transcript of what to speak)
+                self._trigger_sticky = False  # latch consumed (see __init__)
                 state = AudioGenState(mode="transcript")
                 self._audio_gen_states[req_idx] = state
                 logger.info(f"[AudioGen] req={req_idx}: entered audio mode, starting transcript phase")
@@ -1608,6 +1719,8 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         If so, force the first generated token to be audiotext_start_token_id
         and register the audio gen state for that request.
         """
+        if self._lcn_gen_disabled:
+            return
         if not hasattr(forward_batch, 'extend_seq_lens_cpu') or not forward_batch.extend_seq_lens_cpu:
             return
 
@@ -1651,6 +1764,7 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
 
             # Detect image_start_token_id → enter visual mode
             if token == self._image_start_id:
+                self._trigger_sticky = False  # latch consumed (see __init__)
                 state = ImageGenState()
                 self._image_gen_states[req_idx] = state
                 logger.info(f"[ImageGen] req={req_idx}: entered visual mode (37x37 grid), "
@@ -1777,6 +1891,8 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         forced image_pad that follows carries token-1 feedback — never a
         zero-embedded input, and no +1 raster position shift.
         """
+        if self._lcn_gen_disabled:
+            return
         if not hasattr(forward_batch, 'extend_seq_lens_cpu') or not forward_batch.extend_seq_lens_cpu:
             return
 

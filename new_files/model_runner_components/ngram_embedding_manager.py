@@ -39,6 +39,11 @@ class NgramEmbeddingManager:
     table: Optional[torch.Tensor]
     n: int
     k: int
+    # LongCat-Next overlay: post-sample gen-trigger scan hook (the model's
+    # lcn_trigger_scan). Runs here because update_after_decode is the one
+    # per-step host-side point that sees every sampled batch OUTSIDE any CUDA
+    # graph capture/replay. None for models without the hook.
+    trigger_scan: Optional[object] = None
 
     @classmethod
     def from_model(
@@ -82,6 +87,7 @@ class NgramEmbeddingManager:
             table=token_table,
             n=ngram_embedding_n,
             k=ngram_embedding_k,
+            trigger_scan=getattr(model, "lcn_trigger_scan", None),
         )
 
     def update_after_decode(
@@ -93,6 +99,10 @@ class NgramEmbeddingManager:
         ngram_embedding_info = forward_batch.ngram_embedding_info
         if ngram_embedding_info is None:
             return
+        if self.trigger_scan is not None:
+            # Must see the RAW sampled ids — gen-entry triggers are >= the
+            # text vocab and are zeroed for the hash table below.
+            self.trigger_scan(next_token_ids)
         update_ngram_token_table_after_sampling(
             ngram_embedding_info=ngram_embedding_info,
             next_token_ids=next_token_ids,
@@ -162,6 +172,42 @@ class NgramEmbeddingManager:
                     else None
                 )
         return batch
+
+
+def lcn_write_spec_tokens(
+    manager: NgramEmbeddingManager,
+    *,
+    tokens: torch.Tensor,
+    row_indices: torch.Tensor,
+    column_starts: torch.Tensor,
+    req_lens: torch.Tensor,
+) -> None:
+    """Write speculative-decoding tokens into the ngram hash table.
+
+    Called from the NGRAM spec worker patch (patches/ngram_spec_verify.patch)
+    at two points: (a) draft tokens BEFORE the verify forward — the hash
+    kernel reads context exclusively from the table, so draft position i needs
+    drafts 0..i-1 present (exact for CHAIN drafts; tree branching >1 is not
+    supported — the entrypoint pins bfs breadth to 1); (b) accepted tokens
+    AFTER verification — the spec path bypasses model_runner.sample(), so the
+    normal update_after_decode table write never runs for accepted tokens.
+    Rejected drafts left beyond the accepted region are harmless: the kernel
+    only ever reads backwards from a live position, and later writes overwrite
+    them. Applies the same specials-to-zero hashing rule as every other write.
+    """
+    if not manager.enabled or tokens.numel() == 0:
+        return
+    toks = torch.where(
+        tokens < NGRAM_HASH_TEXT_VOCAB, tokens, torch.zeros_like(tokens)
+    ).to(torch.int32)
+    update_token_table(
+        ne_token_table=manager.table,
+        tokens=toks,
+        row_indices=row_indices,
+        column_starts=column_starts.to(torch.int32),
+        req_lens=req_lens.to(torch.int32),
+        ignore_tokens=None,
+    )
 
 
 def update_ngram_token_table_after_sampling(

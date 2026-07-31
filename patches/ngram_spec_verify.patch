@@ -1,0 +1,75 @@
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -1017,6 +1017,16 @@
+     def _init_ngram_embedding_info(self, batch: ScheduleBatch, device: torch.device):
+         if self.forward_mode.is_decode():
+             column_starts, req_lens = self.seq_lens - 1, 1
++        elif self.forward_mode.is_target_verify():
++            # LongCat-Next overlay: hand-built spec-verify batches do not
++            # carry extend_prefix_lens/extend_seq_lens, so the generic extend
++            # branch below leaves column_starts UNINITIALIZED (torch.empty in
++            # NgramEmbeddingInfo.create) -> out-of-bounds token-table indexing
++            # (CUDA illegal memory access). Draft token i sits at column
++            # seq_lens + i; the NGRAM worker patch writes the draft tokens
++            # into the table before this forward (chain drafts only).
++            column_starts = self.seq_lens
++            req_lens = self.spec_info.draft_token_num
+         else:
+             column_starts, req_lens = self.extend_prefix_lens, self.extend_seq_lens
+         self.ngram_embedding_info = NgramEmbeddingInfo.create(
+--- a/python/sglang/srt/speculative/ngram_worker.py
++++ b/python/sglang/srt/speculative/ngram_worker.py
+@@ -339,6 +339,27 @@
+             draft_token_num=self.draft_token_num,
+         )
+ 
++        # LongCat-Next overlay: the ngram hash kernel reads context only from
++        # its token table, so the drafts must be there before the verify
++        # forward (draft i at column seq_lens + i). Exact for CHAIN drafts
++        # (bfs breadth pinned to 1); a branching tree would lay siblings out
++        # linearly and corrupt the hash context.
++        _lcn_mgr = self.model_runner.ngram_embedding_manager
++        if _lcn_mgr.enabled:
++            from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
++                lcn_write_spec_tokens,
++            )
++
++            lcn_write_spec_tokens(
++                _lcn_mgr,
++                tokens=draft_tokens,
++                row_indices=batch.req_pool_indices,
++                column_starts=batch.seq_lens,
++                req_lens=torch.full(
++                    (bs,), self.draft_token_num, dtype=torch.int32, device=self.device
++                ),
++            )
++
+     def _update_ngram_corpus(self, batch: ScheduleBatch):
+         batch_tokens = []
+         i, stride = 0, self.draft_token_num
+@@ -441,6 +462,25 @@
+             accept_tokens = predict[accept_index].flatten()
+             next_token_ids = accept_tokens
+ 
++            # LongCat-Next overlay: the spec path bypasses
++            # model_runner.sample(), so the normal post-sample ngram table
++            # write never runs — do it here. The accepted tokens overwrite
++            # their draft-written columns (the bonus/correction token differs
++            # from its draft).
++            _lcn_mgr = self.model_runner.ngram_embedding_manager
++            if _lcn_mgr.enabled:
++                from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
++                    lcn_write_spec_tokens,
++                )
++
++                lcn_write_spec_tokens(
++                    _lcn_mgr,
++                    tokens=accept_tokens,
++                    row_indices=batch.req_pool_indices,
++                    column_starts=batch.seq_lens,
++                    req_lens=accept_lens,
++                )
++
+             # The KV mover expects drafts-only counts. NGRAM's
+             # accept_lens includes the bonus token, matching scheduler output.
+             num_correct_drafts_per_req = accept_lens - 1

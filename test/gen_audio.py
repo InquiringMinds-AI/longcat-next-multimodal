@@ -19,10 +19,12 @@ prompt = ("<longcat_system>Replicate the voice in the audio clip to formulate an
 print("[gen_audio] SYN_TEXT=%r  ref=%s" % (SYN_TEXT, REF), flush=True)
 before = set(glob.glob(f"{OUT}/longcat_tts_*.wav"))
 t0 = time.time()
+_key = os.environ.get("LCN_API_KEY", "").strip()
+_hdrs = {"Authorization": f"Bearer {_key}"} if _key else {}
 r = requests.post(f"http://localhost:{PORT}/generate",
                   json={"text": prompt, "audio_data": [REF],
                         "sampling_params": {"max_new_tokens": 1200, "temperature": 0.5, "top_k": 5, "top_p": 0.85}},
-                  timeout=900)
+                  headers=_hdrs, timeout=900)
 print("[gen_audio] HTTP %d in %ds" % (r.status_code, time.time() - t0), flush=True)
 try:
     print("[gen_audio] transcript:", (r.json().get("text") or "")[:200], flush=True)

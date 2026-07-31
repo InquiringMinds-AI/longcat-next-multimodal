@@ -280,10 +280,14 @@ class NgramEmbedding(torch.nn.Module):
         # Their hash context is zeroed so N-gram contributions are ~0.
         # Giving them just the word embedding (= sum / 13 * 13 ≈ word_embed)
         # is the cleanest match. Use word_embed directly for these positions.
-        if hasattr(self, '_oe_ignored_range') and self._oe_ignored_range is not None:
+        # Branch-free (torch.where, no .any() host sync): this forward runs
+        # inside CUDA graph capture, where data-dependent host branching aborts
+        # the capture.
+        if self._oe_ignored_range is not None:
             lo, hi = self._oe_ignored_range
             ignored_mask = (input_ids >= lo) & (input_ids < hi)
-            if ignored_mask.any():
-                result[ignored_mask] = all_hidden_states[0, ignored_mask]
+            result = torch.where(
+                ignored_mask.unsqueeze(-1), all_hidden_states[0], result
+            )
 
         return result

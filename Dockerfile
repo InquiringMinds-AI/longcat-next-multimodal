@@ -37,7 +37,9 @@ RUN pip install --no-cache-dir librosa soundfile "scipy==1.17.1"
 COPY patches/ /tmp/patches/
 RUN cd /sgl-workspace/sglang && \
     patch -p1 < /tmp/patches/model_config.patch && \
-    patch -p1 < /tmp/patches/configs_longcat_flash.patch
+    patch -p1 < /tmp/patches/configs_longcat_flash.patch && \
+    patch -p1 < /tmp/patches/decode_graph_gen_veto.patch && \
+    patch -p1 < /tmp/patches/ngram_spec_verify.patch
 
 # --- GB10 fix: on an ARM host SGLang routes the int8 MoE to a CPU-only op even on GPU.
 #     Require actually-on-CPU so the GB10 GPU/Triton path runs. ---
