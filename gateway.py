@@ -27,6 +27,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoTokenizer
 from longcat_tools import build_tools_system_block, parse_tool_calls
+from stream_tools import ToolStreamFilter, MARKERS as STREAM_MARKERS
 from anthropic_route import router as anthropic_router
 
 SGLANG = "http://localhost:%s" % os.environ.get("SGLANG_INTERNAL_PORT", "30000")
@@ -226,6 +227,81 @@ async def _stream_chat(body):
             yield chunk
 
 
+async def _sse_deltas(client, url, body):
+    """Yield (content_piece, finish_reason, usage) triples from an OpenAI SSE stream."""
+    async with client.stream("POST", url, json=body) as r:
+        async for line in r.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                return
+            try:
+                j = json.loads(data)
+            except Exception:
+                continue
+            ch = (j.get("choices") or [{}])[0] if j.get("choices") else {}
+            piece = (ch.get("delta") or {}).get("content") or ""
+            yield piece, ch.get("finish_reason"), j.get("usage")
+
+
+def _earliest_marker(text):
+    idxs = [text.find(m) for m in STREAM_MARKERS]
+    idxs = [i for i in idxs if i != -1]
+    return min(idxs) if idxs else -1
+
+
+async def _stream_chat_with_tools(b2, tools, model):
+    """Live token streaming on the tools path: pass text through, go silent at the
+    first tool marker, emit parsed tool_calls at the end (ROADMAP #2)."""
+    filt = ToolStreamFilter()
+    cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
+
+    def chunk(delta, finish=None):
+        return "data: " + json.dumps(
+            {"id": cid, "object": "chat.completion.chunk", "created": created,
+             "model": model,
+             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]},
+            ensure_ascii=False) + "\n\n"
+
+    yield chunk({"role": "assistant"})
+    finish_reason = "stop"
+    b3 = dict(b2)
+    b3["stream"] = True
+    try:
+        async for piece, fr, _usage in _sse_deltas(_client, SGLANG + "/v1/chat/completions", b3):
+            if fr:
+                finish_reason = fr
+            out = filt.feed(piece)
+            if out:
+                yield chunk({"content": out})
+    except httpx.ConnectError:
+        yield chunk({"content": "[backend unavailable]"})
+        yield chunk({}, "stop")
+        yield "data: [DONE]\n\n"
+        return
+    leftover, raw = filt.finish()
+    if leftover:
+        yield chunk({"content": leftover})
+    calls = []
+    if filt.saw_marker:
+        _normal, calls = parse_tool_calls(raw, tools)
+        if not calls:
+            # Marker never parsed into calls — release the swallowed text
+            i = _earliest_marker(raw)
+            if i != -1:
+                yield chunk({"content": raw[i:]})
+    if calls:
+        for i, c in enumerate(calls):
+            yield chunk({"tool_calls": [{"index": i, "id": c["id"], "type": "function",
+                        "function": {"name": c["function"]["name"],
+                                     "arguments": c["function"]["arguments"]}}]})
+        yield chunk({}, "tool_calls")
+    else:
+        yield chunk({}, finish_reason)
+    yield "data: [DONE]\n\n"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
     body = await req.json()
@@ -245,7 +321,11 @@ async def chat_completions(req: Request):
             msgs2[0]["content"] = block + "\n\n" + msgs2[0]["content"]
         else:
             msgs2 = [{"role": "system", "content": block}] + msgs2
-        b2 = dict(body); b2["messages"] = msgs2; b2.pop("tools", None); b2.pop("tool_choice", None); b2["stream"] = False
+        b2 = dict(body); b2["messages"] = msgs2; b2.pop("tools", None); b2.pop("tool_choice", None)
+        if b2.pop("stream", False):
+            return StreamingResponse(
+                _stream_chat_with_tools(b2, tools, body.get("model", MODEL)),
+                media_type="text/event-stream")
         try:
             r = await _client.post(SGLANG + "/v1/chat/completions", json=b2)
         except httpx.ConnectError:

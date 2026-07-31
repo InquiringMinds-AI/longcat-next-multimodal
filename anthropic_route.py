@@ -14,9 +14,9 @@ OpenAI-style tool_calls (arguments = JSON string) through SGLang renders garbage
 content-side rendering sidesteps that entirely. Tool RESULTS go through as role:"tool"
 messages, which the template renders correctly (<longcat_tool_response>).
 
-Streaming is buffered-then-emitted: the tool path needs the full completion to parse
-XML, so we generate non-streaming and then synthesize the Anthropic SSE event sequence.
-Anthropic clients (Claude Code included) tolerate chunky streams.
+Streaming is INCREMENTAL (real deltas): text passes through live; a tool marker
+silences pass-through mid-stream and the buffered tail parses into tool_use blocks at
+stream end (stream_tools.ToolStreamFilter, shared with the OpenAI route).
 """
 import json, os, time, uuid
 import httpx
@@ -24,6 +24,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from longcat_tools import build_tools_system_block, parse_tool_calls
+from stream_tools import ToolStreamFilter, MARKERS as _MARKERS
 
 SGLANG = "http://localhost:%s" % os.environ.get("SGLANG_INTERNAL_PORT", "30000")
 router = APIRouter()
@@ -126,28 +127,97 @@ def _sse(event, data):
     return "event: %s\ndata: %s\n\n" % (event, json.dumps(data, ensure_ascii=False))
 
 
-async def _stream_events(msg):
-    """Synthesize the Anthropic SSE sequence from a complete message dict."""
-    head = {k: msg[k] for k in ("id", "type", "role", "model")}
-    head.update({"content": [], "stop_reason": None, "stop_sequence": None,
-                 "usage": {"input_tokens": msg["usage"]["input_tokens"], "output_tokens": 0}})
+async def _stream_live(body, sg_body, oai_tools):
+    """REAL incremental SSE (ROADMAP #2): text deltas pass through as they arrive;
+    a tool marker silences pass-through and the buffered tail parses into tool_use
+    blocks at the end. The old buffered-then-synthesized path remains for
+    stream=false only."""
+    filt = ToolStreamFilter()
+    mid = "msg_" + uuid.uuid4().hex[:24]
+    model = body.get("model", "longcat-next")
+    head = {"id": mid, "type": "message", "role": "assistant", "model": model,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0}}
     yield _sse("message_start", {"type": "message_start", "message": head})
-    for i, block in enumerate(msg["content"]):
-        if block["type"] == "text":
-            yield _sse("content_block_start", {"type": "content_block_start", "index": i,
-                                               "content_block": {"type": "text", "text": ""}})
-            yield _sse("content_block_delta", {"type": "content_block_delta", "index": i,
-                                               "delta": {"type": "text_delta", "text": block["text"]}})
-        else:  # tool_use
-            yield _sse("content_block_start", {"type": "content_block_start", "index": i,
-                       "content_block": {"type": "tool_use", "id": block["id"], "name": block["name"], "input": {}}})
-            yield _sse("content_block_delta", {"type": "content_block_delta", "index": i,
-                       "delta": {"type": "input_json_delta",
-                                 "partial_json": json.dumps(block["input"], ensure_ascii=False)}})
-        yield _sse("content_block_stop", {"type": "content_block_stop", "index": i})
+    finish_reason, usage = "stop", {}
+    text_open = False
+    idx = 0
+    sg2 = dict(sg_body)
+    sg2["stream"] = True
+    sg2["stream_options"] = {"include_usage": True}
+
+    def text_delta(t):
+        return _sse("content_block_delta", {"type": "content_block_delta", "index": idx,
+                    "delta": {"type": "text_delta", "text": t}})
+
+    try:
+        async with _client.stream("POST", SGLANG + "/v1/chat/completions", json=sg2) as r:
+            async for line in r.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    j = json.loads(data)
+                except Exception:
+                    continue
+                if j.get("usage"):
+                    usage = j["usage"]
+                ch = (j.get("choices") or [{}])[0] if j.get("choices") else {}
+                if ch.get("finish_reason"):
+                    finish_reason = ch["finish_reason"]
+                out = filt.feed((ch.get("delta") or {}).get("content") or "")
+                if out:
+                    if not text_open:
+                        yield _sse("content_block_start", {"type": "content_block_start",
+                                   "index": idx, "content_block": {"type": "text", "text": ""}})
+                        text_open = True
+                    yield text_delta(out)
+    except httpx.ConnectError:
+        if not text_open:
+            yield _sse("content_block_start", {"type": "content_block_start", "index": idx,
+                       "content_block": {"type": "text", "text": ""}})
+            text_open = True
+        yield text_delta("[backend unavailable]")
+    leftover, raw = filt.finish()
+    calls = []
+    tail_text = leftover
+    if filt.saw_marker:
+        if oai_tools:
+            _normal, calls = parse_tool_calls(raw, oai_tools)
+        if not calls:
+            # Marker without parseable calls (or no tools declared): release the text
+            i = min((raw.find(m) for m in _MARKERS if m in raw), default=-1)
+            if i != -1:
+                tail_text = raw[i:]
+    if tail_text:
+        if not text_open:
+            yield _sse("content_block_start", {"type": "content_block_start", "index": idx,
+                       "content_block": {"type": "text", "text": ""}})
+            text_open = True
+        yield text_delta(tail_text)
+    if text_open:
+        yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+        idx += 1
+    for c in calls:
+        try:
+            args = json.loads(c["function"]["arguments"])
+        except Exception:
+            args = {}
+        yield _sse("content_block_start", {"type": "content_block_start", "index": idx,
+                   "content_block": {"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex[:24],
+                                     "name": c["function"]["name"], "input": {}}})
+        yield _sse("content_block_delta", {"type": "content_block_delta", "index": idx,
+                   "delta": {"type": "input_json_delta",
+                             "partial_json": json.dumps(args, ensure_ascii=False)}})
+        yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+        idx += 1
+    stop = "tool_use" if calls else _STOP_MAP.get(finish_reason, "end_turn")
     yield _sse("message_delta", {"type": "message_delta",
-                                 "delta": {"stop_reason": msg["stop_reason"], "stop_sequence": None},
-                                 "usage": {"output_tokens": msg["usage"]["output_tokens"]}})
+               "delta": {"stop_reason": stop, "stop_sequence": None},
+               "usage": {"input_tokens": int(usage.get("prompt_tokens", 0) or 0),
+                         "output_tokens": int(usage.get("completion_tokens", 0) or 0)}})
     yield _sse("message_stop", {"type": "message_stop"})
 
 
@@ -171,6 +241,9 @@ async def messages(req: Request):
                      ("top_k", "top_k"), ("stop_sequences", "stop")):
         if body.get(src) is not None:
             sg_body[dst] = body[src]
+    if body.get("stream"):
+        return StreamingResponse(_stream_live(body, sg_body, oai_tools),
+                                 media_type="text/event-stream")
     try:
         r = await _client.post(SGLANG + "/v1/chat/completions", json=sg_body)
     except httpx.ConnectError:
@@ -192,8 +265,6 @@ async def messages(req: Request):
            "stop_reason": _STOP_MAP.get(fr, "end_turn"), "stop_sequence": None,
            "usage": {"input_tokens": int(usage.get("prompt_tokens", 0) or 0),
                      "output_tokens": int(usage.get("completion_tokens", 0) or 0)}}
-    if body.get("stream"):
-        return StreamingResponse(_stream_events(msg), media_type="text/event-stream")
     return JSONResponse(msg)
 
 

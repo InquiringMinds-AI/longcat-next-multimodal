@@ -62,18 +62,20 @@ try:
 except Exception as e:
     rec("tool_roundtrip", False, str(e))
 
-# 4. streaming SSE shape
+# 4. streaming SSE shape — INCREMENTAL: a multi-sentence answer must arrive as
+# MULTIPLE text deltas (buffered-then-synthesized emitted exactly one)
 try:
     r = requests.post(BASE + "/v1/messages", headers=HEADERS, json={
-        "model": "longcat-next", "max_tokens": 16, "stream": True,
-        "messages": [{"role": "user", "content": "Reply with the single word: ready"}]},
+        "model": "longcat-next", "max_tokens": 200, "stream": True,
+        "messages": [{"role": "user", "content": "In two or three sentences, what is a lighthouse for?"}]},
         timeout=300, stream=True)
     events = [ln.split(": ", 1)[1] for ln in r.iter_lines(decode_unicode=True)
               if ln and ln.startswith("event: ")]
     need = ["message_start", "content_block_start", "content_block_delta",
             "content_block_stop", "message_delta", "message_stop"]
-    ok = all(e in events for e in need)
-    rec("streaming", ok, "->".join(events))
+    n_deltas = events.count("content_block_delta")
+    ok = all(e in events for e in need) and n_deltas >= 3
+    rec("streaming", ok, "%d text deltas; %s" % (n_deltas, "->".join(dict.fromkeys(events))))
 except Exception as e:
     rec("streaming", False, str(e))
 

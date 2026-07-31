@@ -57,6 +57,7 @@ COPY test/ /workspace/scripts/
 COPY voices/ /workspace/scripts/voices/
 COPY gateway.py /workspace/scripts/gateway.py
 COPY longcat_tools.py /workspace/scripts/longcat_tools.py
+COPY stream_tools.py /workspace/scripts/stream_tools.py
 COPY anthropic_route.py /workspace/scripts/anthropic_route.py
 
 # default output dir for generated PNG/WAV (override + mount via run.sh)

@@ -19,3 +19,5 @@ outputs/
 # NOTE: examples/ and voices/ media (*.png / *.wav) are intentionally tracked —
 # they ship with the package (demo outputs + TTS reference clips). No blanket
 # *.png / *.wav ignore here.
+calibrate_spark_nf4.py
+diag_patch.py
