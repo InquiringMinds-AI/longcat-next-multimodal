@@ -218,9 +218,16 @@ start buffering only when `<longcat_tool_call>` appears mid-stream; emit parsed 
 calls at the end. Applies to `/v1/chat/completions` (tools branch) and `/v1/messages`.
 No interaction with any engine work below.
 
-- [ ] OpenAI route: stream-with-tool-detection
-- [ ] Anthropic route: real SSE deltas (replace buffered-then-emitted synthesis)
-- [ ] test_anthropic streaming check tightened (multiple text deltas expected)
+- [x] OpenAI route: stream-with-tool-detection — VALIDATED 2026-07-31: first
+      content delta at 0.52s of a 4.23s completion (was: full buffer wait), 81
+      live deltas; streamed tool call emits tool_calls deltas +
+      finish_reason=tool_calls correctly.
+- [x] Anthropic route: real SSE deltas — VALIDATED: 96 text deltas on a
+      multi-sentence answer (buffered path emitted exactly 1); 5/5 route checks.
+- [x] test_anthropic streaming check tightened (>=3 text deltas required)
+      Implementation: stream_tools.ToolStreamFilter (shared, unit-tested) —
+      rolling-tail withholding so partial markers never leak; silent-buffer
+      from first marker; marker-without-calls releases the swallowed text.
 
 ## 3. n-gram embedding rework (engine-deep — the double unlock)
 
