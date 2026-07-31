@@ -186,9 +186,15 @@ local w8a8 shards — the sidecar (rows 131125:) was simply never extracted.
         render the FIRST sound too fast or slightly distorted but recognizable
         ("the s in self is present but so fast I wasn't sure it was there").
         Residual is a rendering-speed/attack artifact on frame 1, not missing
-        content; candidate follow-ups: D3 (transcript greedy vs original's
-        sampled), first-frame vocoder attack behavior, or accept as model/
-        quant baseline (BF16 reference behavior unknown).
+        content. D3 (sampled transcript, original semantics) TESTED 2026-07-31:
+        owner verdict "most are good" but no clear onset improvement — failure
+        texture changed (junk-syllable prepend "uf...Self", vowel substitution
+        "ee-very") at a similar rate (2/5 vs 3/5; n=5 = noise, no ranking
+        claim). D3 KEPT on faithfulness grounds (LCN_TRANSCRIPT_GREEDY=1
+        reverts). Residual first-frame variance now presumed MODEL BASELINE
+        (all known mechanical divergences fixed; failures are wrong-content
+        picks, not missing content). Optional polish if wanted: gateway
+        opt-in leading pause (the proven damage absorber).
       * IMAGES: "overall, better coherence" — windowsill PRESENT (adherence
         fixed on that prompt), bird proportions look right, market now has
         BOTH people (adherence improved). Residual geometry flaws remain
