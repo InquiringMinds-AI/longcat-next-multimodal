@@ -63,6 +63,13 @@ KV_FLAGS=""
 # degrades image generation. Set LCN_NGRAM_EOS=<token_id> to opt into upstream behavior.
 export LCN_NGRAM_EOS="${LCN_NGRAM_EOS:--1}"
 
+# TTS onset conditioning (owner-validated defaults, 2026-07-31): inject 1 encoded-
+# silence frame before the acoustic head's first free sample (absorbs the first-
+# frame onset garble: "these all work"), and trim the rendered leading silence
+# back to ~150ms (the model extends injected silence by momentum). 0/0 disables.
+export LCN_TTS_SILENCE_FRAMES="${LCN_TTS_SILENCE_FRAMES:-1}"
+export LCN_TTS_TRIM_LEAD_MS="${LCN_TTS_TRIM_LEAD_MS:-150}"
+
 # Radix (prefix) cache: ON by default — warm-prefix reuse is what makes agentic clients
 # (Claude Code re-sends a ~15k-token system prompt every turn) responsive. Viable only
 # WITH the expandable_segments allocator above (radix keeps KV resident, which amplified

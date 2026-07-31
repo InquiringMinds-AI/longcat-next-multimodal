@@ -204,8 +204,16 @@ local w8a8 shards — the sidecar (rows 131125:) was simply never extracted.
         N=1 + TRIM OWNER VERDICT (2026-07-31): "these all work" — zero garble,
         all female, natural; residual = accent/tone variation ("plausibly the
         same speaker, but if they were doing impressions") — generic-silence
-        anchoring still dilutes the clone slightly. Reference-voice lead build
-        (request-time derivation, drop-in voices) in capture.
+        anchoring still dilutes the clone slightly.
+        REFERENCE-VOICE LEAD: TESTED AND REJECTED (owner: "all worse" — identity
+        NOT maintained, one clip devolved into nonsense). Post-mortem: a
+        mid-utterance reference frame, even the quietest, implies DISCONTINUITY
+        as generation history — worse than neutral silence. Code reverted.
+        SHIPPING DEFAULT (baked into entrypoint): LCN_TTS_SILENCE_FRAMES=1 +
+        LCN_TTS_TRIM_LEAD_MS=150 (the owner-validated "these all work" config).
+        Residual impressions-grade identity wander = accepted baseline for now;
+        remaining ideas if ever revisited: longer/denser reference conditioning,
+        temperature reduction on the first free frames.
         INJECTION N=2 OWNER VERDICT (2026-07-31): "the utterances are perfect"
         — ALL FIVE sentences intact, onset defect fully absorbed. One issue:
         the model EXTENDS injected silence by momentum (20-40% of each clip was
