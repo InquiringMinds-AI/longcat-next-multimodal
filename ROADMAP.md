@@ -56,8 +56,11 @@ rebase would force re-porting, so this gate comes first.
       44/300; pre-divergence |dlogprob| max 0.268 mean 0.028. A decode-path kernel
       changed (flashinfer decode attn / fused-MoE / DeepGemm) — plausible carrier for
       whole-clip prosody drift (audio codec tokens decode-generated + perturbation-
-      sensitive). Toggle A/B running: SGLANG_ENABLE_JIT_DEEPGEMM=0 on v0516 vs the
-      v512 baseline.
+      sensitive). Toggle A/B DONE: SGLANG_ENABLE_JIT_DEEPGEMM=0 on v0516 is
+      BIT-IDENTICAL to DeepGemm-on (300/300 greedy tokens, zero scoring drift) —
+      DeepGemm is INERT for this w8a8_int8 checkpoint; the startup ue8m0 warning is
+      noise. DeepGemm ELIMINATED as a TTS suspect; decode drift must come from
+      flashinfer decode-attention or fused-MoE changes between releases.
       (iii) TTS path is NONDETERMINISTIC even at temp 0 (main-stream greedy; run
       lengths differ 38/53 v512, 82/109 v516) while text is bit-exact — the audio
       codec heads sample internally; nondeterminism enters via audio machinery only.
@@ -120,9 +123,10 @@ reason #1 settles first).
       multi-image understanding while sampling MemAvailable at 1s; step 0.72→0.73→0.74
       until the measured floor drops below ~2.5–3GB margin; ship the last safe value.
 
-- [ ] **DeepGemm accuracy flag**: launches warn `scale_fmt is not ue8m0 — might cause
-      accuracy degradation on Blackwell`. A/B DeepGemm on/off for quality + speed;
-      keep or disable with evidence.
+- [x] **DeepGemm accuracy flag**: RESOLVED 2026-07-31 (early, via the TTS
+      investigation) — SGLANG_ENABLE_JIT_DEEPGEMM=0 vs on is bit-identical on v0.5.16
+      (greedy tokens + teacher-forced logprobs): DeepGemm is inert for this w8a8_int8
+      checkpoint and the `scale_fmt is not ue8m0` warning is noise. Nothing to tune.
 - [ ] **Prefill tuning**: cold prefill measured ~2.6k tok/s; try larger
       `chunked_prefill_size` / `max_prefill_tokens` on the 128 GB box.
 - [ ] **fp8 KV re-bench** post-#4 (owner-validated for quality; −41% decode pre-tuning —
