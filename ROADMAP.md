@@ -118,7 +118,18 @@ local w8a8 shards — the sidecar (rows 131125:) was simply never extracted.
 
 - [x] Sidecar extracted on Spark from the local checkpoint (151499×3072 BF16,
       931MB) → `~/models/LongCat-Next-w8a8int8/codebook_embeddings.safetensors`
-- [ ] Post-fix generation captures (TTS + image) — OWNER eyes/ears verdict pending
+- [x] Post-fix generation captures (TTS + image) — OWNER verdicts 2026-07-31:
+      image "cat looks great, no windowsill" (quality good, composition adherence
+      miss); TTS onset STILL damaged post-sidecar (prod garbled the word before
+      "reflection"; temp-0 started mid-word at "lection"). Sidecar fix stands on
+      restore-original-behavior grounds, but it was NOT the onset root cause.
+      VOCODING RULED OUT by frame arithmetic: all clips decode at a consistent
+      12.5 frames/sec and wav duration == frames/12.5 exactly, so the missing
+      word's frames were never accumulated — the loss is at generation/
+      accumulation time (mode-entry frame drop, or the model "fading in" with
+      unusable first frames). Sacrificial-leading-word probe ("Okay. Self...")
+      delivered — if the filler absorbs the damage, damage is positional
+      (~first 8 frames) and a leading pause is a workable mitigation.
 - [ ] If validated: add extraction step/script to the repo (quantize/ or docs) so
       distributed deployments can produce the sidecar; note in README + HF card
 - [ ] Re-examine the onset defect and image hard-prompt quality AFTER this fix —
