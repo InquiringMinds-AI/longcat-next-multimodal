@@ -46,6 +46,15 @@ huggingface-cli download InquiringMinds-AI/LongCat-Next-w8a8-int8-GB10 --local-d
 The weights directory is **self-contained** (~90 GB): quantized backbone + tokenizers + image
 decoder + audio vocoder. Nothing else to fetch.
 
+Then extract the codebook-embedding sidecar the generation heads need (one-time, ~931 MB,
+sliced from the unquantized `embed_tokens` already in the shards):
+```bash
+python3 quantize/extract_codebook_embeddings.py ./longcat-next-gb10-weights
+```
+Without `codebook_embeddings.safetensors` the server still runs, but prior-level codebook
+conditioning in the audio/image generation heads silently degrades to zero vectors
+(watch for `codebook_embeddings.safetensors not found` in the logs).
+
 ## 2. Build the image
 ```bash
 docker build -t longcat-next-gb10 .

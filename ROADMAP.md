@@ -139,8 +139,9 @@ local w8a8 shards — the sidecar (rows 131125:) was simply never extracted.
       drop; note ~/longcat-outputs/pad_*_tts.wav suggest pad-prepend strategies
       were probed once before — check what was learned. NOTE: onset defect
       predates the rebase (v512 swallowed whole words) — NOT a rebase blocker.
-- [ ] If validated: add extraction step/script to the repo (quantize/ or docs) so
-      distributed deployments can produce the sidecar; note in README + HF card
+- [x] Extraction script shipped (`quantize/extract_codebook_embeddings.py`) +
+      README step 1 note (2026-07-31). HF model card note still pending; option:
+      upload the 931MB sidecar to the HF weights repo so downloads are turnkey.
 - [ ] Re-examine the onset defect and image hard-prompt quality AFTER this fix —
       earlier verdicts (quant-bound imagery, shared onset bug) may need revision
 
