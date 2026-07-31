@@ -128,8 +128,17 @@ local w8a8 shards — the sidecar (rows 131125:) was simply never extracted.
       word's frames were never accumulated — the loss is at generation/
       accumulation time (mode-entry frame drop, or the model "fading in" with
       unusable first frames). Sacrificial-leading-word probe ("Okay. Self...")
-      delivered — if the filler absorbs the damage, damage is positional
-      (~first 8 frames) and a leading pause is a workable mitigation.
+      OWNER VERDICT: damage is POSITIONAL and bounded — run b fully complete,
+      run a lost only "O"/part of "Okay" (~1-2 frames); "Self reflection" intact
+      in both. The 0-vs-2-frame variance argues against a fixed code off-by-N
+      and toward the model's own onset (leading breath/silence frames absorb the
+      loss when present), with at most a small mechanical component. Leading-
+      filler prepend is a proven mitigation. NEXT: env-gated boundary
+      instrumentation (log step offset of first accumulated frame + level-0
+      content of first ~8 frames) to separate model fade-in from mechanical
+      drop; note ~/longcat-outputs/pad_*_tts.wav suggest pad-prepend strategies
+      were probed once before — check what was learned. NOTE: onset defect
+      predates the rebase (v512 swallowed whole words) — NOT a rebase blocker.
 - [ ] If validated: add extraction step/script to the repo (quantize/ or docs) so
       distributed deployments can produce the sidecar; note in README + HF card
 - [ ] Re-examine the onset defect and image hard-prompt quality AFTER this fix —
