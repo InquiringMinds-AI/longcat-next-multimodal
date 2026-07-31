@@ -151,8 +151,31 @@ local w8a8 shards — the sidecar (rows 131125:) was simply never extracted.
       flawless, damage confined to first 0-2 phonemes, no phoneme-class correlation
       (two vowel-onset sentences went opposite ways) — stochastic head-of-clip loss.
       Sidecar retained on restore-original-mechanics grounds; it is NOT a quality
-      fix for either standing defect. Root-cause hunt continues (onset boundary
-      instrumentation; imagery presumed model/quant-bound pending contrary evidence).
+      fix for either standing defect.
+      ROOT CAUSES FOUND (2026-07-31, original-vs-port seam analysis, subagent
+      report; commit "Fix two boundary defects"):
+      * D1 — audio onset: the port wrote multimodal special tokens RAW into the
+        n-gram token table; the original NgramCache stores them as ZERO (hash
+        base = text vocab 131072; specials were never hashed in training). Raw
+        specials corrupt the hash context of exactly the first <=3 transcript
+        tokens (12/12 embedders at t1, 8/12 t2, 4/12 t3, clean from t4) — the
+        measured stochastic 0-2 phoneme onset loss. FIX: zero ids >=131072 at
+        both table-write sites (overlay ngram_embedding_manager.py; env
+        LCN_NGRAM_HASH_VOCAB). The kernel's ignore_tokens is NOT equivalent
+        (breaks the hash window instead of zeroing through it).
+      * D2 — image composition: visual token 1 was generated one step AFTER
+        image_start from a zero-embedded pad, shifting the whole raster +1
+        position vs training. Original generates token 1 from the image_start
+        hidden in the same forward. FIX: shared _image_gen_token_step called
+        from prefill detection + decode fall-through; CFG token 1 reuses the
+        uncond prefill's last hidden; uncond suffix ids rebuilt explicitly
+        (table now reads specials as 0).
+      * Also from the report, recorded not yet acted on: transcript decoding is
+        greedy vs original's sampled (D3, benign-leaning); end-of-audio differs
+        (2-consecutive-confirm + flag frame dropped vs first-flag + kept, D4);
+        rep-penalty window 50 frames vs all (D7); D1 partially twins into the
+        visual path via the anyres resolution tokens (now fixed by D1).
+      Post-fix review sets (5 TTS + 4 images) generating — OWNER verdict decides.
 
 ## 2. Incremental streaming (orthogonal — gateway only, no relaunch risk)
 
