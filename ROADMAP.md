@@ -175,7 +175,22 @@ local w8a8 shards — the sidecar (rows 131125:) was simply never extracted.
         (2-consecutive-confirm + flag frame dropped vs first-flag + kept, D4);
         rep-penalty window 50 frames vs all (D7); D1 partially twins into the
         visual path via the anyres resolution tokens (now fixed by D1).
-      Post-fix review sets (5 TTS + 4 images) generating — OWNER verdict decides.
+      Post-fix review sets (5 TTS + 4 images) — OWNER VERDICTS (2026-07-31):
+      * AUDIO: "all audio contains correct words" — the word/phoneme LOSS is
+        FIXED (D1 confirmed as the onset root cause). Residual: several clips
+        render the FIRST sound too fast or slightly distorted but recognizable
+        ("the s in self is present but so fast I wasn't sure it was there").
+        Residual is a rendering-speed/attack artifact on frame 1, not missing
+        content; candidate follow-ups: D3 (transcript greedy vs original's
+        sampled), first-frame vocoder attack behavior, or accept as model/
+        quant baseline (BF16 reference behavior unknown).
+      * IMAGES: "overall, better coherence" — windowsill PRESENT (adherence
+        fixed on that prompt), bird proportions look right, market now has
+        BOTH people (adherence improved). Residual geometry flaws remain
+        (child's arm backwards/handless, laptop base still wrong) — the
+        residual class is presumed model/quant-bound (single-sample caveat).
+      D2 confirmed as a real composition-adherence defect; both boundary fixes
+      VALIDATED as improvements and retained.
 
 ## 2. Incremental streaming (orthogonal — gateway only, no relaunch risk)
 
