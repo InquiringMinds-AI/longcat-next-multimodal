@@ -58,6 +58,9 @@ class AudioGenState:
     end_run: int = 0  # consecutive level-0 end-flags seen (for END_CONFIRM)
     ended: bool = False  # set when a confirmed end-of-audio cluster is reached
     rid: str = ""  # per-request id → unique output filename (concurrency-safe retrieval)
+    lead_frames: Optional[list] = None  # per-request lead frames (WITH offsets) from the
+    # REFERENCE voice's quietest segment — identity-anchored onset absorber; falls back
+    # to the generic _SILENCE_SEQ when the reference encode wasn't captured
 
 
 # Audio generation sampling config (from generation_config.json). Operator-tunable via env
@@ -494,6 +497,36 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 logger.info(f"[ImageGen] Freed uncond KV: {state.uncond_seq_len} tokens")
             except Exception as e:
                 logger.warning(f"[ImageGen] Failed to free uncond KV: {e}")
+
+    def _take_ref_lead(self):
+        """Consume the stashed reference encode -> the voice's own lead frames.
+
+        Picks the TTS_SILENCE_FRAMES consecutive reference frames with minimal
+        summed mel energy (her quietest segment — breath/room-tone, identity-
+        anchored). Returns a list of [num_codebooks] tensors WITH offsets, or
+        None (caller falls back to the generic _SILENCE_SEQ)."""
+        pending = getattr(self, "_pending_ref_lead", None)
+        self._pending_ref_lead = None
+        if pending is None or TTS_SILENCE_FRAMES <= 0:
+            return None
+        try:
+            offset_ids, energy = pending
+            n = TTS_SILENCE_FRAMES
+            if offset_ids.shape[0] < n or len(energy) < n:
+                return None
+            best, best_e = 0, float("inf")
+            for k in range(len(energy) - n + 1):
+                e = sum(energy[k:k + n])
+                if e < best_e:
+                    best, best_e = k, e
+            frames = [offset_ids[best + j].to(self.audio_offset_vals.device)
+                      for j in range(n)]
+            logger.info(f"[AudioGen] ref-voice lead: frames {best}..{best + n - 1} "
+                        f"of {offset_ids.shape[0]} (min-energy segment)")
+            return frames
+        except Exception as e:
+            logger.warning(f"[AudioGen] ref lead derivation failed: {e}")
+            return None
 
     def _trim_wav_lead(self, path):
         """Cut the rendered leading silence back to TTS_TRIM_LEAD_MS.
@@ -1153,6 +1186,24 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             else:
                 offset_ids = audio_ids
 
+            # Stash this reference's encoded frames + per-frame energy so audio-gen
+            # can derive an IDENTITY-ANCHORED lead (the voice's own quietest
+            # segment) at request time — drop-in voices need no packaging step.
+            # Single-slot: consumed by _check_prefill_audio_start in the same
+            # forward; concurrent multi-audio prefills would race (acceptable for
+            # the deployment's serial TTS use; worst case = generic-silence fallback).
+            if TTS_SILENCE_FRAMES > 0:
+                try:
+                    import numpy as _np
+                    mel = _np.asarray(audio_features)  # [n_mels, time]
+                    n_frames = offset_ids.shape[0]
+                    per = max(1, mel.shape[1] // max(n_frames, 1))
+                    energy = [float(mel[:, k * per:(k + 1) * per].mean())
+                              for k in range(n_frames)]
+                    self._pending_ref_lead = (offset_ids.detach().cpu(), energy)
+                except Exception:
+                    self._pending_ref_lead = None
+
             audio_embeddings = self._embed_multimodal_ids(offset_ids)  # [actual_seq, hidden_size]
 
             # Pad or truncate to match the expected bridge_length from processor
@@ -1515,6 +1566,7 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 # Enter audio mode — start transcript phase
                 # Let lm_head generate text normally (transcript of what to speak)
                 state = AudioGenState(mode="transcript")
+                state.lead_frames = self._take_ref_lead()
                 self._audio_gen_states[req_idx] = state
                 logger.info(f"[AudioGen] req={req_idx}: entered audio mode, starting transcript phase")
                 # No override — let lm_head generate transcript text
@@ -1564,12 +1616,19 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 # NOT stored (it carries no audio).
                 hs = hidden_states[i:i+1]  # [1, hidden_size]
                 if state.step_count < TTS_SILENCE_FRAMES:
-                    # First-frame conditioning: replay encoded-silence frames so the
-                    # model's first FREE sample sees real audio history.
-                    raw = _SILENCE_SEQ[min(state.step_count, len(_SILENCE_SEQ) - 1)]
-                    audio_ids = (torch.tensor(raw, dtype=torch.long,
-                                              device=self.audio_offset_vals.device)
-                                 + self.audio_offset_vals)
+                    # First-frame conditioning: replay lead frames so the model's
+                    # first FREE sample sees real audio history. Prefer the
+                    # REFERENCE VOICE's own quietest segment (identity-anchored,
+                    # derived per request — drop-in voices need no packaging);
+                    # fall back to generic encoded silence.
+                    if state.lead_frames:
+                        audio_ids = state.lead_frames[
+                            min(state.step_count, len(state.lead_frames) - 1)]
+                    else:
+                        raw = _SILENCE_SEQ[min(state.step_count, len(_SILENCE_SEQ) - 1)]
+                        audio_ids = (torch.tensor(raw, dtype=torch.long,
+                                                  device=self.audio_offset_vals.device)
+                                     + self.audio_offset_vals)
                 else:
                     audio_ids = self._generate_audio_codebook_step(hs, state)
                 if audio_ids is not None:
@@ -1623,6 +1682,7 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 if last_token == self._audiogen_start_id:
                     req_idx = forward_batch.req_pool_indices[i].item()
                     state = AudioGenState(mode="transcript")
+                    state.lead_frames = self._take_ref_lead()
                     self._audio_gen_states[req_idx] = state
                     # Let lm_head's transcript token pass through — the scheduler
                     # writes it to the N-gram token table for correct hash context.
