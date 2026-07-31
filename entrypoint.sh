@@ -58,6 +58,11 @@ NGRAM_FLAGS=""
 KV_FLAGS=""
 [ -n "${LCN_KV_DTYPE:-}" ] && KV_FLAGS="--kv-cache-dtype ${LCN_KV_DTYPE}"
 
+# n-gram embedding EOS semantics: -1 (legacy cross-boundary hashing) by default — the
+# checkpoint was trained/validated under it; sglang >=0.5.16's eos-exclusion measurably
+# degrades image generation. Set LCN_NGRAM_EOS=<token_id> to opt into upstream behavior.
+export LCN_NGRAM_EOS="${LCN_NGRAM_EOS:--1}"
+
 # Radix (prefix) cache: ON by default — warm-prefix reuse is what makes agentic clients
 # (Claude Code re-sends a ~15k-token system prompt every turn) responsive. Viable only
 # WITH the expandable_segments allocator above (radix keeps KV resident, which amplified

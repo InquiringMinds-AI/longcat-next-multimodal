@@ -27,9 +27,19 @@ rebase would force re-porting, so this gate comes first.
       dialect parser added after live CC runs surfaced it; scipy pinned 1.17.1.
       Validation: automated battery ALL GREEN (7/7 selftest, 6/6 degeneracy, 5/5
       anthropic, 3/3 live CC, 40-turn soak converging-flat) — but HUMAN review caught
-      generation regressions the battery could not: (a) image quality — FIXED, root
-      cause was the v0.5.16 n-gram EOS-break (neutralized via LCN_NGRAM_EOS=-1; keep -1
-      the default: the checkpoint was trained under cross-boundary hashing); (b) TTS
+      generation regressions the battery could not: (a) image quality — CLOSED
+      (2026-07-31, paired comparison + owner review): the rebase regression itself was
+      FIXED — root cause was the v0.5.16 n-gram EOS-break (neutralized via
+      LCN_NGRAM_EOS=-1; keep -1 the default: the checkpoint was trained under
+      cross-boundary hashing). The residual hard-composition failures (object-
+      interaction geometry, body-vehicle fusion, floating subjects) reproduce on
+      v0.5.12 with the same prompts — NOT a rebase bug. Owner verdict on the paired
+      set: no image is fully flawless (even the best, a portrait, has a subtle
+      geometry flaw); most likely an unavoidable quant artifact, though a serving-
+      implementation fault common to BOTH builds remains plausible (the paired test
+      only rules out rebase-introduced regression), and whether the BF16 base weights
+      could do better is an actual unknown (BF16 has never been run — no hardware on
+      hand can). Document as a model/quant capability bound; (b) TTS
       voice-clone — STILL REGRESSED: garbled first word ("Self"->"helf/pulf/uf-") +
       subtly robotic prosody throughout. ELIMINATED: n-gram eos (both paths verified
       env-covered), scipy 1.18, our overlay code (identical), mm offset machinery
