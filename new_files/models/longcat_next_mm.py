@@ -91,6 +91,11 @@ _SILENCE_SEQ = [
     [3608, 2959, 105, 491, 387, 336, 420, 675],
 ]
 TTS_SILENCE_FRAMES = _envi("LCN_TTS_SILENCE_FRAMES", 0)
+# The model EXTENDS injected silence (momentum: silence history begets silence
+# frames — owner-measured 20-40% silent lead at N=2). The wav-side trim cuts the
+# rendered lead back to a fixed small beat regardless of how much silence the
+# model chose to generate. 0 disables trimming entirely.
+TTS_TRIM_LEAD_MS = _envi("LCN_TTS_TRIM_LEAD_MS", 0)
 # End-of-audio is confirmed by this many CONSECUTIVE level-0 end-flags (canonical guard):
 # an isolated/stray end-flag is re-sampled to a real acoustic code so the model speaks for
 # exactly as long as its task needs — no arbitrary minimum-length floor.
@@ -489,6 +494,37 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 logger.info(f"[ImageGen] Freed uncond KV: {state.uncond_seq_len} tokens")
             except Exception as e:
                 logger.warning(f"[ImageGen] Failed to free uncond KV: {e}")
+
+    def _trim_wav_lead(self, path):
+        """Cut the rendered leading silence back to TTS_TRIM_LEAD_MS.
+
+        Energy-based: first 10ms window above 2% of peak RMS marks speech onset;
+        everything before (onset - lead) is dropped. No-op on failure or when the
+        existing lead is already short."""
+        try:
+            import numpy as np
+            import scipy.io.wavfile as wavfile
+            sr, data = wavfile.read(path)
+            mono = data if data.ndim == 1 else data[:, 0]
+            x = mono.astype(np.float32)
+            win = max(1, int(sr * 0.010))
+            n_win = len(x) // win
+            if n_win < 3:
+                return
+            rms = np.sqrt((x[:n_win * win].reshape(n_win, win) ** 2).mean(axis=1))
+            thresh = max(rms.max() * 0.02, 1.0)
+            above = np.nonzero(rms > thresh)[0]
+            if len(above) == 0:
+                return
+            onset = int(above[0]) * win
+            keep_lead = int(sr * TTS_TRIM_LEAD_MS / 1000.0)
+            start = max(0, onset - keep_lead)
+            if start <= 0:
+                return
+            wavfile.write(path, sr, mono[start:])
+            logger.info(f"[AudioGen] trimmed {start/sr:.2f}s of leading silence from {path}")
+        except Exception as e:
+            logger.warning(f"[AudioGen] lead trim failed (kept original): {e}")
 
     def _decode_token(self, token_id: int) -> str:
         """Decode a single token ID to text for logging."""
@@ -927,6 +963,8 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 wave_concat_overlap=AUDIO_GEN_WAVE_OVERLAP,
                 save_path=save_path,
             )
+            if TTS_TRIM_LEAD_MS > 0:
+                self._trim_wav_lead(save_path)
             logger.info(f"Audio saved to {save_path}")
             return save_path
 
