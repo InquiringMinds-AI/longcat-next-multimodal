@@ -95,6 +95,35 @@ rebase would force re-porting, so this gate comes first.
       <longcat_audio_end>; fix offsets to inclusive when touching this area.
       v0.5.12 image remains :latest / shipping; v0.5.16 work lives in :v0516.
 
+## 1b. MISSING CODEBOOK EMBEDDING SIDECAR (found 2026-07-31 — affects BOTH builds,
+##     both generation modalities, since original stand-up)
+
+Investigating the shared TTS onset defect surfaced that
+`codebook_embeddings.safetensors` never existed in the serving weights dir. The
+overlay's `_codebook_embed_fn` / `_embed_multimodal_ids` fall back to ZERO vectors
+for codebook-range ids when the sidecar is absent (the "will be clamped" warning
+undersells it — the log shows the warning firing ~8k times per generation). Effect:
+in `CasualDepthTransformerHead`, the within-frame prior-level conditioning
+(cumsum of prior codebook embeddings) is all zeros — every codebook level beyond
+level 0 samples with no knowledge of what the previous levels chose, for BOTH the
+audio head (8 levels) and visual head (8 levels). A standing quality ceiling on both
+generation paths that no automated battery could see, and a candidate contributor to
+the shared TTS onset damage and some image-quality flaws previously attributed to
+the quant.
+
+Root cause of absence: the quantize recipe correctly EXCLUDES `embed_tokens` from
+quantization, and the full multimodal table `model.embed_tokens.weight
+[282624, 3072] BF16` (text 131125 + audio 19456 + visual 131072 + pad) ships in the
+local w8a8 shards — the sidecar (rows 131125:) was simply never extracted.
+
+- [x] Sidecar extracted on Spark from the local checkpoint (151499×3072 BF16,
+      931MB) → `~/models/LongCat-Next-w8a8int8/codebook_embeddings.safetensors`
+- [ ] Post-fix generation captures (TTS + image) — OWNER eyes/ears verdict pending
+- [ ] If validated: add extraction step/script to the repo (quantize/ or docs) so
+      distributed deployments can produce the sidecar; note in README + HF card
+- [ ] Re-examine the onset defect and image hard-prompt quality AFTER this fix —
+      earlier verdicts (quant-bound imagery, shared onset bug) may need revision
+
 ## 2. Incremental streaming (orthogonal — gateway only, no relaunch risk)
 
 Both the OpenAI tool path and the Anthropic route currently buffer the whole completion
