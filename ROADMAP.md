@@ -43,10 +43,32 @@ rebase would force re-porting, so this gate comes first.
       voice-clone — STILL REGRESSED: garbled first word ("Self"->"helf/pulf/uf-") +
       subtly robotic prosody throughout. ELIMINATED: n-gram eos (both paths verified
       env-covered), scipy 1.18, our overlay code (identical), mm offset machinery
-      (agent-diffed byte-identical across tags). REMAINING SUSPECTS: v0.5.16 sampler
-      backend changes (fits whole-clip prosody + onset-worst signature; TTS samples at
-      temp 0.5 top_k 5), token-table lifecycle in the new NgramEmbeddingManager,
-      DeepGemm numeric drift. ALSO FOUND (latent, both versions): overlay emits
+      (agent-diffed byte-identical across tags). 2026-07-31 paired-probe evidence
+      (temp-0 + teacher-forced captures, radix off, both engines):
+      (i) SAMPLER statically near-cleared — sglang's joint top-k/top-p Python path is
+      behavior-equivalent across versions; flashinfer 0.6.11->0.6.14's new top_k_first
+      fast path doesn't engage for filter_apply_order="joint"; kernel diffs are two
+      edge-case fixes. temp-0 wav pairs (no sampling kernels at all) delivered for
+      owner ears — if those still garble, sampler is conclusively out.
+      (ii) BACKBONE PREFILL BIT-IDENTICAL across versions (teacher-forced scoring of a
+      fixed 127-token passage: zero logprob delta), and each version is bit-exact
+      run-to-run on text. BUT DECODE NUMERICS DIFFER: greedy prose diverges at token
+      44/300; pre-divergence |dlogprob| max 0.268 mean 0.028. A decode-path kernel
+      changed (flashinfer decode attn / fused-MoE / DeepGemm) — plausible carrier for
+      whole-clip prosody drift (audio codec tokens decode-generated + perturbation-
+      sensitive). Toggle A/B running: SGLANG_ENABLE_JIT_DEEPGEMM=0 on v0516 vs the
+      v512 baseline.
+      (iii) TTS path is NONDETERMINISTIC even at temp 0 (main-stream greedy; run
+      lengths differ 38/53 v512, 82/109 v516) while text is bit-exact — the audio
+      codec heads sample internally; nondeterminism enters via audio machinery only.
+      (iv) NEW OBJECTIVE DELTA: same sentence/ref, v512 clips run 2.2-3.4s and their
+      transcripts STOP AT THE FIRST CLAUSE; v516 clips run 5.1-7.3s and speak further.
+      Audio-end behavior differs across versions (possibly the latent half-open-vs-
+      inclusive mm offset issue) — v516 may actually be MORE complete here.
+      Remaining suspects, reordered: decode-numerics drift (toggle test running),
+      NgramEmbeddingManager token-table lifecycle (new ne_skip_token_table_update
+      path at the chunked-prefill->decode boundary — static content-equivalent but
+      overlap-timing-sensitive per upstream's own comment). ALSO FOUND (latent, both versions): overlay emits
       half-open mm offsets where upstream treats them inclusive -> pad clobbers
       <longcat_audio_end>; fix offsets to inclusive when touching this area.
       v0.5.12 image remains :latest / shipping; v0.5.16 work lives in :v0516.
