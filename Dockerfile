@@ -22,6 +22,7 @@ COPY new_files/models/image_refiner.py          ${SG}/models/image_refiner.py
 COPY new_files/models/refiner_modules.py        ${SG}/models/refiner_modules.py
 COPY new_files/models/cosy24k_vocoder.py        ${SG}/models/cosy24k_vocoder.py
 COPY new_files/layers/n_gram_embedding.py       ${SG}/layers/n_gram_embedding.py
+COPY new_files/model_runner_components/ngram_embedding_manager.py ${SG}/model_executor/model_runner_components/ngram_embedding_manager.py
 COPY new_files/processors/longcat_next.py       ${SG}/multimodal/processors/longcat_next.py
 COPY new_files/hf_transformers/processor.py     ${SG}/utils/hf_transformers/processor.py
 

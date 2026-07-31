@@ -326,12 +326,20 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                     model_path = os.environ.get('SGLANG_MODEL_PATH', '/workspace/model')
                     self._tokenizer = AutoTokenizer.from_pretrained(model_path)
                 anyres_text = '<longcat_img_token_size>37 37</longcat_img_token_size>'
-                ANYRES_SUFFIX_LEN = len(self._tokenizer.encode(anyres_text, add_special_tokens=False)) + 1  # +1 for image_start
+                _suffix_ids = self._tokenizer.encode(anyres_text, add_special_tokens=False) + [self._image_start_id]
+                ANYRES_SUFFIX_LEN = len(_suffix_ids)
             except Exception:
+                _suffix_ids = None
                 ANYRES_SUFFIX_LEN = 8  # fallback
             uncond_ids = input_ids_for_prefill.clone()
             if n_prefill > ANYRES_SUFFIX_LEN:
                 uncond_ids[:n_prefill - ANYRES_SUFFIX_LEN] = 0  # Zero prompt token IDs
+            # The N-gram token table (our id source) stores special tokens as 0
+            # (hash semantics), so the suffix's tag/image_start ids must be
+            # rebuilt explicitly — the uncond branch needs them REAL.
+            if _suffix_ids is not None and n_prefill >= ANYRES_SUFFIX_LEN:
+                uncond_ids[n_prefill - ANYRES_SUFFIX_LEN:n_prefill] = torch.tensor(
+                    _suffix_ids, dtype=uncond_ids.dtype, device=uncond_ids.device)
             # Compute N-gram on zeroed IDs (hash sees zeros for prompt)
             if self.model.use_ngram_embedding:
                 uncond_embeds = self.model.embed_tokens(uncond_ids, forward_batch)
@@ -365,16 +373,22 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             self._model_runner.attn_backend.init_forward_metadata(uncond_fb)
             uncond_fb.attn_backend = self._model_runner.attn_backend
 
-            # Run backbone with unconditional embeddings
-            self.model(input_ids=None, positions=uncond_fb.positions,
+            # Run backbone with unconditional embeddings. Keep the LAST hidden:
+            # it is the uncond branch's image_start-position state, i.e. the CFG
+            # counterpart for visual token 1 (which the cond branch generates from
+            # its own image_start hidden in the same forward — original semantics).
+            uncond_hidden = self.model(input_ids=None, positions=uncond_fb.positions,
                       forward_batch=uncond_fb, input_embeds=uncond_embeds)
+            last_hidden = None
+            if uncond_hidden is not None and uncond_hidden.shape[0] >= 1:
+                last_hidden = uncond_hidden[-1:].detach()
 
             logger.info(f"[ImageGen] Unconditional prefill: {n_prefill} tokens, req_pool_idx={uncond_idx}")
-            return uncond_idx
+            return uncond_idx, last_hidden
 
         except Exception as e:
             logger.error(f"[ImageGen] Failed to allocate uncond KV: {e}", exc_info=True)
-            return -1
+            return -1, None
 
     def _run_uncond_decode(self, state: ImageGenState, position: int,
                           forward_batch, is_newline: bool = False) -> Optional[torch.Tensor]:
@@ -1327,7 +1341,8 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         # --- Step 6: Check prefill for generation triggers (extend mode) ---
         if not is_decode and logits_output.next_token_logits is not None:
             self._check_prefill_audio_start(input_ids, logits_output, forward_batch)
-            self._check_prefill_image_start(input_ids, logits_output, forward_batch)
+            self._check_prefill_image_start(input_ids, logits_output, forward_batch,
+                                            hidden_states=hidden_states)
 
         return logits_output
 
@@ -1545,9 +1560,16 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             if token == self._image_start_id:
                 state = ImageGenState()
                 self._image_gen_states[req_idx] = state
-                logger.info(f"[ImageGen] req={req_idx}: entered visual mode (37x37 grid)")
-                # Force image_pad as first token (first codebook gen position)
-                overrides[i] = self._image_pad_id
+                logger.info(f"[ImageGen] req={req_idx}: entered visual mode (37x37 grid), "
+                            f"generating visual token 1 from the image_start hidden state")
+                # Original semantics: visual token 1 is generated from THIS
+                # step's hidden state (the image_start position); the forced
+                # image_pad then carries token-1 feedback into the next step.
+                overrides[i] = self._image_gen_token_step(
+                    i, req_idx, state, hidden_states[i:i+1],
+                    forward_batch, forward_batch.positions[i].item(),
+                    forward_batch.seq_lens[i].item(),
+                )
                 continue
 
             # Detect image_end → clean up and decode
@@ -1588,54 +1610,80 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                     continue
 
                 # Generate codebook tokens for this position
-                cond_hs = hidden_states[i:i+1]
-
-                # Run unconditional forward for CFG if available
-                uncond_hs = None
-                if IMAGE_GEN_CFG_SCALE != 1.0 and self._model_runner is not None:
-                    # Initialize uncond KV cache on first use (try only once)
-                    if not state.uncond_initialized and state.uncond_req_pool_idx == -1 and state.current_image_token_num == 0:
-                        # Build uncond prefill with real token IDs (for suffix preservation).
-                        # Read the conditional tokens from the N-gram token table.
-                        cond_seq_len = forward_batch.seq_lens[i].item()
-                        rtp = self._model_runner.req_to_token_pool
-                        cond_pool_idx = forward_batch.req_pool_indices[i].item()
-                        # Read token IDs from token table (N-gram table stores them)
-                        ngram_info = getattr(forward_batch, 'ngram_embedding_info', None)
-                        if ngram_info is not None:
-                            token_table = ngram_info.token_table
-                            prefill_ids = token_table[cond_pool_idx, :cond_seq_len].to(input_ids.device)
-                        else:
-                            prefill_ids = torch.zeros(cond_seq_len, dtype=input_ids.dtype,
-                                                     device=input_ids.device)
-                        state.uncond_req_pool_idx = self._alloc_uncond_kv(
-                            cond_pool_idx,
-                            cond_seq_len, prefill_ids, forward_batch)
-                        if state.uncond_req_pool_idx >= 0:
-                            state.uncond_seq_len = cond_seq_len
-                            state.uncond_initialized = True
-                            logger.info(f"[ImageGen] CFG initialized: uncond_req={state.uncond_req_pool_idx}, "
-                                       f"seq_len={cond_seq_len}")
-
-                    if state.uncond_initialized:
-                        pos = forward_batch.positions[i].item()
-                        uncond_hs = self._run_uncond_decode(state, pos, forward_batch)
-
-                visual_ids = self._generate_image_codebook_step(cond_hs, uncond_hs, state)
-                state.accumulated_ids.append(visual_ids)
-                state.current_image_token_num += 1
-                overrides[i] = self._image_pad_id
-
-                if state.current_image_token_num <= 3:
-                    logger.info(f"[ImageGen] req={req_idx}: token {state.current_image_token_num}, "
-                               f"level0_raw={visual_ids[0].item() - self.visual_offset_vals[0].item()}")
+                overrides[i] = self._image_gen_token_step(
+                    i, req_idx, state, hidden_states[i:i+1],
+                    forward_batch, forward_batch.positions[i].item(),
+                    forward_batch.seq_lens[i].item(),
+                )
 
         return overrides
 
+    def _image_gen_token_step(self, i, req_idx, state, cond_hs, forward_batch,
+                              position, cond_seq_len) -> int:
+        """Generate one visual codebook token from cond_hs (CFG init on first use).
+
+        Shared by the decode-step loop AND the image_start trigger steps (decode
+        fall-through + prefill detection): the original generates visual token 1
+        from the image_start hidden state in the SAME forward — generating it one
+        step later (from a zero-embedded pad, with the whole raster shifted +1
+        position) measurably degrades global composition.
+        Returns the token to force as this step's sampled output (image_pad).
+        """
+        uncond_hs = None
+        first_uncond_hs = None
+        if IMAGE_GEN_CFG_SCALE != 1.0 and self._model_runner is not None:
+            # Initialize uncond KV cache on first use (try only once)
+            if not state.uncond_initialized and state.uncond_req_pool_idx == -1 and state.current_image_token_num == 0:
+                # Build uncond prefill with real token IDs (for suffix preservation).
+                # Read the conditional tokens from the N-gram token table.
+                rtp = self._model_runner.req_to_token_pool
+                cond_pool_idx = forward_batch.req_pool_indices[i].item()
+                # Read token IDs from token table (N-gram table stores them;
+                # specials read back as 0 — _alloc_uncond_kv rebuilds the suffix)
+                ngram_info = getattr(forward_batch, 'ngram_embedding_info', None)
+                if ngram_info is not None:
+                    token_table = ngram_info.token_table
+                    prefill_ids = token_table[cond_pool_idx, :cond_seq_len].to(cond_hs.device)
+                else:
+                    prefill_ids = torch.zeros(cond_seq_len, dtype=torch.int32,
+                                             device=cond_hs.device)
+                state.uncond_req_pool_idx, first_uncond_hs = self._alloc_uncond_kv(
+                    cond_pool_idx,
+                    cond_seq_len, prefill_ids, forward_batch)
+                if state.uncond_req_pool_idx >= 0:
+                    state.uncond_seq_len = cond_seq_len
+                    state.uncond_initialized = True
+                    logger.info(f"[ImageGen] CFG initialized: uncond_req={state.uncond_req_pool_idx}, "
+                               f"seq_len={cond_seq_len}")
+
+            if state.uncond_initialized:
+                if first_uncond_hs is not None:
+                    # Token 1: the uncond prefill's last hidden IS this position's
+                    # uncond state — a decode step here would double-process it.
+                    uncond_hs = first_uncond_hs
+                else:
+                    uncond_hs = self._run_uncond_decode(state, position, forward_batch)
+
+        visual_ids = self._generate_image_codebook_step(cond_hs, uncond_hs, state)
+        state.accumulated_ids.append(visual_ids)
+        state.current_image_token_num += 1
+
+        if state.current_image_token_num <= 3:
+            logger.info(f"[ImageGen] req={req_idx}: token {state.current_image_token_num}, "
+                       f"level0_raw={visual_ids[0].item() - self.visual_offset_vals[0].item()}")
+        return self._image_pad_id
+
     def _check_prefill_image_start(
         self, input_ids: torch.Tensor, logits_output, forward_batch: ForwardBatch,
+        hidden_states: torch.Tensor = None,
     ):
-        """Check if prefill ends with image_start_token_id."""
+        """Check if prefill ends with image_start_token_id.
+
+        Original semantics: visual token 1 is generated from the image_start
+        position's hidden state in the SAME forward (here: the prefill), so the
+        forced image_pad that follows carries token-1 feedback — never a
+        zero-embedded input, and no +1 raster position shift.
+        """
         if not hasattr(forward_batch, 'extend_seq_lens_cpu') or not forward_batch.extend_seq_lens_cpu:
             return
 
@@ -1652,10 +1700,22 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                     self._image_gen_states[req_idx] = state
                     logger.info(f"[ImageGen] req={req_idx}: detected image_start in prefill, "
                                f"starting visual generation (37x37)")
+                    forced = self._image_pad_id
+                    if hidden_states is not None and last_token_pos < hidden_states.shape[0]:
+                        forced = self._image_gen_token_step(
+                            i, req_idx, state,
+                            hidden_states[last_token_pos:last_token_pos+1],
+                            forward_batch,
+                            forward_batch.positions[last_token_pos].item(),
+                            forward_batch.seq_lens[i].item(),
+                        )
+                    else:
+                        logger.warning(f"[ImageGen] req={req_idx}: no hidden state at prefill "
+                                       f"trigger — visual token 1 deferred one step (legacy path)")
                     # Force image_pad as first token
                     if logits_output.next_token_logits is not None and i < logits_output.next_token_logits.shape[0]:
                         logits_output.next_token_logits[i, :] = float('-inf')
-                        logits_output.next_token_logits[i, self._image_pad_id] = 0.0
+                        logits_output.next_token_logits[i, forced] = 0.0
             offset += seq_len
 
     def _dequant_layer_to_bf16(self, layer_id):
