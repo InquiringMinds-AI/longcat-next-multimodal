@@ -397,6 +397,25 @@ reason #1 settles first).
       .json + _down). Runtime engine loads them from
       configs/triton_3_6_0/ under the moe_runner/triton_utils dir (or
       SGLANG_MOE_CONFIG_DIR env).
+      MEASURED per-batch-size wall times (M: hours) 4096:12.5, 3072:10.4,
+      2048:9.1, 1536:8.6, 1024:8.0, 512:7.5, 256:6.9, 128:6.1, 96:5.7 — the
+      decay FLATTENS toward ~4-5h because per-config cost is dominated by
+      Triton JIT + Ray dispatch overhead, not GEMM work. Do not expect small-M
+      sizes to be cheap: revised total ~5 days, not the 2.5-3 first estimated.
+      CHECKPOINTING (added 2026-08-03, NOT active in the current run — the
+      staged copy on Spark was deliberately left untouched because bash reads
+      a running script by byte offset): the stock tuner buffers all 18 results
+      in the Ray driver and calls save_configs_sep ONCE at the end, and never
+      prints the configs, so a crash loses the whole run with nothing
+      recoverable from the log. quantize/tune_moe_gb10.sh now patches
+      BenchmarkWorker.tune to dump each batch size to
+      $OUT/checkpoints/ckpt_M<N>.json as it completes, and a post-run recovery
+      block rebuilds the two final JSONs from those checkpoints (same filename
+      derivation, sort_config, ascending-M order as save_configs_sep) if the
+      tuner died first. Anchor verified unique against the real source; the
+      sep-tuner patch section now self-skips when already applied. A partial
+      ladder is still usable — the runtime interpolates across the M values
+      present.
 - [ ] Ship configs: repo new_files/moe_configs/ + Dockerfile COPY into
       ${SG}/layers/moe/moe_runner/triton_utils/configs/triton_3_6_0/; verify launch
       log says "Using MoE kernel config from ..." (today's builds warn it's missing)
