@@ -402,6 +402,22 @@ reason #1 settles first).
       raising RAY_memory_usage_threshold — 116GB is already inside the
       ~110-115GB band where Spark hard-powers-off; the OOM monitor is the safety
       net.
+      RUN 3 LAUNCHED 2026-08-04 ~16:20 CDT — restarted from scratch (run 2 was
+      ~1h in) so the whole ladder runs under the resume-skip capability, which
+      landed after run 2 started and could not be applied to a live script.
+      Full 18-size ladder, same image/mounts/env as run 2. Startup verified the
+      same way: all patch asserts passed (the "+ per-batch checkpointing" line
+      prints only after the resume anchor assert too), correct target filename,
+      and /proc/418/environ on `ray::BenchmarkWorker.tune` carries both
+      LCN_CKPT_DIR and PYTORCH_CUDA_ALLOC_CONF. No "resume:" line, correctly —
+      the checkpoint dir was empty. Checkpoint dir PROVEN to be host-backed:
+      a file written inside the container was read on the host and the path
+      resolves to /dev/nvme0n1p2, not overlay. Checkpoints land root-owned
+      (container runs as root) — manipulate them via the container or sudo.
+      Memory trend logging to ~/longcat-outputs/memtrend.csv every 5 min
+      (baseline 121.9GB free at launch, before the tuner's working set settles);
+      run 2's aborted trend kept as memtrend_run2aborted.csv.
+      (Superseded run-2 record follows.)
       RUN 2 LAUNCHED 2026-08-04 ~13:30 CDT — same full 18-size ladder, same
       image (:v0516-spec) and mounts, plus PYTORCH_CUDA_ALLOC_CONF=
       expandable_segments:True both on docker run and in-script. Startup
