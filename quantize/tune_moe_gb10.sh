@@ -43,6 +43,18 @@ CKPT=$OUT/checkpoints
 mkdir -p "$OUT" "$CKPT"
 export LCN_CKPT_DIR="$CKPT"
 
+# The 2026-08-04 run died at ~hour 95 (during the last small-M sizes) when Ray's
+# memory monitor OOM-killed the BenchmarkWorker at 116.84GB/121.69GB node usage,
+# taking every completed config with it. This container is launched with
+# --entrypoint bash, which BYPASSES entrypoint.sh, so the project-standard
+# allocator setting never got applied — on GB10's unified memory the caching
+# allocator's per-shape blocks accumulate across thousands of tuned configs and
+# count against system RAM. Set it here so it holds regardless of entrypoint.
+# (Do NOT raise RAY_memory_usage_threshold instead: 116GB is already inside the
+# ~110-115GB band where Spark hard-powers-off, so the monitor firing is the
+# safety net, not the bug.)
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
 # the serving image ships without ray (the tuner's worker framework)
 python3 -c "import ray" 2>/dev/null || pip install --no-cache-dir -q ray
 
@@ -137,6 +149,9 @@ src = src.replace(anchor, """        _c0 = trace0.config_dict(best_block_m)
                 )
             os.replace(_dst + ".tmp", _dst)
             print(f"checkpointed batch_size={num_tokens} -> {_dst}")
+        # drop the caching allocator's per-shape blocks between batch sizes;
+        # their accumulation is what walked the node into Ray's OOM kill
+        torch.cuda.empty_cache()
         return (
             _c0,
             _c1,

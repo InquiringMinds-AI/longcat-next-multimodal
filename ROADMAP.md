@@ -382,7 +382,28 @@ tuned path is the shipping path (config files are also keyed by triton version �
 reason #1 settles first).
 
 - [ ] Targeted `tuning_fused_moe_triton_sep.py` sweep (both up and down proj; artifacts
-      on a mounted volume, never in an `--rm` container) — RUNNING since 2026-07-31
+      on a mounted volume, never in an `--rm` container)
+      *** RUN 1 FAILED 2026-08-04 — TOTAL LOSS, 4 days, zero configs written. ***
+      14 of 18 batch sizes had completed (4096..16) and it died during the last
+      small-M sizes: `ray.exceptions.OutOfMemoryError` — Ray's memory monitor
+      OOM-killed the BenchmarkWorker at 116.84GB/121.69GB node usage (95%
+      threshold), `ray.get(outputs)` re-raised in `_distribute`, main() never
+      reached save_configs_sep. Verified unrecoverable: no JSON in the container
+      bench dir, no Ray spill, nothing on the mount, and the tuner never prints
+      configs. ROOT CAUSE (strong hypothesis, not proven): the container was
+      launched with `--entrypoint bash`, which bypasses entrypoint.sh, so
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True was never set —
+      docker inspect confirmed it absent from the container env. On GB10 unified
+      memory the caching allocator's per-shape blocks count against system RAM
+      and accumulate across ~30k tuned configs. Both fixes are now in
+      quantize/tune_moe_gb10.sh (allocator setting exported in-script;
+      torch.cuda.empty_cache() per batch size; plus the checkpointing below, which
+      would have preserved 14/18 sizes had it been active). Do NOT "fix" this by
+      raising RAY_memory_usage_threshold — 116GB is already inside the
+      ~110-115GB band where Spark hard-powers-off; the OOM monitor is the safety
+      net. Run 2 scope (full ladder vs decode-only M) is an owner decision.
+      Historical detail of run 1 follows.
+      RUN 1 ran since 2026-07-31
       ~14:36 in container `lcn-moe-tune` on Spark (image :v0516-spec, entrypoint
       quantize/tune_moe_gb10.sh staged at ~/longcat-outputs/tune_moe_gb10.sh; topk
       captures in ~/longcat-outputs/topk_ids, 14 MoE layers x2 from a 16k-token
@@ -397,11 +418,14 @@ reason #1 settles first).
       .json + _down). Runtime engine loads them from
       configs/triton_3_6_0/ under the moe_runner/triton_utils dir (or
       SGLANG_MOE_CONFIG_DIR env).
-      MEASURED per-batch-size wall times (M: hours) 4096:12.5, 3072:10.4,
-      2048:9.1, 1536:8.6, 1024:8.0, 512:7.5, 256:6.9, 128:6.1, 96:5.7 — the
-      decay FLATTENS toward ~4-5h because per-config cost is dominated by
-      Triton JIT + Ray dispatch overhead, not GEMM work. Do not expect small-M
-      sizes to be cheap: revised total ~5 days, not the 2.5-3 first estimated.
+      MEASURED per-batch-size wall times from run 1 (M: hours) 4096:12.5,
+      3072:10.4, 2048:9.1, 1536:8.6, 1024:8.0, 512:7.5, 256:6.9, 128:6.1,
+      96:5.7, 64:5.1, 48:4.7, 32:4.0, 24:3.5, 16:3.5, 8:~0.9. Per-config cost is
+      dominated by Triton JIT + Ray dispatch, not GEMM work, so the decay
+      flattens at ~3.5h through M=16; the cliff only arrives at M<=8, where most
+      of the 1920 candidates are invalid for the shape and skip via
+      OutOfResources without compiling. Total for the full ladder ~4.2 days.
+      Budget a decode-only rerun (M<=48) at roughly 17h, not hours.
       CHECKPOINTING (added 2026-08-03, NOT active in the current run — the
       staged copy on Spark was deliberately left untouched because bash reads
       a running script by byte offset): the stock tuner buffers all 18 results
