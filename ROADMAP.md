@@ -401,7 +401,20 @@ reason #1 settles first).
       would have preserved 14/18 sizes had it been active). Do NOT "fix" this by
       raising RAY_memory_usage_threshold — 116GB is already inside the
       ~110-115GB band where Spark hard-powers-off; the OOM monitor is the safety
-      net. Run 2 scope (full ladder vs decode-only M) is an owner decision.
+      net.
+      RUN 2 LAUNCHED 2026-08-04 ~13:30 CDT — same full 18-size ladder, same
+      image (:v0516-spec) and mounts, plus PYTORCH_CUDA_ALLOC_CONF=
+      expandable_segments:True both on docker run and in-script. Startup
+      verified: both patch blocks applied ("+ per-batch checkpointing" printed,
+      so every anchor assert passed), correct per-channel target filename
+      announced, and /proc/<pid>/environ on the live `ray::BenchmarkWorker.tune`
+      worker confirms LCN_CKPT_DIR and PYTORCH_CUDA_ALLOC_CONF are both present
+      in the process that actually runs the tuning. STILL UNVERIFIED until it
+      runs: the checkpoint write itself (first lands when M=4096 finishes,
+      ~12.5h in) and the recovery block (only executes if the tuner dies).
+      Watchers armed: completion monitor + a MemAvailable<25GB creep alarm
+      (run 1 died with ~5GB free), the latter so a repeat can be harvested from
+      checkpoints rather than lost.
       Historical detail of run 1 follows.
       RUN 1 ran since 2026-07-31
       ~14:36 in container `lcn-moe-tune` on Spark (image :v0516-spec, entrypoint
