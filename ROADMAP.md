@@ -414,9 +414,16 @@ reason #1 settles first).
       a file written inside the container was read on the host and the path
       resolves to /dev/nvme0n1p2, not overlay. Checkpoints land root-owned
       (container runs as root) — manipulate them via the container or sudo.
-      Memory trend logging to ~/longcat-outputs/memtrend.csv every 5 min
-      (baseline 121.9GB free at launch, before the tuner's working set settles);
+      Memory trend logging to ~/longcat-outputs/memtrend.csv every 5 min;
       run 2's aborted trend kept as memtrend_run2aborted.csv.
+      MEASURED STARTUP CURVE (both runs agree): MemAvailable 122GB at launch ->
+      79GB at 5min -> 41GB at 10min -> 40GB at 15min. ~40GB free is this
+      tuner's STEADY STATE (~82GB working set: fake expert weights + 100 cached
+      topk sample tensors + 20 Ray workers), reached in ~10 min. Do NOT read the
+      first few samples as a baseline — a 60GB alarm set from a 4-minute sample
+      false-fired immediately. Alarm now at 30GB (10GB of drift below steady
+      state, 25GB of headroom above run 1's ~5GB death point). A slow decline
+      away from 40GB is the signal that the allocator fix is not holding.
       (Superseded run-2 record follows.)
       RUN 2 LAUNCHED 2026-08-04 ~13:30 CDT — same full 18-size ladder, same
       image (:v0516-spec) and mounts, plus PYTORCH_CUDA_ALLOC_CONF=
