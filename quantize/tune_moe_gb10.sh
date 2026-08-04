@@ -126,6 +126,34 @@ src = src.replace(anchor, """    num_layers = 14
 anchor = '''        f"{topk_ids_dir}/topk_ids_layer{i % moe_layers + dense_layers}_idx{i // moe_layers}.pt"'''
 assert src.count(anchor) == 1
 src = src.replace(anchor, '''        f"{topk_ids_dir}/topk_ids_layer{(i % (moe_layers * 2)) % moe_layers + dense_layers}_idx{(i % (moe_layers * 2)) // moe_layers}.pt"''')
+# Resume: drop batch sizes that already have a checkpoint, so a rerun after a
+# crash costs only the size that was in flight instead of the whole ladder.
+# (The stock tuner has no skip logic — restarting it re-tunes everything.)
+anchor = """    if args.batch_size is None:
+        batch_sizes = get_default_batch_sizes()
+        batch_sizes.reverse()
+    else:
+        batch_sizes = [args.batch_size]"""
+assert src.count(anchor) == 1
+src = src.replace(anchor, anchor + """
+
+    _ckpt_dir = os.environ.get("LCN_CKPT_DIR")
+    if _ckpt_dir and os.path.isdir(_ckpt_dir):
+        _done = set()
+        for _f in os.listdir(_ckpt_dir):
+            if _f.startswith("ckpt_M") and _f.endswith(".json"):
+                try:
+                    _done.add(int(_f[len("ckpt_M"):-len(".json")]))
+                except ValueError:
+                    pass
+        _skipped = sorted(b for b in batch_sizes if b in _done)
+        if _skipped:
+            batch_sizes = [b for b in batch_sizes if b not in _done]
+            print(f"resume: skipping already-checkpointed batch sizes {_skipped}")
+            if not batch_sizes:
+                print("resume: all batch sizes checkpointed, nothing left to tune")
+                return""")
+
 # BenchmarkWorker.tune returns its winning configs to the Ray driver, which
 # buffers all of them until the final write. Dump each one as it is produced.
 anchor = """        return (
