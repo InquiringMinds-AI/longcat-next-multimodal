@@ -152,7 +152,17 @@ src = src.replace(anchor, anchor + """
             print(f"resume: skipping already-checkpointed batch sizes {_skipped}")
             if not batch_sizes:
                 print("resume: all batch sizes checkpointed, nothing left to tune")
-                return""")
+                return
+
+    # Memory drifts ~0.75GB/h WITHIN a batch size and the boundary
+    # empty_cache() does not reclaim it (measured over M=4096's 12.5h), so a
+    # long-lived process walks into Ray's OOM kill around hour 50 of ~100.
+    # One size per process, supervised and resumed from checkpoints, bounds
+    # the working set to a single size's worth no matter how long the ladder is.
+    if os.environ.get("LCN_ONE_SIZE_PER_RUN") == "1" and len(batch_sizes) > 1:
+        print(f"one-size-per-run: tuning {batch_sizes[0]}, "
+              f"leaving {len(batch_sizes) - 1} for later runs")
+        batch_sizes = [batch_sizes[0]]""")
 
 # BenchmarkWorker.tune returns its winning configs to the Ray driver, which
 # buffers all of them until the final write. Dump each one as it is produced.
@@ -269,9 +279,10 @@ for cfgs, down_moe in ((up, False), (down, True)):
         )
     )
     dst = os.path.join(out, name)
-    if os.path.exists(dst):
-        print(f"recovery: {name} already written by the tuner, leaving it")
-        continue
+    # Always rewrite: the checkpoint set is authoritative and grows across
+    # supervised restarts, so a file left from an earlier, shorter run must not
+    # survive. (When the tuner completed the ladder itself, its own write and
+    # this one carry the same content.)
     with open(dst, "w") as fh:
         json.dump({str(m): cfgs[m] for m in sorted(cfgs)}, fh, indent=4)
         fh.write("\n")
