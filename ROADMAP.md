@@ -402,7 +402,32 @@ reason #1 settles first).
       raising RAY_memory_usage_threshold — 116GB is already inside the
       ~110-115GB band where Spark hard-powers-off; the OOM monitor is the safety
       net.
-      RUN 3 LAUNCHED 2026-08-04 ~16:20 CDT — restarted from scratch (run 2 was
+      *** CURRENT: SUPERVISED one-size-per-process run, started 2026-08-05
+      10:30 UTC. Drive/monitor it with quantize/tune_moe_supervise.sh (staged at
+      ~/longcat-outputs/tune_moe_supervise.sh, run detached with setsid nohup,
+      log ~/longcat-outputs/supervise.log). It launches one container per batch
+      size, each resuming from ~/longcat-outputs/moe_configs/checkpoints/, and
+      aborts if a cycle adds no checkpoint. M=4096 was banked by run 3 before
+      the switch, so it started at 1/18.
+      WHY (measured, run 3): MemAvailable drifts down ~0.75GB/h WITHIN one batch
+      size — 40GB at the start of M=4096, 31GB when it finished 12.5h later —
+      and the boundary torch.cuda.empty_cache() reclaims NONE of it (confirmed
+      flat at 31.0-31.7GB across 35 min after the boundary). A single long-lived
+      process therefore reaches zero around hour 50 of a ~100h ladder, which is
+      what killed run 1. That empty_cache() does nothing is the diagnostic: the
+      memory is not in the CUDA caching allocator, so it is host-side, most
+      likely Triton's in-process cache of compiled kernel variants (no flush
+      API). Unfixable in-process -> bound the process lifetime instead.
+      VERIFIED LIVE at the switch: "resume: skipping already-checkpointed batch
+      sizes [4096]" and "one-size-per-run: tuning 3072, leaving 16 for later
+      runs" both printed, and ckpt_M4096.json holds valid configs for both
+      projections (config0 up / config1 down, USE_TMA on down). Checkpointing,
+      resume, and one-size-per-run are all now proven in production, not just
+      simulated.
+      Low-memory alarm now at 15GB (per-size floor is ~31GB even after 12.5h).
+      ETA ~87h of tuning left from 2026-08-05 10:30 UTC, plus ~2 min container
+      startup x 17 cycles. ***
+      RUN 3 (single-process) LAUNCHED 2026-08-04 ~16:20 CDT — restarted from scratch (run 2 was
       ~1h in) so the whole ladder runs under the resume-skip capability, which
       landed after run 2 started and could not be applied to a live script.
       Full 18-size ladder, same image/mounts/env as run 2. Startup verified the
