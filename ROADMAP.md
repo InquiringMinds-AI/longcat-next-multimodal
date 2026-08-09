@@ -501,9 +501,21 @@ reason #1 settles first).
       sep-tuner patch section now self-skips when already applied. A partial
       ladder is still usable — the runtime interpolates across the M values
       present.
-- [ ] Ship configs: repo new_files/moe_configs/ + Dockerfile COPY into
-      ${SG}/layers/moe/moe_runner/triton_utils/configs/triton_3_6_0/; verify launch
-      log says "Using MoE kernel config from ..." (today's builds warn it's missing)
+- [x] TUNING LADDER COMPLETE 2026-08-09 11:53 UTC — 18/18 sizes, 17 supervised
+      cycles, every one exit=0. Both JSONs have 18 valid entries (M=1..4096),
+      no malformed configs.
+- [x] Ship configs: new_files/moe_configs/ + Dockerfile COPY into
+      ${SG}/layers/moe/moe_runner/triton_utils/configs/triton_3_6_0/ (commit
+      7d9e0fe). Image longcat-next-gb10:v0516-tuned. VERIFIED LOADED — the
+      runtime logs, for BOTH projections:
+        "Using MoE kernel config from .../triton_3_6_0/E=256,N=1024,
+         device_name=NVIDIA_GB10,dtype=int8_w8a8,per_channel_quant=True[_down].json."
+      GOTCHA that cost time: that line does NOT appear at startup. get_moe_configs
+      is called lazily on the first MoE forward and the server runs with
+      skip_server_warmup=True, so the log is silent until you send a request.
+      Do not read startup silence as "config not picked up" — send one request
+      first. (Calling get_moe_configs directly via docker exec also fails:
+      it reads get_server_args(), which is unset outside the server process.)
 - [ ] Before/after decode bench (baselines: 21.5 tok/s eager / 22.4 graphs, 400-token
       essay probe x3) + rebench with LCN_CUDAGRAPH=1 (kernel time shrinking amplifies
       the graph win) + battery; kernel configs change scheduling not math, so temp-0
