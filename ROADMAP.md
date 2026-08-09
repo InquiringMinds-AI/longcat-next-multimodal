@@ -623,7 +623,44 @@ reason #1 settles first).
       is a\nA red" from image_understanding and still scored PASS, because the
       test only checks for a substring. A tuning pass needs an OUTPUT-
       CORRECTNESS gate, not a battery of pass/fail modality checks. ***
-- [ ] Rebench with LCN_CUDAGRAPH=1 (kernel time shrinking amplifies
+- [x] CUDA GRAPHS RE-BENCHED 2026-08-09 on the tuned build — a WIN, and the
+      2x2 shows tuning and graphs are ADDITIVE, not overlapping:
+                        no graphs     with graphs
+        untuned         21.02         21.81  (+3.8%)
+        tuned           21.46 (+2.1%) 22.29  (+6.0%)
+      Tuning adds ~+0.45 tok/s with or without graphs; graphs add ~+0.8 with or
+      without tuning — they attack different terms (execution time vs launch
+      overhead). Prefill unchanged (3065 -> 3071): prefill graphs are disabled
+      on this model (incompatible with MLA attention), as expected.
+      Battery 7/7, 0 asserts, 95 decode batches served from replay, and the #3
+      veto machinery correctly forces eager for image/audio generation.
+      MEMORY IS NOT THE OBJECTION IT WAS: capture cost 1.49GB (not the 2.79GB
+      from #3) and MemAvailable after gen warmup was 9.95GB, not 4.36GB.
+      => RECOMMEND making LCN_CUDAGRAPH=1 the all-modality default.
+- [x] NGRAM SPEC DECODE MEASURED PROPERLY 2026-08-09 (test/bench_agent.py, new:
+      verbatim source reproduction — the actual agent shape — with a FIDELITY
+      check so a speedup on wrong output cannot pass):
+        agent workload (warm table): 72.4 tok/s vs 22.1 baseline = 3.3x, 100% fidelity
+        novel prose, COLD table:     22.9 vs 22.3 = no penalty in aggregate
+            (narrative 20.8 = -6.7%, essay 22.9, technical 26.3 = +18%)
+        correctness: anthropic 5/5 (incl. tool_call + tool_roundtrip), degeneracy 6/6
+      The documented "7-9% novel-prose overhead" DOES NOT REPRODUCE. Two reasons:
+      a 400-token generation feeds its own output into the table as it goes, so
+      the drafter starts hitting partway through the SAME request; and the cost
+      depends on how repetitive the content is.
+      ⚠ THE N-GRAM TABLE IS SERVER-GLOBAL AND PERSISTS ACROSS REQUESTS AND
+      ACROSS BENCH INVOCATIONS. Any "novel prose" measurement on a server that
+      has already served similar text is measuring repetition. A cold-table
+      number requires a FRESH CONTAINER and --runs 1. Two measurements were
+      wasted before this was understood.
+      Cold-start signature to expect: request 1 is ~baseline or slightly slower
+      (empty table), then 3x once history accumulates.
+      => RECOMMEND LCN_AGENT=1 imply LCN_NGRAM=1 (with an explicit off switch).
+      Agent traffic is overwhelmingly repetition-shaped, correctness now checks
+      out, and the cold cost is bounded to the first request.
+      NOTE: NGRAM implies AGENT (generation endpoints 403), so this can never be
+      a global default — only the agent profile.
+- [ ] Superseded: rebench with LCN_CUDAGRAPH=1 (kernel time shrinking amplifies
       the graph win) + battery; kernel configs change scheduling not math, so temp-0
       spot check suffices unless drift appears
 
