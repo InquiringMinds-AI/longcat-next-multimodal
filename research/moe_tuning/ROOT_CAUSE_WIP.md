@@ -78,6 +78,52 @@ That turns a 20-minute coin flip into a fast, high-power per-config verdict, and
 it doubles as the output-correctness gate the tuner never had — which is what
 allowed a fast-but-wrong config to be selected in the first place.
 
+## Harness BUILT — `quantize/moe_config_check.py` (2026-08-09)
+
+Works end to end. Runs a config hundreds of times in seconds instead of a
+20-minute intermittent server test.
+
+Two non-obvious things it needs, both already handled:
+
+- `fused_experts` reads `get_server_args()` and allocates its output through the
+  TP group, so the script sets `_rc._CONTEXT._server_args` and calls
+  `init_distributed_environment(world_size=1, ...)` +
+  `initialize_model_parallel(1)`. Without them it dies on
+  `AssertionError: tensor model parallel group is not initialized`.
+- **`override_config()` only forces the UP config.** `try_get_optimal_moe_config`
+  early-exits on it and leaves `down_config` as None, so the down GEMM silently
+  runs on defaults — a "clean" verdict on a config half of which was never
+  exercised. The harness therefore installs single-entry config FILES and points
+  `SGLANG_MOE_CONFIG_DIR` at them, clearing `get_moe_configs`'s `lru_cache`
+  (it is `@functools.lru_cache`, and would otherwise serve the stale map).
+  Injection was verified directly: both maps come back as the injected entry.
+
+### Result so far: NEGATIVE, and it narrows things
+
+With BOTH projections injected from files, M=128, M=256 and M=512 are all clean
+at M in {7, 170, 193}, 3 reps each — no NaN, no inf. The DEFAULT (no config) is
+clean too.
+
+So the fault does **not** reproduce on synthetic inputs: random int8 expert
+weights, random per-channel scales, random gating. It needs something real.
+
+### Next step: real weights and real activations
+
+1. Load ONE MoE layer's actual w1/w2 and scales from the checkpoint — that is
+   only ~1.6GB + ~0.8GB int8, entirely feasible standalone, no need for the 75B
+   model.
+2. Capture real `hidden_states` entering the MoE during a failing shape (a
+   170-193 token audio prefill). The topk-capture hook added for tuning
+   (`LCN_DUMP_TOPK_DIR` in `new_files/models/longcat_flash.py`) is the pattern —
+   extend it to dump hidden_states and the real topk_ids for those batches.
+3. Replay through the harness with `--poison` as well; if the fault is an
+   unwritten row in the uninitialised `intermediate_cache1`, NaN-filling the
+   pool should make it deterministic.
+
+The activation ranges are the most likely missing ingredient: audio features
+enter with a different distribution than text embeddings, and an int8 path is
+exactly where that would matter.
+
 ## Iteration tooling already in place
 
 `SGLANG_MOE_CONFIG_DIR` points the runtime at
