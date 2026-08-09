@@ -54,6 +54,70 @@ E, TOPK, INTER, HIDDEN = 256, 12, 1024, 3072
 DTYPE = torch.bfloat16
 
 
+def load_real_weights(model_dir, layer_id):
+    """Load one MoE layer's actual int8 experts + per-channel scales.
+
+    The last untested variable: synthetic weights, real activations and
+    NaN-poisoned pools all came back clean. Only one layer is needed
+    (~1.6GB w1 + ~0.8GB w2), so the 75B model never has to be loaded.
+
+    Checkpoint stores per-expert gate_proj/up_proj/down_proj; w1 is
+    cat(gate, up) to match the fused kernel (E, 2*INTER, HIDDEN) layout.
+    """
+    import json as _json
+    from safetensors import safe_open
+
+    idx = _json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))["weight_map"]
+    handles = {}
+
+    def get(key):
+        shard = idx[key]
+        if shard not in handles:
+            handles[shard] = safe_open(os.path.join(model_dir, shard), framework="pt", device="cpu")
+        return handles[shard].get_tensor(key)
+
+    w1 = torch.empty((E, 2 * INTER, HIDDEN), dtype=torch.int8)
+    w2 = torch.empty((E, HIDDEN, INTER), dtype=torch.int8)
+    w1_s = torch.empty((E, 2 * INTER), dtype=torch.float32)
+    w2_s = torch.empty((E, HIDDEN), dtype=torch.float32)
+    pre = f"model.layers.{layer_id}.mlp.experts."
+    for e in range(E):
+        w1[e] = torch.cat([get(f"{pre}{e}.gate_proj.weight"), get(f"{pre}{e}.up_proj.weight")], dim=0)
+        w2[e] = get(f"{pre}{e}.down_proj.weight")
+        w1_s[e] = torch.cat([
+            get(f"{pre}{e}.gate_proj.weight_scale").flatten(),
+            get(f"{pre}{e}.up_proj.weight_scale").flatten()])
+        w2_s[e] = get(f"{pre}{e}.down_proj.weight_scale").flatten()
+    return (w1.cuda(), w2.cuda(), w1_s.cuda(), w2_s.cuda())
+
+
+def load_capture(path, real_weights=None):
+    """Real hidden_states/routing captured from a failing MoE call.
+
+    Synthetic inputs do not reproduce the fault, so replaying the actual
+    activations is the next discriminator. Weights stay synthetic here: if this
+    alone reproduces it, the trigger is the activation distribution and the
+    checkpoint weights are not needed.
+    """
+    d = torch.load(path, map_location="cuda")
+    hidden = d["hidden_states"].to("cuda", DTYPE)
+    # the kernel requires int32 expert ids; the capture round-trips wider
+    topk_ids = d["topk_ids"].to("cuda").to(torch.int32)
+    topk_weights = d["topk_weights"].to("cuda")
+    M = hidden.shape[0]
+    if real_weights is not None:
+        w1, w2, w1_scale, w2_scale = real_weights
+    else:
+        g = torch.Generator(device="cuda").manual_seed(0)
+        w1 = torch.randint(-127, 127, (E, 2 * INTER, HIDDEN), dtype=torch.int8, device="cuda", generator=g)
+        w2 = torch.randint(-127, 127, (E, HIDDEN, INTER), dtype=torch.int8, device="cuda", generator=g)
+        w1_scale = torch.rand((E, 2 * INTER), dtype=torch.float32, device="cuda", generator=g) * 0.01
+        w2_scale = torch.rand((E, HIDDEN), dtype=torch.float32, device="cuda", generator=g) * 0.01
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+    topk_out = StandardTopKOutput(topk_weights, topk_ids, None)
+    return (hidden, w1, w2, w1_scale, w2_scale, topk_out), M, d["layer_id"]
+
+
 def build_inputs(M, seed):
     g = torch.Generator(device="cuda").manual_seed(seed)
     hidden = torch.randn(M, HIDDEN, dtype=DTYPE, device="cuda", generator=g)
@@ -156,6 +220,10 @@ def main():
     ap.add_argument("--m-values", default="1,7,64,170,193,256,512,1024",
                     help="runtime M values to exercise each config at")
     ap.add_argument("--only", default="", help="comma-separated config keys to test")
+    ap.add_argument("--real-weights", action="store_true",
+                    help="load actual expert weights from the checkpoint")
+    ap.add_argument("--replay", default="",
+                    help="dir of captured moe_call_layer*.pt (real hidden_states + routing)")
     args = ap.parse_args()
 
     M_values = [int(x) for x in args.m_values.split(",")]
@@ -172,6 +240,39 @@ def main():
     if args.only:
         want = set(args.only.split(","))
         keys = [k for k in keys if k in want]
+
+    if args.replay:
+        import glob
+        caps = sorted(glob.glob(os.path.join(args.replay, "moe_call_layer*.pt")))
+        _wcache = {}
+        _tag = ", REAL WEIGHTS" if args.real_weights else ", synthetic weights"
+        print(f"REPLAY mode: {len(caps)} captured MoE calls, real activations + routing{_tag}")
+        for k in keys:
+            bad_any = []
+            for c in caps:
+                lid_probe = torch.load(c, map_location="cpu")["layer_id"]
+                if args.real_weights:
+                    if lid_probe not in _wcache:
+                        print(f"  loading real weights for layer {lid_probe} ...", flush=True)
+                        _wcache[lid_probe] = load_real_weights(
+                            os.environ.get("LCN_MODEL", "/workspace/model"), lid_probe)
+                    rw = _wcache[lid_probe]
+                else:
+                    rw = None
+                inputs, M, lid = load_capture(c, real_weights=rw)
+                install_config(configs[k], down_configs[k], tmpdir)
+                for r in range(args.reps):
+                    if args.poison:
+                        poison_pool()
+                    out = run(None, inputs)
+                    torch.cuda.synchronize()
+                    nn_, ni_ = int(torch.isnan(out).sum()), int(torch.isinf(out).sum())
+                    if nn_ or ni_:
+                        bad_any.append((lid, M, r, nn_, ni_))
+            tag = "BAD " if bad_any else "ok  "
+            extra = f"  {len(bad_any)} failures; first layer={bad_any[0][0]} M={bad_any[0][1]} nan={bad_any[0][3]}" if bad_any else ""
+            print(f"{tag}M={k:<5}{extra}", flush=True)
+        return
 
     print(f"checking {len(keys)} configs from {os.path.basename(up_path)}")
     print(f"M values: {M_values}   reps: {args.reps}   poison: {args.poison}")

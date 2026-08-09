@@ -107,7 +107,55 @@ clean too.
 So the fault does **not** reproduce on synthetic inputs: random int8 expert
 weights, random per-channel scales, random gating. It needs something real.
 
-### Next step: real weights and real activations
+### ELIMINATION COMPLETE — an isolated MoE call cannot reproduce it
+
+Ran with `--replay` against 14 captured MoE calls (one per layer) taken from a
+run that actually faulted, at the failing shapes, for M=128 / 256 / 512:
+
+| inputs | result |
+|---|---|
+| synthetic weights + synthetic routing | clean |
+| synthetic weights + REAL activations and routing | clean |
+| same, with the allocator pool NaN-poisoned (`--poison`) | clean |
+| REAL weights + REAL activations + REAL routing, all 14 layers | **clean** |
+
+So the fault is NOT reproducible in a single fused-MoE call, even given the
+complete production input. That kills the uninitialised-`intermediate_cache1`
+theory as a self-contained explanation too: poisoning the pool should have made
+an unwritten-row fault fire deterministically, and it did not.
+
+**Reframe this forces.** The device-side assert fires in the SAMPLER, not in the
+MoE kernel — we only ever inferred the MoE was the source because the configs
+are what changes. Four possibilities remain, and they need distinguishing before
+any more kernel-level work:
+
+1. The NaN originates in a *different* layer/op, and the tuned configs merely
+   perturb timing enough to expose a pre-existing race (the audio path is the
+   newest, least-exercised code).
+2. It needs cross-layer sequential state — 14 MoE calls running back-to-back
+   with the rest of the model, not one call in isolation.
+3. It needs concurrency: other CUDA streams, the overlap scheduler, or memory
+   pressure with the full model resident.
+4. It depends on kernel autotune/JIT state accumulated across a long-lived
+   process (the tuner's own configs are compiled fresh in the harness).
+
+### NEXT STEP: localise the NaN inside the live server, not standalone
+
+Stop trying to reproduce out-of-process. Instead instrument the server to find
+where the NaN FIRST appears during a failing request:
+
+- add an env-gated forward hook that checks `torch.isnan(...).any()` on each
+  layer's output during prefill (cheap enough for a debug build), logging the
+  first layer/op that goes bad;
+- run it with the full 18-entry configs and drive the audio path until it trips;
+- if the first NaN is not the MoE output, the configs are a trigger rather than
+  the cause, and the fix belongs wherever it actually originates.
+
+`CUDA_LAUNCH_BLOCKING=1` plus `TORCH_USE_CUDA_DSA` would also give an accurate
+stack for the assert, which the current async report explicitly warns is
+unreliable ("the stacktrace below might be incorrect").
+
+### Superseded plan: real weights and real activations
 
 1. Load ONE MoE layer's actual w1/w2 and scales from the checkpoint — that is
    only ~1.6GB + ~0.8GB int8, entirely feasible standalone, no need for the 75B

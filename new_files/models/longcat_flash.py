@@ -331,6 +331,33 @@ class LongcatFlashMoE(nn.Module):
         # (benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py)
         # needs REAL topk distributions. Set LCN_DUMP_TOPK_DIR and send two
         # >=4096-token prefills; inert in normal serving.
+        # Env-gated capture of a FAILING MoE call for the config correctness
+        # harness (quantize/moe_config_check.py). The tuned M<=256 configs
+        # produce NaN only with real weights/activations — synthetic inputs do
+        # not reproduce it — so this dumps the real hidden_states and routing
+        # for mid-size prefills, which is where every observed failure landed.
+        # LCN_DUMP_MOE_RANGE="lo,hi" selects the token count; inert otherwise.
+        _moe_dir = os.environ.get("LCN_DUMP_MOE_DIR")
+        if _moe_dir:
+            _lo, _hi = (
+                int(x) for x in os.environ.get("LCN_DUMP_MOE_RANGE", "150,220").split(",")
+            )
+            _n = hidden_states.shape[0]
+            if _lo <= _n <= _hi:
+                if not hasattr(self, "_moe_save_idx"):
+                    self._moe_save_idx = 0
+                if self._moe_save_idx < 1:
+                    torch.save(
+                        {
+                            "hidden_states": hidden_states.detach().cpu(),
+                            "topk_ids": topk_idx_clamped.detach().cpu(),
+                            "topk_weights": topk_weights.detach().cpu(),
+                            "layer_id": self.layer_id,
+                        },
+                        f"{_moe_dir}/moe_call_layer{self.layer_id}.pt",
+                    )
+                    self._moe_save_idx += 1
+
         _dump_dir = os.environ.get("LCN_DUMP_TOPK_DIR")
         if _dump_dir and hidden_states.shape[0] >= 4096:
             if not hasattr(self, "_topk_save_idx"):
