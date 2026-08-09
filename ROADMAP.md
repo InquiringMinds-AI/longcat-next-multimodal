@@ -574,7 +574,35 @@ reason #1 settles first).
       a container restart. Variants live in ~/longcat-outputs/moe_override/.
       Crash logs preserved: ~/longcat-outputs/server_{tuned_crash2,no128,
       untuned_battery,largeM_r1,largeM_r2}.log
-      RESOLVED 2026-08-09 by shipping ONLY M>=512 (commit 31c0314). Full
+      ROOT CAUSE FOUND 2026-08-09 (commit d489578): USE_TMA on the DOWN
+      projection produces NaN at M=1. It is set on exactly two entries, M=1 and
+      M=2; excluding those two makes the whole rest of the ladder stable, so
+      16 of 18 entries ship (image :v0516-tuned-16).
+      Found by asking a different question — not "which config is wrong" but
+      "where does the NaN first appear". LCN_NAN_CHECK=1 checks both sides of
+      every MoE call and answered on the first run:
+        [NAN-CHECK] layer=0 tokens=1 input_bad=False output_bad=True -> CREATED HERE
+      tokens=1 is a DECODE step. THE TRAP THAT COST FOUR HYPOTHESES: every
+      assert was preceded in the log by a 170-193 token audio prefill, so all of
+      them chased mid-size prefills. Those prefills were bystanders — the assert
+      fires at SAMPLING, after the decode steps that follow. Log adjacency is
+      not causation.
+      Dropping M=1/M=2 beats disabling their TMA flag: decode then resolves by
+      nearest-M to the tuned M=4 config (TMA off natively), whereas disabling
+      TMA in place leaves a geometry chosen BECAUSE TMA made it fast, and
+      measured 20.93 tok/s — below the untuned baseline.
+      SHIPPING IMAGE :v0516-tuned-16 validated: 7/7 x2, anthropic 5/5,
+      degeneracy 6/6, 0 asserts, decode 21.46 / prefill 3065 tok/s.
+      (Previously shipped M>=512-only, commit 31c0314: 21.37 / 3055 — the
+      16-entry set is only ~0.4% better on decode; the value here is the
+      diagnosis, not the throughput.)
+      *** UPSTREAM-REPORTABLE: USE_TMA down-projection NaN at M=1 on sm_121 is
+      an SGLang bug, not a config mistake. The tuner will pick it again on any
+      Blackwell device because TMA genuinely is the fastest candidate. ***
+      ⚠ NEVER benchmark with LCN_NAN_CHECK=1: .any() on both sides of 14 MoE
+      layers = 28 device syncs per decoded token, pinning decode at ~20.9
+      regardless of config. Two benchmark runs were wasted on that.
+      Superseded: RESOLVED 2026-08-09 by shipping ONLY M>=512 (commit 31c0314). Full
       18-entry results archived in research/moe_tuning/ with the investigation
       writeup. Both refuted hypotheses are recorded there so nobody re-walks
       them: (1) single bad entry — removing M=128 made it WORSE (1/7);
