@@ -574,14 +574,23 @@ reason #1 settles first).
       a container restart. Variants live in ~/longcat-outputs/moe_override/.
       Crash logs preserved: ~/longcat-outputs/server_{tuned_crash2,no128,
       untuned_battery,largeM_r1,largeM_r2}.log
-      NEXT: testing large-M-only (M>=512) — if the audio path survives two
-      consecutive batteries, the fault lives in the small/mid-M entries and the
-      +18.6% prefill win can likely be kept by shipping only large-M tuned
-      entries plus get_default_config values for the small ones (a bare
-      large-M-only map would mis-route M=1 decode to the 512 tile and cost
-      decode speed, so the small entries must be filled, not just dropped).
-      CAUTION: the failure is intermittent, so no single green run settles
-      anything — require repeated batteries before believing any fix.
+      RESOLVED 2026-08-09 by shipping ONLY M>=512 (commit 31c0314). Full
+      18-entry results archived in research/moe_tuning/ with the investigation
+      writeup. Both refuted hypotheses are recorded there so nobody re-walks
+      them: (1) single bad entry — removing M=128 made it WORSE (1/7);
+      (2) pipeline depth — capping num_stages at 4 still failed (4/7 then 0/7).
+      M>=512 validated across FIVE consecutive batteries, 7/7 each, 0 asserts,
+      clean output. Dropping M=1 to the 512 tile cost less decode than feared:
+        untuned        21.02 tok/s decode / 2684 tok/s prefill  (stable)
+        full 18-entry  21.62 (+2.9%) / 3184 (+18.6%)            (BROKEN)
+        M>=512 SHIPPED 21.40 (+1.8%) / 3064 (+14.2%)            (stable)
+      *** THE LESSON FOR ANY FUTURE TUNING ON THIS BOX: the sep tuner ranks
+      candidates PURELY BY LATENCY and never compares their output to a
+      reference, so a fast-but-racy config is exactly what it selects. Worse
+      than the crashes, the capped variant returned "The\nTherl's in the image
+      is a\nA red" from image_understanding and still scored PASS, because the
+      test only checks for a substring. A tuning pass needs an OUTPUT-
+      CORRECTNESS gate, not a battery of pass/fail modality checks. ***
 - [ ] Rebench with LCN_CUDAGRAPH=1 (kernel time shrinking amplifies
       the graph win) + battery; kernel configs change scheduling not math, so temp-0
       spot check suffices unless drift appears
