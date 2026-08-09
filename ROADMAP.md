@@ -516,8 +516,33 @@ reason #1 settles first).
       Do not read startup silence as "config not picked up" — send one request
       first. (Calling get_moe_configs directly via docker exec also fails:
       it reads get_server_args(), which is unset outside the server process.)
-- [ ] Before/after decode bench (baselines: 21.5 tok/s eager / 22.4 graphs, 400-token
-      essay probe x3) + rebench with LCN_CUDAGRAPH=1 (kernel time shrinking amplifies
+- [x] PAIRED BEFORE/AFTER BENCH DONE 2026-08-09. Method is now COMMITTED
+      (test/bench_decode.py, test/bench_prefill.py) — the old 21.5/22.4 numbers
+      came from an uncommitted script and are NOT a safe comparator, so both
+      halves were re-measured under the same script on the same machine:
+      :v0516-spec (untuned, logs "Using default MoE kernel config") vs
+      :v0516-tuned (logs "Using MoE kernel config from ..." for both projections).
+      All-modality defaults, CUDA graphs OFF (disable_cuda_graph=True).
+        decode  bs=1, 400 tok x3 prompts: 21.02 -> 21.62 tok/s = +2.9%
+                (per-prompt +3.0/+2.8/+2.9%, spreads 0.1-0.3% — not noise)
+        prefill 6769-token prompt x5:     2684 -> 3184 tok/s  = +18.6%
+                (spreads 0.6% / 0.7%)
+      WHY THE 6x GAP, and it matters for future tuning decisions: at bs=1 the
+      MoE GEMM is a skinny matvec, memory-bandwidth-bound on GB10's ~270GB/s,
+      so tile geometry has little room to help. Prefill runs M in the thousands
+      where the same kernel is compute-bound and tile/warp/stage choices decide
+      GPU utilization. TUNING PAYS WHERE THE KERNEL IS COMPUTE-BOUND.
+      This retro-justifies running the FULL ladder: a decode-only tune would
+      have cost hours instead of days and captured the +2.9% while missing the
+      +18.6% entirely. The large-M sizes were described mid-campaign as "batch
+      sizes we can't feasibly run" — that was WRONG; they are the prefill
+      shapes and they run on every long prompt.
+      BENCH GOTCHAS baked into the scripts: (1) prefill needs a UNIQUE NONCE
+      per request or the radix cache serves it and you measure nothing —
+      cached_tokens is printed to make a hit visible; (2) the warmup must be
+      FULL SIZE — a short warmup leaves the large-M kernels cold and the first
+      real run lands ~2.7x slow (974 vs 2684 tok/s), wrecking the median.
+- [ ] Rebench with LCN_CUDAGRAPH=1 (kernel time shrinking amplifies
       the graph win) + battery; kernel configs change scheduling not math, so temp-0
       spot check suffices unless drift appears
 

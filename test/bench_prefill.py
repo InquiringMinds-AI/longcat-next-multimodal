@@ -42,7 +42,9 @@ def one_run(url, key, prompt, timeout):
     elapsed = time.perf_counter() - t0
     usage = payload.get("usage", {})
     ptok = usage.get("prompt_tokens")
-    cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    # the key is present but null when nothing was cached, so a .get default
+    # on the outer lookup is not enough
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
     if not ptok:
         raise RuntimeError(f"no prompt_tokens in usage: {usage}")
     return ptok, cached, elapsed, ptok / elapsed
@@ -62,8 +64,11 @@ def main():
     print(f"bench_prefill: {args.runs} runs, ~{args.words} words/prompt, "
           f"max_tokens=1, unique nonce per run{tag}")
 
-    one_run(args.url, args.key, make_prompt(200, "warmup"), args.timeout)
-    print("warmup done")
+    # The warmup must be the SAME size as the measured runs: a short prompt
+    # never touches the large-M kernels, so the first real run pays their
+    # one-time cost and lands ~2.7x slow, wrecking the median.
+    one_run(args.url, args.key, make_prompt(args.words, "warmup"), args.timeout)
+    print(f"warmup done (full-size, ~{args.words} words)")
 
     rates = []
     for i in range(args.runs):
