@@ -389,6 +389,25 @@ class LongcatFlashMoE(nn.Module):
         if self.tp_size > 1 and _lc_gab().is_none():
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
+        # Env-gated NaN localisation (LCN_NAN_CHECK=1). The device-side assert
+        # that kills the server fires in the SAMPLER, so "the MoE produced the
+        # NaN" was only ever an inference from the tuned configs being the sole
+        # variable — and an isolated MoE call refuses to reproduce it even with
+        # real weights, activations and routing. This reports whether NaN is
+        # ARRIVING at this layer or being CREATED here, which is the fork in the
+        # road. Costs a sync per MoE call, so it is debug-only.
+        if os.environ.get("LCN_NAN_CHECK") == "1":
+            _in_bad = bool(torch.isnan(hidden_states).any() or torch.isinf(hidden_states).any())
+            _out_bad = bool(torch.isnan(final_hidden_states).any()
+                            or torch.isinf(final_hidden_states).any())
+            if _in_bad or _out_bad:
+                origin = "CREATED HERE" if (_out_bad and not _in_bad) else "arrived from upstream"
+                print(
+                    f"[NAN-CHECK] layer={self.layer_id} tokens={num_tokens} "
+                    f"input_bad={_in_bad} output_bad={_out_bad} -> {origin}",
+                    flush=True,
+                )
+
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def get_moe_weights(self):
