@@ -542,6 +542,46 @@ reason #1 settles first).
       cached_tokens is printed to make a hit visible; (2) the warmup must be
       FULL SIZE — a short warmup leaves the large-M kernels cold and the first
       real run lands ~2.7x slow (974 vs 2684 tok/s), wrecking the median.
+- [ ] *** BLOCKER 2026-08-09: THE TUNED CONFIGS BREAK THE AUDIO PATH. DO NOT
+      SHIP / DO NOT PUSH new_files/moe_configs UNTIL RESOLVED. ***
+      Symptom: `_assert_async_cuda_kernel: Assertion 'probability tensor
+      contains either inf, nan or element < 0' failed` -> `torch.AcceleratorError:
+      device-side assert triggered` -> scheduler dies, launch_server SIGKILLed,
+      gateway survives so everything downstream returns connection-refused
+      (those cascade failures are NOT separate bugs).
+      PAIRED EVIDENCE, same image/mounts/sequence, all-modality defaults:
+        :v0516-spec  (untuned) -> selftest 7/7, 0 asserts, server alive
+        :v0516-tuned          -> 3 runs, 3 failures (4/7, 1/7, and the first
+                                 battery), 1 assert each, server dead each time
+      NOT memory: OOMKilled=false, normal headroom, memory frees only AFTER the
+      process dies. NOT one bad entry: removing M=128 did not help (it made the
+      run worse), and run 2 vs run 3 executed the SAME 193-token audiogen
+      prefill with the SAME M=256 config, one passing and one asserting.
+      => the fault is NONDETERMINISTIC. Identical config + identical shape +
+      both outcomes rules out a wrong-but-deterministic tile choice; the shape
+      of it is a race (likely the async-copy pipeline) that the tuned configs
+      expose. Tuned configs use num_stages=5 / BLOCK_SIZE_K=256, far deeper and
+      wider than get_default_config's conservative choices, on a new arch
+      (sm_121). THE TUNER ONLY EVER TIMED CANDIDATES — it never compared their
+      output against a reference, so a fast-but-racy config is exactly what it
+      would select.
+      All 3 failures were mid-size prefills (170-193 tokens) in the AUDIO path
+      (audio_understanding once, audio generation twice). Large prefills (6769
+      tok -> M=4096 config) and text decode never failed.
+      ITERATION TOOL (big time saver): get_moe_configs honours
+      SGLANG_MOE_CONFIG_DIR, so config variants can be tested by pointing the
+      env at <dir>/configs/triton_3_6_0/ on the output mount — no rebuild, just
+      a container restart. Variants live in ~/longcat-outputs/moe_override/.
+      Crash logs preserved: ~/longcat-outputs/server_{tuned_crash2,no128,
+      untuned_battery,largeM_r1,largeM_r2}.log
+      NEXT: testing large-M-only (M>=512) — if the audio path survives two
+      consecutive batteries, the fault lives in the small/mid-M entries and the
+      +18.6% prefill win can likely be kept by shipping only large-M tuned
+      entries plus get_default_config values for the small ones (a bare
+      large-M-only map would mis-route M=1 decode to the 512 tile and cost
+      decode speed, so the small entries must be filled, not just dropped).
+      CAUTION: the failure is intermittent, so no single green run settles
+      anything — require repeated batteries before believing any fix.
 - [ ] Rebench with LCN_CUDAGRAPH=1 (kernel time shrinking amplifies
       the graph win) + battery; kernel configs change scheduling not math, so temp-0
       spot check suffices unless drift appears
