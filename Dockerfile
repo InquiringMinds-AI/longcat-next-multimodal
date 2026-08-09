@@ -52,6 +52,15 @@ archs=ModelRegistry.get_supported_archs(); \
 assert 'LongcatNextForCausalLM' in archs, sorted(a for a in archs if 'ongcat' in a); \
 print('OK registered: LongcatNextForCausalLM')"
 
+# --- GB10-tuned fused-MoE Triton kernel configs (roadmap #4) ---
+#     Tuned on this checkpoint's real routing distributions across all 18 batch
+#     sizes; without them the runtime warns the config is missing and falls back
+#     to generic heuristics. Filenames are what get_config_file_name() derives
+#     for E=256, N=1024, int8_w8a8, per_channel_quant=True (plus the _down
+#     variant for the second projection); triton_3_6_0 matches the image's
+#     Triton, and the lookup is keyed by that version directory.
+COPY new_files/moe_configs/ ${SG}/layers/moe/moe_runner/triton_utils/configs/triton_3_6_0/
+
 # --- bundled client/test scripts + per-language demo reference voices ---
 #   voices/en_reference.wav : public-domain LibriVox solo narration (native English)
 #   voices/zh_reference.wav : Meituan LongCat example clip spk_syn.wav (MIT, Chinese)
