@@ -579,8 +579,12 @@ reason #1 settles first).
       writeup. Both refuted hypotheses are recorded there so nobody re-walks
       them: (1) single bad entry — removing M=128 made it WORSE (1/7);
       (2) pipeline depth — capping num_stages at 4 still failed (4/7 then 0/7).
-      M>=512 validated across FIVE consecutive batteries, 7/7 each, 0 asserts,
-      clean output. Dropping M=1 to the 512 tile cost less decode than feared:
+      M>=512 validated across SEVEN consecutive batteries, 7/7 each, 0 asserts,
+      clean output — five via SGLANG_MOE_CONFIG_DIR override, then two more on
+      the actual shipping image longcat-next-gb10:v0516-tuned-safe (configs
+      baked in, no override), which also passed anthropic 5/5 and degeneracy
+      6/6 and measured 21.37 tok/s decode / 3055 tok/s prefill, matching the
+      override runs within noise. Dropping M=1 to the 512 tile cost less decode than feared:
         untuned        21.02 tok/s decode / 2684 tok/s prefill  (stable)
         full 18-entry  21.62 (+2.9%) / 3184 (+18.6%)            (BROKEN)
         M>=512 SHIPPED 21.40 (+1.8%) / 3064 (+14.2%)            (stable)
