@@ -167,3 +167,31 @@
          fi = draft_input.future_indices
          if fi is None:
              return
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -509,6 +509,25 @@
+             max_running_requests=self.max_running_requests,
+             device=self.device,
+         )
++        self.lcn_setup_model_kv_pool_refs()
++
++    def lcn_setup_model_kv_pool_refs(self):
++        """LongCat-Next overlay: hand the model a model_runner reference.
++
++        The model defines `_setup_kv_pool_refs`, whose docstring says
++        "Called by model_runner to provide KV pool access for CFG dual-path"
++        -- but nothing ever called it. `self._model_runner` therefore stayed
++        None for the life of the project, every classifier-free-guidance path
++        short-circuited on it, and ALL image generation ran UNGUIDED despite
++        IMAGE_GEN_CFG_SCALE defaulting to 3.0.
++
++        Safe to install here: the model only stores the reference and resolves
++        req_to_token_pool / token_to_kv_pool_allocator / attn_backend lazily at
++        generation time. Set IMAGE_GEN_CFG_SCALE=1.0 to disable CFG.
++        """
++        _setup = getattr(self.model, "_setup_kv_pool_refs", None)
++        if _setup is not None:
++            _setup(self)
+ 
+     def init_kv_cache_configurator(self):
+         self.kv_cache_configurator = KVCacheConfigurator(
