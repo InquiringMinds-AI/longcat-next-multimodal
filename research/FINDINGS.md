@@ -1464,3 +1464,28 @@ is physical rather than statistical.
 **This is what the labelled set was for.** It killed my metric, promoted a better one, and
 gave every future TTS change a ground-truth-checkable acceptance test. The rate is also now
 known: 3 defective in 8 renders (~38%) on the shipping config.
+
+### Instrument self-check: the seventh silence-read-as-success failure (2026-08-10)
+
+The first TTS arm run reported `0/16 flagged` on the baseline against an owner-labelled 3/8
+— a p≈0.0003 result that would have been entirely convincing as "the defect is fixed".
+
+It measured nothing. The container image predated `end_jump`, so `st.get("end_jump", -1)`
+returned the sentinel for every render and every sentinel fell below the defect threshold.
+What caught it was printing the raw values beside the verdict: `jumps sorted: [-1, -1, ...]`
+is unmistakable where `0/16 flagged` is not.
+
+This is the SEVENTH instrument today whose silence was nearly read as success — after
+`seconds`, the deleted `tail_gap_ms` flag, `cps`, the round-trip transcriber, the hashed-pad
+backstop that never executed, and the blind chunk sweep. Two mitigations now stand:
+
+1. **Report evidence beside the conclusion, never the conclusion alone.** Every summary line
+   is now accompanied by the raw values it was computed from.
+2. **Instruments must verify themselves before measuring.** The arm harness now renders one
+   probe clip and ASSERTS the metric field exists, aborting loudly if absent. A measurement
+   run that cannot measure must fail, not return zeros.
+
+The general form, worth carrying beyond this project: *a metric that is missing, a guard that
+never fires, and a bug that is absent all produce identical output.* Any harness that cannot
+distinguish those three states will eventually report the wrong one, and it will do so in the
+direction that looks like success.
