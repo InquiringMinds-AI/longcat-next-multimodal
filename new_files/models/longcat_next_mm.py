@@ -100,21 +100,27 @@ TTS_TRIM_LEAD_MS = _envi("LCN_TTS_TRIM_LEAD_MS", 0)
 # an isolated/stray end-flag is re-sampled to a real acoustic code so the model speaks for
 # exactly as long as its task needs — no arbitrary minimum-length floor.
 AUDIO_END_CONFIRM = 2
-# Require the end-of-audio flag to be the model's TOP choice, not merely a sampled one,
-# before it counts toward AUDIO_END_CONFIRM. The flag shares the sampled distribution with
-# acoustic content, so it can be drawn while a held sound is still in progress — which is
-# the owner-adjudicated defect: renders cut mid-'s' and mid-'l' with an audible click, and
-# one that ended on a click with the word intact (2026-08-10). Measured 4/16 renders
-# affected on the shipping config, end_jump up to 0.296 against a clean-render ceiling of
-# 0.012.
-# This makes TERMINATION deterministic while leaving acoustic sampling stochastic, so the
-# voice is untouched. It is preferred over the two env-only alternatives that were measured:
-# AUDIO_GEN_REPETITION_PENALTY=1.0 cleared the defect (0/14, max 0.048) but produced HTTP
-# 500s on 2 of 16 requests — the penalty is also what suppresses runaway repetition, so
-# disabling it trades an audible click for a hard failure. AUDIO_GEN_TOP_K=1 only halved the
-# defect (2/16) and would flatten the voice by making every codebook greedy.
-# AUDIO_END_ARGMAX=0 restores the previous sample-anywhere behaviour.
-AUDIO_END_ARGMAX = os.environ.get("AUDIO_END_ARGMAX", "1").strip() == "1"
+#
+# MEASURED AND REJECTED (2026-08-10): requiring the end flag to be the model's TOP choice
+# before it counts (an "AUDIO_END_ARGMAX" gate). The idea was that the flag shares the
+# sampled distribution with acoustic content, so it can be drawn mid-sound — matching the
+# owner-adjudicated defect where renders cut mid-'s' and mid-'l' with an audible click.
+# A MATCHED pair on one build, 32 renders per arm, threshold end_jump>=0.06:
+#     gate ON  6/32 flagged (max 1.329)
+#     gate OFF 5/32 flagged (max 0.763)
+# No effect. An earlier 4/16-vs-2/16 reading that appeared to halve the defect compared
+# DIFFERENT builds at half the sample size and did not survive matching. The terminal-click
+# rate is ~16% either way, so it is a property of audio decoding, not of the end decision.
+# The gate was removed rather than left default-off: it has no measured benefit, and it is
+# suspected of converting terminal clicks into a SECOND, audibly worse defect (sustained
+# mid-utterance babble, e.g. "self test. oooOoOoOooo.. nomina"), which end_jump cannot see
+# at all. Two env-only alternatives were also measured and rejected:
+# AUDIO_GEN_REPETITION_PENALTY=1.0 cleared the metric (0/14, max 0.048) but produced HTTP
+# 500s on 2 of 16 requests — that penalty is also what suppresses runaway repetition, so it
+# trades an audible click for a hard failure. AUDIO_GEN_TOP_K=1 halved the flag rate (2/16,
+# unmatched) and would flatten the voice by making every codebook greedy.
+# Anything attempted here next needs a metric that sees BOTH defect populations; end_jump
+# measures only the terminal discontinuity.
 AUDIO_GEN_SAMPLING_RATE = 24000
 
 
@@ -902,21 +908,13 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
 
             # End-of-audio flag (index == codebook_sizes[level]) is only meaningful at level 0.
             # Still NO arbitrary minimum-length floor — the flag stays sampleable at level 0
-            # and is adjudicated by AUDIO_END_ARGMAX (must be the model's top choice) and then
-            # END_CONFIRM (must repeat). At levels >0 it is always masked.
+            # and is adjudicated by END_CONFIRM (must repeat). At levels >0 it is always
+            # masked. See the AUDIO_END_CONFIRM block above for the argmax gate that was
+            # measured here and rejected.
             end_token_idx = self._audio_codebook_sizes[level]
             if level == 0:
                 tok = self._sample_codebook_logits(logits, level, prev_ids)
-                if int(tok) == end_token_idx and AUDIO_END_ARGMAX and int(logits[0].argmax()) != end_token_idx:
-                    # Sampled an end flag the model does not actually prefer — the premature
-                    # stop. Treat it as a stray: reset the confirm run and re-sample real
-                    # speech content with the end slot masked, exactly as the existing stray
-                    # handling below does. `logits` is untouched here (the sampler clones),
-                    # so this argmax is the model's raw preference.
-                    state.end_run = 0
-                    logits[0, end_token_idx] = float('-inf')
-                    tok = self._sample_codebook_logits(logits, level, prev_ids)
-                elif int(tok) == end_token_idx:
+                if int(tok) == end_token_idx:
                     state.end_run += 1
                     if state.end_run >= AUDIO_END_CONFIRM:
                         state.ended = True
