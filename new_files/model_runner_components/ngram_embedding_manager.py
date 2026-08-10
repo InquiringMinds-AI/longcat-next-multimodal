@@ -181,6 +181,7 @@ def lcn_write_spec_tokens(
     row_indices: torch.Tensor,
     column_starts: torch.Tensor,
     req_lens: torch.Tensor,
+    scan_triggers: bool = False,
 ) -> None:
     """Write speculative-decoding tokens into the ngram hash table.
 
@@ -194,9 +195,20 @@ def lcn_write_spec_tokens(
     Rejected drafts left beyond the accepted region are harmless: the kernel
     only ever reads backwards from a live position, and later writes overwrite
     them. Applies the same specials-to-zero hashing rule as every other write.
+
+    scan_triggers: run the model's gen-entry trigger scan on these ids. Set ONLY
+    at the accepted-tokens call site (b). model_runner.sample() — the one place
+    that normally arms the latch — is bypassed on the spec path, so without this
+    a generation entered by a token accepted during a verify round is never
+    noticed and the plain-decode fallback never engages. Must NOT be set for
+    drafts (a): a rejected draft would arm generation that never happened.
     """
     if not manager.enabled or tokens.numel() == 0:
         return
+    if scan_triggers and manager.trigger_scan is not None:
+        # RAW ids, before the specials-to-zero rewrite below zeroes the
+        # gen-entry triggers (they sit above the text vocab).
+        manager.trigger_scan(tokens)
     toks = torch.where(
         tokens < NGRAM_HASH_TEXT_VOCAB, tokens, torch.zeros_like(tokens)
     ).to(torch.int32)

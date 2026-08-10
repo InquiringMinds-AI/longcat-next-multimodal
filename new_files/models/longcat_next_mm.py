@@ -328,6 +328,18 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         # (LCN_NGRAM=1 implies LCN_AGENT=1 — see entrypoint.)
         self._lcn_gen_disabled = os.environ.get("LCN_AGENT", "0").strip() == "1"
 
+        # Publish the gen-watch predicate to the scheduler. Under speculative
+        # decoding the scheduler must know, at decode-prep time, whether this
+        # step needs the Python state machines — verify rounds cannot run them.
+        # See lcn_gen_state and patches/spec_gen_fallback.patch. No-op unless
+        # a spec algorithm is configured.
+        try:
+            from sglang.srt.lcn_gen_state import register_gen_probe
+
+            register_gen_probe(self.lcn_gen_watch_active)
+        except Exception:
+            pass
+
         # KV pool references for dual-path CFG (set by model_runner after load)
         self._model_runner = None
 

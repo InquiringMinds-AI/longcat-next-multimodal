@@ -15,14 +15,18 @@ INTERNAL="${SGLANG_INTERNAL_PORT:-30000}"
 export SGLANG_INTERNAL_PORT="$INTERNAL"
 export MODEL_PATH="${MODEL_PATH:-/workspace/model}"
 
-# NGRAM spec decode implies the AGENT profile: generation and speculative
-# verify rounds cannot coexist (the multimodal state machines only run on
-# plain-decode forwards, and a plain-decode fallback under a spec-configured
-# scheduler leaves a half-built batch — crashes in the eager buffer fill).
-# Agent mode 403s gen at the gateway AND disables the model's gen machinery,
-# which is exactly the deployment NGRAM is for (repetitive agent loops).
-if [ "${LCN_NGRAM:-0}" = "1" ] && [ "${LCN_AGENT:-0}" != "1" ]; then
+# NGRAM spec decode still implies the AGENT profile by DEFAULT. The fatal crash
+# that originally forced this is FIXED (patches/spec_gen_fallback.patch: a batch
+# with an active image/audio generation falls back to plain decode, one token per
+# step, and speculation resumes afterwards) — image generation now runs to
+# completion under a spec-configured scheduler. But that path still leaks one KV
+# slot per fallback decode step, which exhausts the pool over a session, so it is
+# NOT yet a safe default. See research/FINDINGS.md.
+# LCN_NGRAM_ALLOW_GEN=1 opts into the fixed-but-leaking path (dev/debug only).
+if [ "${LCN_NGRAM:-0}" = "1" ] && [ "${LCN_NGRAM_ALLOW_GEN:-0}" != "1" ] \
+   && [ "${LCN_AGENT:-0}" != "1" ]; then
   echo "[entrypoint] LCN_NGRAM=1 implies the agent profile — enabling LCN_AGENT=1"
+  echo "[entrypoint]   (set LCN_NGRAM_ALLOW_GEN=1 for generation+NGRAM; known KV leak)"
   export LCN_AGENT=1
 fi
 

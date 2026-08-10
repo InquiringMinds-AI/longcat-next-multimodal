@@ -47,7 +47,7 @@
      def _update_ngram_corpus(self, batch: ScheduleBatch):
          batch_tokens = []
          i, stride = 0, self.draft_token_num
-@@ -441,6 +462,25 @@
+@@ -441,6 +462,30 @@
              accept_tokens = predict[accept_index].flatten()
              next_token_ids = accept_tokens
  
@@ -68,6 +68,11 @@
 +                    row_indices=batch.req_pool_indices,
 +                    column_starts=batch.seq_lens,
 +                    req_lens=accept_lens,
++                    # Arm the gen-entry latch: sample() (which normally does
++                    # it) is bypassed here, so without this an image/audio
++                    # generation entered by an ACCEPTED token is never seen
++                    # and the plain-decode fallback never engages.
++                    scan_triggers=True,
 +                )
 +
              # The KV mover expects drafts-only counts. NGRAM's

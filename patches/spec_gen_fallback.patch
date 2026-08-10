@@ -1,0 +1,111 @@
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -2782,6 +2782,59 @@
+             latest_output_ids
+         )
+ 
++    def _lcn_set_plain_decode_input_ids(self):
++        """Materialize input_ids for a spec->plain decode fallback.
++
++        The plain path normally gets input_ids from the previous run_batch, or
++        (under overlap) from FutureMap.output_tokens_buf at forward entry. With
++        NGRAM configured, BOTH sources are empty: FutureMap.stash() early-returns
++        for ngram, so output_tokens_buf is never written, and resolve_forward_inputs
++        gates its gather on future_map.spec_algo.is_none(). So the last real token
++        has to be rebuilt here.
++
++        Reconstruction mirrors NGRAMWorker._prepare_draft_tokens exactly: the true
++        history is origin_input_ids + output_ids + the previous round's accepted
++        tokens, and under overlap that last group has NOT yet landed in
++        req.output_ids (results are processed one iteration behind). accept_tokens
++        is laid out per request at stride draft_token_num, valid for accept_lens[i]
++        entries -- so the newest token is the last valid entry when there is one.
++        """
++        spec_info = self.spec_info
++        prev_tokens = prev_lens = None
++        stride = 0
++        if (
++            self.enable_overlap
++            and spec_info is not None
++            and getattr(spec_info, "accept_tokens", None) is not None
++            and getattr(spec_info, "accept_lens", None) is not None
++        ):
++            # Host sync: acceptable here because a generating batch is already
++            # eager and host-driven (the state machines run per token).
++            prev_tokens = spec_info.accept_tokens.tolist()
++            prev_lens = spec_info.accept_lens.tolist()
++            stride = spec_info.draft_token_num
++
++        last_tokens = []
++        for i, req in enumerate(self.reqs):
++            tok = None
++            if prev_tokens is not None and i < len(prev_lens) and prev_lens[i] > 0:
++                idx = i * stride + prev_lens[i] - 1
++                if idx < len(prev_tokens):
++                    tok = prev_tokens[idx]
++            if tok is None:
++                tok = (
++                    req.output_ids[-1]
++                    if len(req.output_ids)
++                    else req.origin_input_ids[-1]
++                )
++            last_tokens.append(tok)
++
++        self.input_ids = torch.tensor(
++            last_tokens,
++            dtype=torch.int64,
++            pin_memory=is_pin_memory_available(self.device),
++        ).to(self.device, non_blocking=True)
++
+     def prepare_for_decode(self):
+         self.forward_mode = ForwardMode.DECODE
+         server_args = get_server_args()
+@@ -2793,7 +2846,29 @@
+         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
+             self.attn_cp_metadata = None
+ 
++        # LongCat-Next overlay: image/audio generation is driven by Python
++        # state machines in the model's decode forward. A speculative verify
++        # round evaluates several candidate tokens at once and cannot run
++        # them, so a batch with generation active must fall back to plain
++        # decode. Upstream has no such fallback -- the branch below hands
++        # decode prep to the spec path unconditionally, and nothing there
++        # assigns input_ids, so a batch that then needs the plain forward
++        # arrives with input_ids=None -> raw_num_tokens=0 -> the eager buffer
++        # fill dies ("The size of tensor a (0) must match the size of tensor
++        # b (N)"). Same all-or-nothing granularity as the CUDA-graph veto:
++        # generation state is global to the model, so the whole batch falls
++        # back. Costs one token/step while generating -- which is exactly
++        # what generation needs anyway.
++        self.lcn_force_plain_decode = False
+         if not self.spec_algorithm.is_none():
++            from sglang.srt.lcn_gen_state import gen_active, note_fallback
++
++            if gen_active():
++                note_fallback()
++                self.lcn_force_plain_decode = True
++                self._lcn_set_plain_decode_input_ids()
++
++        if not self.spec_algorithm.is_none() and not self.lcn_force_plain_decode:
+             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
+             from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
+ 
+--- a/python/sglang/srt/speculative/ngram_worker.py
++++ b/python/sglang/srt/speculative/ngram_worker.py
+@@ -267,6 +267,16 @@
+         if not batch.forward_mode.is_decode():
+             return
+ 
++        # LongCat-Next overlay: the scheduler flagged this batch as needing the
++        # model's Python generation state machines, which only run on a plain
++        # decode forward. Leave forward_mode at DECODE and build no verify
++        # input -- forward_batch_generation's existing non-verify branch then
++        # runs a single plain target forward and reports it as one accepted
++        # token, which is the graceful degradation we want (and is the same
++        # path prefill already takes under this worker).
++        if getattr(batch, "lcn_force_plain_decode", False):
++            return
++
+         bs = len(batch.reqs)
+ 
+         retrieve_index = self.retrieve_indexes_batch[bs]

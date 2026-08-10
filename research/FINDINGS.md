@@ -237,3 +237,94 @@ token per decode step (watching for image_start/audio_start, counting toward the
 spec output with an active generation, those counters need ordered multi-token
 handling. The all-or-nothing veto avoids this by construction, but it is the
 first thing to check if a fix misbehaves.
+
+### Implementing it: what the source actually required
+
+Four things the sketch above got wrong or missed, each found by reading the
+v0.5.16 scheduler rather than by reasoning from the crash:
+
+1. **`batch.spec_algorithm` must NOT be flipped to NONE.** That looks like the
+   elegant fix (every downstream `is_none()` branch would then agree), but
+   `self.model_worker` is bound ONCE at init — with speculation configured it is
+   permanently the draft worker — while the FutureMap stays ngram-configured.
+   Flipping the batch flag desynchronizes the batch from the relay bookkeeping.
+   A dedicated `batch.lcn_force_plain_decode` flag, consulted in exactly two
+   places, keeps every other invariant untouched.
+
+2. **The single-token fallback path already exists.** `NGRAMWorker.
+   forward_batch_generation` has a non-verify `else` branch (used by prefill)
+   that runs a plain target forward and reports it as `accept_tokens[:,0]=predict,
+   accept_lens=1`, then builds the next `NgramVerifyInput`. Making
+   `_prepare_for_speculative_decoding` return early for a flagged batch drops
+   decode into that same branch — no new forward path, and the result shape the
+   next draft prep expects is produced for free.
+
+3. **`input_ids` cannot come from the FutureMap.** `FutureMap.stash()`
+   early-returns for ngram ("FIXME: remove once precomputed draft is supported"),
+   so `output_tokens_buf` is never written; `resolve_forward_inputs` gates its
+   gather on `future_map.spec_algo.is_none()`, which is false forever. Both
+   normal sources are empty. The token has to be rebuilt exactly the way
+   `NGRAMWorker._prepare_draft_tokens` reconstructs history: under overlap the
+   previous round's accepted tokens have NOT yet reached `req.output_ids`, so the
+   newest token is `accept_tokens[i*stride + accept_lens[i] - 1]`, falling back to
+   `output_ids[-1]` / `origin_input_ids[-1]`.
+
+4. **The gen-entry latch never arms on the spec path.** `lcn_trigger_scan` is
+   called from `update_after_decode`, which lives inside `model_runner.sample()` —
+   bypassed by spec verify. Generation entered at PREFILL still works (prefill
+   takes the plain `else` branch, so `sample()` runs), but a gen-entry token
+   ACCEPTED during a verify round would be missed entirely and the fallback would
+   never engage. Fixed by scanning accepted tokens in `lcn_write_spec_tokens`
+   (`scan_triggers=True` at that call site only — drafts must not arm it, since a
+   rejected draft would arm a generation that never happened).
+
+### Measured result (2026-08-09, `longcat-next-gb10:v0516-specgen`)
+
+Launched all-modality with speculation on — `LCN_NGRAM=1 LCN_AGENT=0`,
+mem-fraction 0.72, overlap schedule ON, decode graphs bs<=32 — i.e. exactly the
+combination the old guard existed to prevent.
+
+**The crash is gone and the fallback demonstrably engages.** Log evidence:
+
+```
+[lcn] spec->plain decode fallback engaged for generation (steps=1)
+[lcn] spec->plain decode fallback engaged for generation (steps=1000)
+Decode batch, #running-req: 1, accept len: 1.00, accept rate: 0.00, cuda graph: False
+[ImageGen] req=2: image complete at token 1405, forcing image_end
+[ImageGen] req=2: image generation ended, 1369 visual tokens accumulated
+Image saved to /workspace/outputs/longcat_img_..._refined.png
+```
+
+A full 37x37 image generated to completion under a spec-configured scheduler —
+`accept len 1.00 / accept rate 0.00 / cuda graph False` is precisely the intended
+fallback signature. Text passed too. The explicit counter matters: without it a
+green selftest could not distinguish "fallback worked" from "generation never
+reached the spec path".
+
+**But a NEW, distinct defect surfaced: a KV pool accounting leak.** The scheduler
+died at the first idle AFTER the image was saved:
+
+```
+ValueError: pool memory leak detected!
+  [full] total=82482, available=79639, evictable=1438, protected=0, session_held=0
+```
+
+`82482 - 79639 - 1438 = 1405` — exactly the image's final token count, i.e. ONE
+leaked slot per fallback decode step. The check (`invariant_checker._check_all_pools`
+from `Scheduler.on_idle`) runs unconditionally, not only under speculation, and the
+shipped non-NGRAM all-modality config passes 7/7 selftest repeatedly, so the leak is
+introduced by the fallback rather than pre-existing.
+
+Not yet root-caused. What is already ruled out: `alloc_for_decode` is NOT missing
+the counter bump — allocation.py:591 does `req.kv.kv_allocated_len += token_per_req`,
+so the plain path is internally self-consistent. The live hypothesis is a mismatch
+between plain-path allocation and the spec-configured RELEASE bookkeeping (the spec
+path pre-allocates a reserve via `alloc_for_spec_decode` and tracks
+`kv_allocated_len` vs `kv_committed_len` differently; the seq-lens publish also
+differs — the spec branch relays `on_publish(new_seq_lens)` where the non-spec
+branch publishes `seq_lens + 1`).
+
+**Status: NOT SHIPPABLE.** The fallback mechanism is validated; the KV accounting is
+not. Do not enable `LCN_NGRAM=1` without `LCN_AGENT=1` until the leak is fixed — a
+leak of one slot per generated token exhausts the KV pool across a session.
+`LCN_NGRAM_AGENT_COUPLE=1` restores the old always-safe guard.

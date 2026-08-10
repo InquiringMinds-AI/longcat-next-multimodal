@@ -25,6 +25,9 @@ COPY new_files/layers/n_gram_embedding.py       ${SG}/layers/n_gram_embedding.py
 COPY new_files/model_runner_components/ngram_embedding_manager.py ${SG}/model_executor/model_runner_components/ngram_embedding_manager.py
 COPY new_files/processors/longcat_next.py       ${SG}/multimodal/processors/longcat_next.py
 COPY new_files/hf_transformers/processor.py     ${SG}/utils/hf_transformers/processor.py
+# Neutral module so the scheduler can ask "is generation active?" without
+# importing the model (models import schedule_batch — the reverse would cycle).
+COPY new_files/lcn_gen_state.py                 ${SG}/lcn_gen_state.py
 
 # --- audio deps (mel extraction + wav I/O for the cosy24k vocoder) ---
 # scipy pinned: the vocoder's STFT window comes from scipy.signal.get_window, and the
@@ -39,7 +42,8 @@ RUN cd /sgl-workspace/sglang && \
     patch -p1 < /tmp/patches/model_config.patch && \
     patch -p1 < /tmp/patches/configs_longcat_flash.patch && \
     patch -p1 < /tmp/patches/decode_graph_gen_veto.patch && \
-    patch -p1 < /tmp/patches/ngram_spec_verify.patch
+    patch -p1 < /tmp/patches/ngram_spec_verify.patch && \
+    patch -p1 < /tmp/patches/spec_gen_fallback.patch
 
 # --- GB10 fix: on an ARM host SGLang routes the int8 MoE to a CPU-only op even on GPU.
 #     Require actually-on-CPU so the GB10 GPU/Triton path runs. ---
