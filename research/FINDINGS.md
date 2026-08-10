@@ -1027,3 +1027,40 @@ and `cps` is only a cadence measure on a COMPLETE render.
 for a state it could not actually distinguish. Every one was validated against
 self-consistency rather than against an adjudicated sample. The adjudication took one
 message and overturned a day of measurement.
+
+### The round-trip transcription check FAILS against ground truth — do not use it
+
+Run against the 11 saved renders, `tts_roundtrip.py` reported 6/11 missing a word, with
+a suspiciously perfect split by `cps` (complete 6.1-7.5, truncated 8.8-14.5, no overlap).
+It is wrong. On the only two renders with owner adjudication it disagrees BOTH times,
+in both directions:
+
+| file | owner | ASR transcript |
+|---|---|---|
+| `..110903` (5.35s, cps 6.1) | "skipping **nominal**" | `'Self test, all systems nominal.'` — complete |
+| `..114958` (3.14s, cps 11.6) | "no missing words or extra tail" | `'Self test all systems'` — missing nominal |
+
+File identity was checked rather than assumed: the durations match the owner's cadence
+descriptions ("very slow" = 5.35s, "faster" = 3.14s), so nothing was mislabeled in
+transit. The path is also visibly unreliable — one render transcribed as meta-commentary
+(`'The audio contains the following words spoken in sequence:\n\nSelf test\nAll systems'`)
+rather than a transcript.
+
+Most likely mechanism: the transcriber reconstructs the expected sentence from priors,
+and does so more readily on longer audio — which would manufacture exactly the clean
+duration-correlated split observed. Self-consistent, and false.
+
+**A caveat that cuts the other way, and is NOT a rescue of the instrument:** if a render
+CONTAINS "nominal" but renders it unintelligibly, ASR could recover it acoustically while
+a listener correctly reports it absent. If so the audio is still defective — for a TTS
+product "present but unintelligible" and "missing" are one failure — but it means the
+round-trip cannot separate TRUNCATED from GARBLED either.
+
+**Fourth instrument in one session to fail the same way** (`seconds`, `tail_gap_ms`,
+`cps`, now the round-trip): each was checked for self-consistency and none against an
+adjudicated sample. Standing rule for this defect going forward: OWNER LABELS ARE THE
+ONLY GROUND TRUTH, and any automatic TTS metric must be validated against a labeled set
+BEFORE it is used to draw a conclusion — not after.
+
+The 6/11 number and the cps separation are recorded here only as the discredited output
+of a broken check. **Do not cite them.**
