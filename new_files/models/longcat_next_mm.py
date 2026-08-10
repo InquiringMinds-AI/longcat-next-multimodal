@@ -296,6 +296,9 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
 
         # Per-request image generation state: req_pool_idx → ImageGenState
         self._image_gen_states: Dict[int, ImageGenState] = {}
+        # (kind, req_pool_idx) -> consecutive decode steps absent from the batch.
+        # Backs the orphaned-generation-state prune in forward(); see the note there.
+        self._gen_state_absent: Dict[tuple, int] = {}
         self._tokenizer = None  # lazy-loaded for diagnostic logging
 
         # --- Gen-trigger latch: sync-free steady-state text decode ---
@@ -1426,6 +1429,37 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             image_logit_overrides = self._image_gen_decode_step(
                 input_ids, hidden_states, forward_batch
             )
+        # Prune generation state orphaned by aborted or evicted requests.
+        # _audio_gen_states/_image_gen_states are keyed by req_pool_idx, and sglang
+        # REUSES pool slots. Entries are deleted on normal completion only, so a request
+        # that dies mid-generation — routine, since image generation runs for minutes and
+        # clients time out — pins its state to a slot that will later be handed to someone
+        # else. The next occupant then hits `.get(req_idx)` in the decode path and is
+        # treated as mid-generation: its input_ids get zeroed at pad positions and it is
+        # fed the dead request's codebook feedback.
+        # Decay-based, mirroring the trigger latch below: a slot absent from the batch for
+        # 64 consecutive decode steps is not coming back. The tolist() is a host sync, but
+        # this runs only while generation state exists, and that path is already eager.
+        if is_decode and (self._audio_gen_states or self._image_gen_states):
+            _live = set(forward_batch.req_pool_indices.tolist())
+            for _store, _kind in ((self._audio_gen_states, "audio"),
+                                  (self._image_gen_states, "image")):
+                for _k in list(_store.keys()):
+                    _key = (_kind, _k)
+                    if _k in _live:
+                        self._gen_state_absent.pop(_key, None)
+                        continue
+                    _n = self._gen_state_absent.get(_key, 0) + 1
+                    self._gen_state_absent[_key] = _n
+                    if _n >= 64:
+                        logger.warning(
+                            "[GenState] %s generation state for pool slot %d absent from "
+                            "the batch for 64 decode steps — clearing (request aborted or "
+                            "evicted). A later request reusing this slot would otherwise "
+                            "inherit it.", _kind, _k)
+                        _store.pop(_k, None)
+                        self._gen_state_absent.pop(_key, None)
+
         if (
             _run_sm
             and self._trigger_sticky
@@ -1648,7 +1682,10 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             prefix_len = prefix_lens[req_idx] if req_idx < len(prefix_lens) else 0
             base = bases[req_idx] if req_idx < len(bases) else 0
             for start, end in offsets:
-                n_tokens = end - start
+                # offsets are INCLUSIVE on both ends (see the processor): upstream
+                # pad_input_tokens writes input_ids[start:end+1], so the span is
+                # end - start + 1 tokens.
+                n_tokens = end - start + 1
                 if embed_idx + n_tokens > embeds.shape[0]:
                     n_tokens = embeds.shape[0] - embed_idx
                 if n_tokens <= 0:
@@ -1662,6 +1699,19 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 adj_start = base + rel_start
                 adj_end = adj_start + n_tokens
                 if adj_end > input_embeds.shape[0]:
+                    # The extend window ends inside this media item — chunked prefill put
+                    # a chunk boundary mid-item. The remainder is NOT written on the next
+                    # chunk either: there this item's rel_start goes negative and the whole
+                    # item is skipped as cached. So part of the media never reaches the
+                    # model. Zero the uncovered tail so the result is at least DETERMINISTIC
+                    # rather than whatever embed_tokens returned for a clamped pad id, and
+                    # say so loudly — a silently half-embedded image is exactly the kind of
+                    # plausible-looking corruption this project keeps getting burned by.
+                    dropped = adj_end - input_embeds.shape[0]
+                    logger.warning(
+                        "[MM] media item truncated by the extend window: %d of %d tokens "
+                        "not embedded (chunk boundary inside a media item). Output for this "
+                        "request may be degraded.", dropped, n_tokens)
                     adj_end = input_embeds.shape[0]
                     n_tokens = adj_end - adj_start
                 if n_tokens > 0:

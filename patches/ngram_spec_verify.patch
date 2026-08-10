@@ -47,7 +47,7 @@
      def _update_ngram_corpus(self, batch: ScheduleBatch):
          batch_tokens = []
          i, stride = 0, self.draft_token_num
-@@ -441,6 +462,30 @@
+@@ -441,6 +462,53 @@
              accept_tokens = predict[accept_index].flatten()
              next_token_ids = accept_tokens
  
@@ -62,9 +62,32 @@
 +                    lcn_write_spec_tokens,
 +                )
 +
++                # accept_tokens is predict[accept_index].flatten(), and NGRAM's
++                # accept_index is (bs, draft_token_num) -- so it is STRIDED with
++                # padding: request i occupies [i*stride, i*stride+stride), of which
++                # only the first accept_lens[i] entries are real. update_token_table
++                # reads tokens CONTIGUOUSLY, walking cumulative req_lens (see the
++                # prefill call site, which packs one flat list). Passing the strided
++                # buffer with req_lens=accept_lens therefore reads request i from
++                # sum(accept_lens[:i]) while its data sits at i*stride. Those agree
++                # only while every earlier request accepted the FULL stride, so
++                # request 0 is always right and later ones corrupt as soon as any
++                # earlier request accepts short -- single-request-safe, intermittent
++                # under concurrency, and invisible to a serial test suite.
++                # Pack to contiguous before writing. This also fixes the trigger
++                # scan below, which previously saw the padding slots and could arm a
++                # generation from a REJECTED draft.
++                _lcn_stride = self.draft_token_num
++                _lcn_bs = accept_lens.shape[0]
++                _lcn_valid = (
++                    torch.arange(_lcn_stride, device=accept_tokens.device).unsqueeze(0)
++                    < accept_lens.unsqueeze(1)
++                )
++                _lcn_packed = accept_tokens.view(_lcn_bs, _lcn_stride)[_lcn_valid]
++
 +                lcn_write_spec_tokens(
 +                    _lcn_mgr,
-+                    tokens=accept_tokens,
++                    tokens=_lcn_packed,
 +                    row_indices=batch.req_pool_indices,
 +                    column_starts=batch.seq_lens,
 +                    req_lens=accept_lens,

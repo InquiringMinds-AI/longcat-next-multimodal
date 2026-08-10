@@ -321,8 +321,6 @@ class LongcatNextProcessor(BaseMultimodalProcessor):
                 # carrying different media produce identical token ids — letting the
                 # radix prefix cache serve one request's media to another (proven; see
                 # research/FINDINGS.md). Leaving it None lets sglang hash the feature.
-                # longcat_next_mm._compute_mm_embeddings maps the resulting out-of-vocab
-                # pad ids back before the embedding lookup.
 
                 # Insert framing tokens: <img_start> <img_pad>×N <img_end>
                 img_start_id = getattr(self, 'image_start_token_id', 131106)
@@ -344,7 +342,11 @@ class LongcatNextProcessor(BaseMultimodalProcessor):
                     input_ids = torch.cat([input_ids, img_frame])
                     offset_start = len(input_ids) - len(img_frame)
 
-                img_item.offsets = [(offset_start + 1, offset_start + 1 + n_visual_tokens)]
+                # INCLUSIVE end. Upstream pad_input_tokens writes
+                # input_ids[offset[0] : offset[1] + 1], so a half-open end wrote n+1
+                # pads for n media tokens and clobbered the token AFTER the media --
+                # the <img_end>/<audio_end> marker -- on EVERY media request.
+                img_item.offsets = [(offset_start + 1, offset_start + n_visual_tokens)]
                 mm_items.append(img_item)
                 logger.info(f"Image {i}: {n_visual_tokens} tokens, grid={image_grid_thw[i].tolist()}, offset={offset_start+1}")
 
@@ -385,8 +387,6 @@ class LongcatNextProcessor(BaseMultimodalProcessor):
                 # carrying different media produce identical token ids — letting the
                 # radix prefix cache serve one request's media to another (proven; see
                 # research/FINDINGS.md). Leaving it None lets sglang hash the feature.
-                # longcat_next_mm._compute_mm_embeddings maps the resulting out-of-vocab
-                # pad ids back before the embedding lookup.
 
                 # Insert framing tokens
                 img_start_id = getattr(self, 'image_start_token_id', 131106)
@@ -406,7 +406,11 @@ class LongcatNextProcessor(BaseMultimodalProcessor):
                     input_ids = torch.cat([input_ids, vid_frame])
                     offset_start = len(input_ids) - len(vid_frame)
 
-                vid_item.offsets = [(offset_start + 1, offset_start + 1 + n_visual_tokens)]
+                # INCLUSIVE end. Upstream pad_input_tokens writes
+                # input_ids[offset[0] : offset[1] + 1], so a half-open end wrote n+1
+                # pads for n media tokens and clobbered the token AFTER the media --
+                # the <img_end>/<audio_end> marker -- on EVERY media request.
+                vid_item.offsets = [(offset_start + 1, offset_start + n_visual_tokens)]
                 mm_items.append(vid_item)
                 logger.info(f"Video {vid_idx}: {len(frames)} frames, {n_visual_tokens} tokens, "
                            f"grid=({n_frames},{int(h_per_frame)},{int(w_per_frame)})")
@@ -434,6 +438,21 @@ class LongcatNextProcessor(BaseMultimodalProcessor):
                 if pos is not None:
                     input_ids = torch.cat([input_ids[:pos + 1], pads, input_ids[pos + 1:]])
                     base = pos + 1
+                    # This INSERT shifts every token after pos by total_bridge, which
+                    # invalidates offsets already recorded for image/video items — they are
+                    # placed at the last assistant marker, i.e. LATER in the sequence, while
+                    # the audio span sits in the system section. Audio is processed last, so
+                    # nothing downstream repairs them: without this the visual embeddings
+                    # land total_bridge tokens too early on any request carrying BOTH audio
+                    # and an image or video.
+                    for _it in mm_items:
+                        _offs = getattr(_it, 'offsets', None)
+                        if not _offs:
+                            continue
+                        _it.offsets = [
+                            (a + total_bridge, b + total_bridge) if a > pos else (a, b)
+                            for a, b in _offs
+                        ]
                     logger.info(f"Audio inserted at in-prompt <audio_start> pos={pos} "
                                 f"({len(segments)} segment(s), {total_bridge} tokens)")
                 else:
@@ -454,10 +473,9 @@ class LongcatNextProcessor(BaseMultimodalProcessor):
                     # carrying different media produce identical token ids — letting the
                     # radix prefix cache serve one request's media to another (proven; see
                     # research/FINDINGS.md). Leaving it None lets sglang hash the feature.
-                    # longcat_next_mm._compute_mm_embeddings maps the resulting out-of-vocab
-                    # pad ids back before the embedding lookup.
                     audio_item.model_specific_data = {'encoder_length': encoder_length, 'bridge_length': bridge_length}
-                    audio_item.offsets = [(cur, cur + bridge_length)]
+                    # INCLUSIVE end -- see the note on the image offsets above.
+                    audio_item.offsets = [(cur, cur + bridge_length - 1)]
                     cur += bridge_length
                     mm_items.append(audio_item)
 
