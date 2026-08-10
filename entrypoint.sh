@@ -62,8 +62,15 @@ fi
 # via patches/decode_graph_gen_veto.patch and run eager). Prefill graphs stay
 # OFF — the multimodal prefill forward (encoders, gen-entry detection) is
 # host-driven and has not been made capture-safe.
-GRAPH_FLAG="--disable-cuda-graph"
-[ "${LCN_CUDAGRAPH:-0}" = "1" ] && GRAPH_FLAG="--cuda-graph-max-bs ${LCN_CUDAGRAPH_BS:-8} --disable-prefill-cuda-graph"
+# ON by default since 2026-08-10, on measurement: +3.8% decode untuned / +6.0%
+# with the tuned MoE configs, and +13.6% AGGREGATE at concurrency 16 (166.6 ->
+# 189.2 tok/s) for 0.17GB of extra capture memory. Capture costs ~30s of startup
+# and ~1.7GB total; measured MemAvailable after generation warmup with graphs on
+# was 9.95GB, so the all-modality budget absorbs it. Max-bs 32 (not 8) is what
+# buys the concurrency win — the curve keeps climbing to 64 concurrent requests.
+# LCN_CUDAGRAPH=0 restores the old always-eager behavior.
+GRAPH_FLAG="--cuda-graph-max-bs ${LCN_CUDAGRAPH_BS:-32} --disable-prefill-cuda-graph"
+[ "${LCN_CUDAGRAPH:-1}" = "0" ] && GRAPH_FLAG="--disable-cuda-graph"
 
 # NGRAM lookup speculative decoding: reworked 2026-07 — verify batches now get
 # correct hash-table geometry (patches/ngram_spec_verify.patch: TARGET_VERIFY

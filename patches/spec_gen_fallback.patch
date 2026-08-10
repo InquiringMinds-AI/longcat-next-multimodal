@@ -1,6 +1,22 @@
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -2782,6 +2782,59 @@
+@@ -133,6 +133,15 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++# LongCat-Next overlay: per-request KV forensics for the spec->plain decode
++# fallback, off unless LCN_DEBUG_KV=1. This is what identified the
++# kv_committed_len double-count (commit ran at ~2x seq_len); kept because the
++# next relayed-counter bug will be found the same way, and reasoning from source
++# had already produced three wrong answers before it.
++import os as _lcn_os
++
++_LCN_DEBUG_KV = _lcn_os.environ.get("LCN_DEBUG_KV", "0").strip() == "1"
++
+ 
+ @lru_cache(maxsize=1)
+ def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
+@@ -2782,6 +2791,59 @@
              latest_output_ids
          )
  
@@ -60,7 +76,7 @@
      def prepare_for_decode(self):
          self.forward_mode = ForwardMode.DECODE
          server_args = get_server_args()
-@@ -2793,7 +2846,44 @@
+@@ -2793,7 +2855,45 @@
          if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
              self.attn_cp_metadata = None
  
@@ -82,7 +98,8 @@
 +            from sglang.srt.lcn_gen_state import gen_active, note_fallback
 +
 +            if gen_active():
-+                if note_fallback() in (1, 500, 1000, 1500):
++                _n = note_fallback()
++                if _LCN_DEBUG_KV and _n in (1, 500, 1000, 1500):
 +                    # Leak forensics: if a fallback step allocates TWO slots,
 +                    # kv_allocated_len outruns seq_lens by the step count.
 +                    try:
@@ -105,7 +122,7 @@
              # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
              from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
  
-@@ -2816,7 +2906,18 @@
+@@ -2816,7 +2916,18 @@
          # Update req-level memory management fields
          for req in self.reqs:
              req.decode_batch_idx += 1
