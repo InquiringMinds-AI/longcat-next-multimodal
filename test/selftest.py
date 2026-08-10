@@ -116,10 +116,21 @@ def image_stats(raw):
     return st
 
 
-def audio_stats(raw):
-    """Objective descriptors of a WAV. `seconds` is the one that surfaces trailing
-    artifacts — the same sentence rendering much longer than usual is measurable
-    even though 'does it sound right' is not."""
+def audio_stats(raw, text=None):
+    """Objective descriptors of a WAV.
+
+    Duration alone does NOT diagnose a trailing artifact: the same sentence read at a
+    slower cadence is legitimately longer, and total rms/peak move with cadence too
+    (inter-word pauses dilute rms without any tail existing). So this separates the
+    two explanations instead of conflating them, via a 20ms energy envelope:
+
+      lead_ms / trail_ms  — silence BEFORE first and AFTER last speech frame. A tail
+                            is trail_ms, and nothing else is.
+      speech_sec          — span from first to last speech frame; the part cadence owns.
+      cps                 — characters of input text per speech_sec = a cadence proxy.
+                            Stable cps + growing trail_ms => tail. Falling cps with
+                            flat trail_ms => the model simply read it slower.
+    """
     st = {"bytes": len(raw)}
     try:
         import io
@@ -134,6 +145,25 @@ def audio_stats(raw):
         if a.size:
             st["peak"] = round(float(np.abs(a).max()) / 32768, 3)
             st["rms"] = round(float(np.sqrt((a ** 2).mean())) / 32768, 4)
+            ch = max(1, st.get("channels", 1))
+            mono = a.reshape(-1, ch).mean(axis=1) if ch > 1 else a
+            win = max(1, int(rate * 0.02))
+            nw = mono.size // win
+            if nw:
+                env = np.sqrt((mono[:nw * win].reshape(nw, win) ** 2).mean(axis=1))
+                # Relative floor: 2% of the loudest frame, with an absolute guard so a
+                # silent file doesn't threshold itself into "all speech".
+                thr = max(env.max() * 0.02, 20.0)
+                voiced = np.flatnonzero(env > thr)
+                if voiced.size:
+                    st["lead_ms"] = int(voiced[0] * 20)
+                    st["trail_ms"] = int((nw - 1 - voiced[-1]) * 20)
+                    sp = (voiced[-1] - voiced[0] + 1) * 0.02
+                    st["speech_sec"] = round(sp, 2)
+                    if text and sp > 0:
+                        st["cps"] = round(len(text) / sp, 1)
+                else:
+                    st["trail_ms"] = -1  # no frame above threshold: silent render
     except Exception as e:
         st["stats_error"] = str(e)[:80]
     return st
@@ -197,13 +227,15 @@ except Exception as e:
 
 # 4. audio generation
 try:
+    TTS_TEXT = "Self test, all systems nominal."
     r = requests.post(BASE + "/v1/audio/speech",
-        json={"input": "Self test, all systems nominal.", "voice": "en"}, timeout=900)
+        json={"input": TTS_TEXT, "voice": "en"}, timeout=900)
     ok = r.status_code == 200 and r.headers.get("content-type") == "audio/wav" and len(r.content) > 1000
-    st = audio_stats(r.content) if ok else {}
+    st = audio_stats(r.content, TTS_TEXT) if ok else {}
     path = save(r.content, "audio.wav") if ok else ""
-    # PASS = well-formed WAV. Onset garble and trailing artifacts both pass this;
-    # check `seconds` against the usual range for the sentence, then LISTEN.
+    # PASS = well-formed WAV. Onset garble and trailing artifacts both pass this.
+    # Read trail_ms (tail) and cps (cadence) SEPARATELY — `seconds` conflates them
+    # and cannot tell a padded render from a slow one. Then LISTEN.
     rec("audio_generation", ok,
         " ".join(f"{k}={v}" for k, v in st.items()) + (f" saved={path}" if path else ""),
         resp_evidence(r))

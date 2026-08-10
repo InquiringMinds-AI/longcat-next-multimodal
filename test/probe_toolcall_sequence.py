@@ -44,7 +44,11 @@ def chat(messages, **kw):
 
 
 def run_sequence(i):
-    """selftest's order, up to but not including tool_calling."""
+    """selftest's FULL order, up to but not including tool_calling.
+
+    Fidelity to the sequence is the whole point — the trigger is cumulative state,
+    so any omitted step turns a clean run into a non-result.
+    """
     chat([{"role": "user", "content": "Say ready."}])
     img = post("/v1/images/generations", {
         "model": "longcat-next", "response_format": "b64_json",
@@ -59,6 +63,28 @@ def run_sequence(i):
     chat([{"role": "user", "content": [
         {"type": "text", "text": "Transcribe this audio."},
         {"type": "input_audio", "input_audio": {"data": ab, "format": "wav"}}]}], max_tokens=60)
+    # Video understanding — selftest step 6, the step IMMEDIATELY BEFORE the failing
+    # tool call and the only predecessor never tested in isolation. Omitting it left
+    # this probe unable to eliminate the most likely trigger, so a clean run here
+    # previously proved nothing.
+    try:
+        import cv2, numpy as np
+        arr = cv2.imdecode(np.frombuffer(base64.b64decode(b64), np.uint8), cv2.IMREAD_COLOR)
+        arr = cv2.resize(arr, (512, 512))
+        vp = "/tmp/_probe_seq_video.mp4"
+        vw = cv2.VideoWriter(vp, cv2.VideoWriter_fourcc(*"mp4v"), 5, (512, 512))
+        for _ in range(10):
+            vw.write(arr)
+        vw.release()
+        vb = base64.b64encode(open(vp, "rb").read()).decode()
+        chat([{"role": "user", "content": [
+            {"type": "text", "text": "What is in this video?"},
+            {"type": "video_url", "video_url": {"url": "data:video/mp4;base64," + vb}}]}])
+        os.remove(vp)
+    except Exception as e:
+        # Loud, not silent: a skipped video step makes a clean result meaningless.
+        print(f"  WARNING: video step FAILED to run ({type(e).__name__}: {str(e)[:90]}) "
+              f"— a PASS this round does not exonerate video understanding", flush=True)
     return b64
 
 

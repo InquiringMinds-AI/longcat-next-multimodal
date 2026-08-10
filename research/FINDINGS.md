@@ -869,3 +869,47 @@ of requiring the bespoke 13-sample study that first established the tail. Note a
 that the short render has ~3x the peak and ~2x the RMS of the long ones, which is
 consistent with the long renders padding quiet material (silence / trailing filler)
 onto the same speech — a useful, cheap discriminator for future work on the tail.
+
+### CORRECTION (2026-08-10): duration was never a valid measure of the tail
+
+Owner, on the duration study above: *"length of audio is not entirely decided by a
+tail, cadence has a significant impact on how long it takes to say a thing."*
+
+He is right, and it retires the instrument. Total duration is `lead + speech_span +
+trail`, and a slower read inflates `speech_span` by exactly the same arithmetic a
+tail inflates `trail`. Duration therefore cannot distinguish them at any sample size
+— the 13-sample distributions and the 2.1x routine-battery spread measured *something
+varying*, but never established *what*.
+
+The rms/peak corroboration was worse than uninformative, it was circular. I read "low
+rms in long renders" as quiet padding. But rms is energy per sample, so inter-word
+pauses in an unhurried read depress it identically. That observation is consistent
+with both hypotheses and discriminates neither; treating it as a "cheap discriminator"
+above was an error.
+
+**What survives:**
+- The owner directly HEARD a tail — "a few seconds of silence" then "um?". That is
+  perceptual evidence a trailing artifact exists in at least that render, and it does
+  not depend on any duration measurement.
+- The NGRAM-on vs NGRAM-off control still supports "not caused by the fallback,"
+  because it was PAIRED — whatever duration mixes together, it mixed the same way in
+  both arms, and neither arm stood out. Weaker than stated, but not overturned.
+
+**What does NOT survive:** that the tail is "occasional" at ~4/13, that a long render
+indicates a tail at all, and the rms/peak inference.
+
+**Instrument replaced** (`test/selftest.py`, `audio_stats`). A 20ms energy envelope
+now reports the components separately instead of their sum:
+
+| field | meaning |
+|---|---|
+| `trail_ms` | silence after the last voiced frame — the tail, and nothing else |
+| `lead_ms` | silence before the first voiced frame (guards the fixed onset trim) |
+| `speech_sec` | first-to-last voiced span — the part cadence owns |
+| `cps` | input characters per `speech_sec` — a cadence proxy |
+
+Reading: stable `cps` + rising `trail_ms` = tail. Falling `cps` + flat `trail_ms` =
+the model simply read it slower, which is not a defect. The acoustic-phase finding
+above (transcript ruled out) still stands — it rested on transcript step counts and
+byte sizes, not on duration — but "how big is the tail" has NO trustworthy prior
+measurement, and must be re-established with `trail_ms` before any trim is designed.
