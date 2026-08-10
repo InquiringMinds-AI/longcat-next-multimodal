@@ -1213,3 +1213,46 @@ the model's placeholder detection currently assumes the constant, so both sides 
 together. Rebuild + full battery + human validation required. Radix cache can be disabled
 (`LCN_RADIX=0`) as an immediate mitigation at the cost of the warm-prefix win that makes
 agentic clients responsive.
+
+### Both fixes VALIDATED on hardware (2026-08-10, image `v0516-mmhash-tools`)
+
+Owner's ruling on the mitigation option — *"refusing prompt caching is not a solution, it
+is a cop out"* — so the cache was fixed rather than disabled. Radix stays ON.
+
+**1. Multimodal cache collision — FIXED.** Image probe, IDENTICAL prompt, the exact case
+that previously returned clip A's description four times:
+
+```
+A -> 'A white circle centered on a red background.'
+B -> 'A black square is centered on a solid green background.'   (was: white circle on red)
+B -> 'A black square is centered on a solid green background.'
+A -> 'A white circle is centered on a solid red background.'
+```
+
+Audio likewise: phase 1 (shared prefix) now matches phase 2 (broken prefix), each clip
+returning its own content instead of stale text from earlier requests. The offsets backstop
+logged ZERO warnings across the whole battery, so every hashed pad was covered by its
+item's offsets and none needed the fallback. Identical media still hashes identically and
+still hits the cache — only collisions between DIFFERENT media stop.
+
+**2. Tool-call syntax 4 — FIXED.** `tool_calling` passed 4/4 on the build where it had just
+failed, each parsing to `get_weather{"city": "Tokyo"}`. The offline parser regression
+(`test/test_tool_parsing.py`) covers all four dialects plus two negative cases and runs
+without a GPU, so this specific regression can never again require a server to detect.
+
+**Battery:** parser 8/8, selftest 7/7 x4, anthropic 5/5, degeneracy 6/6. MemAvailable
+30.4 GB after load.
+
+**Two lessons, both structural rather than incidental:**
+* *A test whose inputs never vary cannot detect a bug that returns the wrong input.*
+  selftest asks about an apple it just generated, every run — so it would have passed 7/7
+  indefinitely while the server described images nobody sent. Test inputs must VARY across
+  runs to have any power against a wrong-content bug.
+* *Report raw material, not verdicts.* Both defects were found by dumping what the model
+  actually emitted or received. The tool-call dialect was invisible behind "no tool_calls
+  parsed" for two builds; the cache bug was invisible behind an argument over which of two
+  contradictory transcripts was correct — the answer being that neither clip was read.
+
+**Incidental TTS signal** (unlabelled, consistent-with only): 3 of 4 renders in this battery
+had `trail_ms=0` at cps 6.4/6.5/7.9 — slow renders with no trailing silence, the predicted
+truncation signature. The owner's blind labels on the 8 adjudication clips remain the gate.
