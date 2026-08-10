@@ -845,3 +845,27 @@ repeatedly is both the reproducer and the instrument.
 Reference: video understanding is also the heaviest multimodal input in the battery
 (an mp4 built from the generated image), which makes it a plausible trigger for
 context-conditioning loss on the following request.
+
+**Rate corrected, and still uncaptured.** Three runs of the improved selftest scored
+7/7 including `tool_calling`. Running total across the session: **2 failures in 6
+selftest runs (~1 in 3)**, not the "2 of 3" inferred earlier from a three-run sample
+— that was over-read, and the correction matters because it changes how many runs a
+capture attempt needs. The defect is still real (two confirmed, independent
+occurrences on different builds) and is NOT to be closed as flaky; it is simply less
+frequent than first claimed. The instrumentation is now permanent, so the next
+occurrence documents itself with no bespoke probe.
+
+**The transparency work paid off immediately on a different problem.** The same three
+runs render the SAME fixed sentence ("Self test, all systems nominal.") at:
+
+| run | seconds | peak | rms |
+|---|---|---|---|
+| 1 | 4.77 | 0.124 | 0.0147 |
+| 2 | **2.52** | 0.381 | 0.0333 |
+| 3 | 5.35 | 0.232 | 0.0147 |
+
+A 2.1x duration spread on identical input, now visible in the ROUTINE battery instead
+of requiring the bespoke 13-sample study that first established the tail. Note also
+that the short render has ~3x the peak and ~2x the RMS of the long ones, which is
+consistent with the long renders padding quiet material (silence / trailing filler)
+onto the same speech — a useful, cheap discriminator for future work on the tail.
