@@ -1574,46 +1574,22 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         vis_pad_id = _cfg_val(vc_cfg, 'image_pad_token_id', 131108)
         aud_pad_id = _cfg_val(ac_cfg, 'audio_pad_token_id', 131105)
 
-        # --- Map hash-derived multimodal pad ids back into vocab range ---
-        # Media content lives in EMBEDDINGS, not token ids, but the radix prefix cache
-        # keys on token ids. sglang's guard is to derive each item's pad_value from a
-        # HASH of its content (MultimodalDataItem.set_pad_value), so two prompts that
-        # differ only in their media get different token ids and cannot share a cache
-        # entry. This package used to defeat that by pre-assigning a CONSTANT pad_value
-        # (set_pad_value early-returns when pad_value is already set), and the prefix
-        # cache duly served one request's image/audio to another — proven, see
-        # research/FINDINGS.md.
-        # Those hashed pad values are deliberately OUT OF VOCAB (MM_PAD_SHIFT_VALUE =
-        # 1e6 + hash%2^30, against this model's vocab_size 282624) so they can never
-        # collide with a real token. They must therefore be mapped back to the model's
-        # own pad ids BEFORE embed_tokens indexes the embedding table, or the lookup
-        # runs off the end.
-        # Matched BY VALUE, not by offset: each item's pad_value is globally unique now
-        # that it is content-derived, so `input_ids == pad_value` finds its positions with
-        # no position arithmetic at all — no request base, no prefix length, nothing that
-        # can be wrong under batching. (The scatter below still needs offsets, because it
-        # must know WHICH embeddings go where; this only needs to know WHICH MODALITY a
-        # position belongs to.)
-        # Mapping per modality (rather than to one arbitrary id) keeps the n-gram
-        # embedding path's token history byte-identical to the pre-fix behaviour; the
-        # embeddings themselves are zeroed and overwritten immediately below regardless.
-        MM_PAD_SHIFT_VALUE = 1_000_000
-        mm_mask = input_ids >= MM_PAD_SHIFT_VALUE
-        if bool(mm_mask.any()):
-            input_ids = input_ids.clone()
-            for items, pid in ((image_items, vis_pad_id), (audio_items, aud_pad_id)):
-                for _req_idx, item in (items or ()):
-                    pv = getattr(item, 'pad_value', None)
-                    if pv is None or pv < MM_PAD_SHIFT_VALUE:
-                        continue
-                    input_ids[input_ids == pv] = pid
-            # Backstop: an offset that does not cover its pads would otherwise index
-            # out of vocab and crash the forward. Never leave one behind.
-            leftover = input_ids >= MM_PAD_SHIFT_VALUE
-            if bool(leftover.any()):
-                logger.warning("[MM] %d hashed pad id(s) not covered by item offsets; "
-                               "mapped to audio pad as a backstop", int(leftover.sum()))
-                input_ids[leftover] = aud_pad_id
+        # NOTE on hash-derived multimodal pad ids: sglang gives each mm item a
+        # pad_value derived from a CONTENT HASH so that two prompts differing only in
+        # their media get different token ids and the radix prefix cache cannot serve one
+        # request's media to another (this package previously defeated that by
+        # pre-assigning a constant pad_value; see research/FINDINGS.md). Those hashed
+        # values are deliberately out of vocab (1e6 + hash%2^30 against vocab 282624).
+        #
+        # They do NOT need remapping here: forward() clamps input_ids to the embedding
+        # table size a few lines before calling this, so the embedding lookup is already
+        # safe. A remapping block added here on 2026-08-10 was DEAD CODE — its guard
+        # (input_ids >= 1e6) can never be true post-clamp — and its never-firing warning
+        # was briefly mistaken for evidence that it was working. Removed rather than kept
+        # as a safety net, because a branch that cannot execute is not a safety net.
+        #
+        # The cache fix is unaffected: the radix key is built from origin_input_ids in the
+        # SCHEDULER, before this forward runs, so the processor-side change carries it.
 
         if self.model.use_ngram_embedding:
             input_embeds = self.model.embed_tokens(input_ids, forward_batch)
