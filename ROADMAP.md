@@ -780,9 +780,31 @@ optimizations that trade modalities for speed:
 - [ ] **`LCN_PREWARM=1`**: opt-in startup warmup of the image/audio generation heads —
       moves the ~25 GB lazy allocation and the 4–5 min first-image surprise to load
       time, where the operator expects cost.
-- [ ] **Processor registration cleanup**: `AutoProcessor build failed → AutoTokenizer
-      fallback` and deprecated `image_processor_class` mappings work today but are
-      fragility against future transformers bumps in the base image.
+- [ ] **Processor registration cleanup** — NOT the easy win it reads as. Investigated
+      2026-08-10 against the live image (transformers **5.12.1**); do not start this
+      without the findings below.
+
+      `ProcessorMixin.from_pretrained` warns per sub-processor: *"`LongcatNextProcessor`
+      defines `image_processor_class = 'Qwen2VLImageProcessor'`, which is deprecated.
+      Register the correct mapping in `AutoImageProcessor` instead."* The deprecated
+      branch is still fully functional in 5.12.1 — it warns, then resolves the name via
+      `get_possibly_dynamic_module`. So this is future-proofing, NOT a live defect.
+
+      **The blocker:** those hardcoded attributes are currently the ONLY thing that
+      resolves the sub-processors. The checkpoint's `preprocessor_config.json` carries
+      one merged config for all three modalities, with **no `image_processor_type` /
+      `video_processor_type` / `feature_extractor_type` keys** and an `auto_map` that
+      maps `AutoProcessor` only. Delete the attributes and `AutoImageProcessor
+      .from_pretrained` has nothing to resolve from — loading breaks. So the fix is
+      necessarily one of:
+        (a) add `auto_map` + `*_type` entries to the checkpoint's
+            `preprocessor_config.json` — but that file is part of the PUBLISHED HF
+            artifact, so this is a model-repo change, not a serving-package change; or
+        (b) explicit `AutoImageProcessor.register(...)` / `AutoVideoProcessor` /
+            `AutoFeatureExtractor` calls in our package, run before the processor loads.
+
+      Either path touches model loading on a production master and needs a rebuild plus
+      the full battery. Cost is real; the deadline is a hypothetical future bump.
 
 ## 7. Final numbers + legibility (last — documents whatever the above produced)
 
