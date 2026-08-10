@@ -1064,3 +1064,43 @@ BEFORE it is used to draw a conclusion — not after.
 
 The 6/11 number and the cps separation are recorded here only as the discredited output
 of a broken check. **Do not cite them.**
+
+### Segment structure — an ASR-free view, and a reading that reconciles the conflict
+
+Owner, on the round-trip contradiction: *"the asr heard a word that wasnt there? and
+missed a word that was there? thats odd, odd that they both flip"*. Correct, and it kills
+the prior-reconstruction mechanism proposed above: a BIASED transcriber hallucinates the
+expected word in both cases; it cannot drop a word that is present. Symmetric errors mean
+noise — except noise does not produce a perfect 11-sample split either. Retract the
+mechanism, keep the tension.
+
+A 20ms envelope segmentation of the two adjudicated clips, no transcription involved:
+
+```
+a_110903 (owner: "skipping nominal")
+  sil140 SPEECH540 sil280 SPEECH500 sil40 SPEECH80 sil1300 SPEECH500 sil1220 SPEECH360 sil20 SPEECH280 sil80
+a_114958 (owner: complete, no tail)
+  sil160 SPEECH220 sil80 SPEECH360 sil80 SPEECH40 sil260 SPEECH600 sil60 SPEECH980 sil300
+```
+
+`110903` carries TWO internal silences over 1.2s and ends in 360ms/280ms fragments;
+`114958` has ordinary 60-260ms gaps and one clean 980ms final run. The multi-second
+internal silence is the owner's ORIGINAL report ("a few seconds of silence") appearing as
+structure rather than as a duration number.
+
+**A reading in which both the owner and the ASR are right** (hypothesis, not established):
+in `110903` "nominal" is PRESENT BUT SHATTERED across fragments after a 1.2s gap — a
+listener correctly reports it as not delivered while ASR reassembles it acoustically; in
+`114958` the fast 980ms final run slurs "systems nominal" together, clear to a human and
+exactly the shape ASR clips. If so, the round-trip's word-completeness output is a
+function of CADENCE AND INTELLIGIBILITY, not of content — which would explain the perfect
+cps separation as the check simply re-measuring cps.
+
+This also relocates the defect: fragmentation and multi-second internal silence, i.e. the
+acoustic phase losing coherence mid-utterance, not a boundary decision at the end.
+
+**Protocol change:** 8 fresh renders (durations 2.56-5.46s, cps 5.9-14.0) were sent for
+BLIND labelling — stats deliberately withheld so the labels are not anchored by the
+numbers hoped to be predictive. Stats are recorded and will be compared after. This is
+the labelled set that every candidate metric must be tested against BEFORE use, per the
+four-instrument lesson above.
