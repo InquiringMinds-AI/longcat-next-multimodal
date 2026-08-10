@@ -666,6 +666,72 @@ reason #1 settles first).
 
 ## 5. Performance experiments (after #3/#4 and ALL fixes — no moving targets)
 
+### MEASURED 2026-08-09/10 — concurrency is the throughput story on this box
+
+Aggregate throughput, tuned + graphs, unique prompts per request (prefix sharing
+deliberately DEFEATED, so these are worst-case for a swarm on a shared codebase):
+
+  conc   aggregate tok/s   per-req tok/s   vs conc=1
+     1        21.2             21.2          1.00x
+     4        69.8             17.4          3.30x
+     8       112.5             14.1          5.32x
+    16       189.2             11.8          8.94x
+    32       298.1              9.3         14.09x
+    64       423.6              6.6         20.02x     <- 0 failures, 28.5GB free
+
+Concurrency 2 is PERFECTLY linear (2.00x, per-request unchanged) — the machine
+is idle at bs=1. Why it bends later: at bs=1 top-12 routing touches ~12 of 256
+experts, but as batch grows the union approaches ALL experts, so a forward reads
+close to the full expert set. At conc=64 that is ~240GB/s against GB10's ~270 —
+i.e. 423 tok/s is near the HARDWARE ceiling, not a software limit. A sparse
+model behaves like a dense one at high batch.
+
+LCN_CUDAGRAPH_BS=32 (vs default 8): +13.6% at conc=16 (166.6 -> 189.2), ~0 at
+other levels, costs 0.17GB and 29s capture (bs 1,2,4,8,12,16,24,32).
+=> RECOMMEND LCN_CUDAGRAPH_BS=32 alongside graphs-by-default.
+
+### MIXED-MODALITY LOAD — what versatility actually costs (test/bench_mixed_load.py)
+
+4 text streams held under load while generation runs concurrently:
+
+  phase                     text/stream   retained
+  baseline                    20.18          -
+  + image generation           8.29         41%     image ok in 246s
+  + audio generation          20.15        100%     audio ok in 17s, 192KB wav
+  recovery                    19.21         95%
+
+0 errors in any phase; server stable; MemAvailable bottoms at ~6GB with ALL
+generation heads warm (above the ~3GB floor, and the tightest the system gets —
+this is the number mem-fraction should be tuned against, and it argues for
+LEAVING 0.72 alone).
+
+VOICE GENERATION IS EFFECTIVELY FREE (no measurable impact on concurrent text).
+IMAGE GENERATION halves text throughput for its ~4 min duration, then full
+recovery. Mechanism: image gen forces EAGER via the #3 CUDA-graph veto, so text
+batches lose replay and share the GPU with a long visual-token AR loop. That the
+two interleave without starvation is the veto machinery working under concurrent
+conditions it was designed for but never tested in.
+
+### VERSATILITY IS THE VALUE PROP — a constraint on optimization choices
+
+Owner ruling 2026-08-10: "nobody loads this much into ram for a one trick pony.
+the value prop for this model is versatility specifically." This RULES OUT
+optimizations that trade modalities for speed:
+- NGRAM must stay OPT-IN, never an agent-mode default. LCN_NGRAM=1 forces
+  LCN_AGENT=1, which 403s the generation endpoints — enabling it by default
+  would trade away image gen + voice cloning, the capabilities that justify
+  holding 92GB resident.
+- CUDA graphs PASS this test: the veto keeps all 7 modalities working, verified
+  under concurrent load.
+- NGRAM IS SERVER-LEVEL ONLY, NOT PER-REQUEST (verified: no speculative field in
+  managers/io_struct.py, sampling/sampling_params.py, or entrypoints/openai/
+  protocol.py; grep sanity-checked against the same files). Structural, not an
+  oversight — spec decode changes the shape of every decode batch, so the
+  scheduler is either in that mode or not. Two deployment modes, switchable only
+  by relaunch (~8 min): full multimodal, or text+tools at up to 3.3x with
+  generation closed. Document as a MODE CHOICE, not a perf flag.
+
+
 - [ ] **mem-fraction headroom mapping (all-modality)**: 0.72 is inherited, not derived —
       each +0.01 buys ~40k KV tokens here. With gen heads warmed, drive image-gen +
       multi-image understanding while sampling MemAvailable at 1s; step 0.72→0.73→0.74
