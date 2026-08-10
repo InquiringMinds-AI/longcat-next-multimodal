@@ -1423,3 +1423,44 @@ warning, and the subsequent image-understanding requests were correct — but th
 nothing about the prune. Orphaning needs genuine preemption/eviction or an explicit abort.
 The fix is code-verified and cheap, and is insurance against a rare event rather than a
 live wound. Left UNEXERCISED deliberately rather than manufacturing a preemption for it.
+
+## TTS defect: owner labels arrive, a metric is VALIDATED, and my prediction FAILED
+
+Owner adjudication of the 8 blind renders (2026-08-10), same sentence throughout:
+
+| clip | verdict | trail_ms | end_jump |
+|---|---|---|---|
+| adj_01 | BAD — "ends in a sound like hanging up a handset" | 200 | **0.138** |
+| adj_04 | BAD — "truncates part of the last syllable, 'nomina'" | 60 | **0.131** |
+| adj_05 | BAD — "gets to the end of nominal, cuts mid-l with a click" | 60 | **0.130** |
+| adj_02 | good | 600 | 0.001 |
+| adj_03 | good | 100 | 0.002 |
+| adj_06 | good | 540 | 0.005 |
+| adj_07 | good | 200 | 0.011 |
+| adj_08 | good | 160 | 0.012 |
+
+**All three defects are one event at different moments.** The waveform stops abruptly; a
+hard stop mid-signal is a discontinuity, which is the click. How much is lost depends only
+on how early it fires — 04 loses a syllable, 05 cuts the final consonant, 01 keeps the word
+and only clicks. That is exactly the signature of an end-of-audio token drawn from the same
+sampled distribution as the acoustic content, with no minimum-length guard.
+
+**`end_jump` (max sample-to-sample discontinuity in the final 60ms) separates 10x** and is
+now the validated defect metric. It works because it measures the defect DIRECTLY: the
+owner hears a click, a click IS a discontinuity. Every metric that failed today measured
+something merely correlated — duration, trailing silence, cadence, a transcript.
+
+**The `trail_ms` prediction recorded in advance FAILED.** Predicted 03/04/05; truth was
+01/04/05 — one false positive, one false negative. There is no clean split: a defective
+clip and a clean one both sit at 200ms, and a clean one sits at 100ms below two defective
+ones. Diagnostic reason: a clip can click and THEN pad out to ordinary trailing silence, so
+the stop is loud while the ending is quiet. Only a metric aimed at the discontinuity sees
+both failure shapes.
+
+Caveat kept attached: n=8, 3 positives — a clean split could be luck at that size. What
+earns end_jump more trust than the six instruments that failed today is that its mechanism
+is physical rather than statistical.
+
+**This is what the labelled set was for.** It killed my metric, promoted a better one, and
+gave every future TTS change a ground-truth-checkable acceptance test. The rate is also now
+known: 3 defective in 8 renders (~38%) on the shipping config.

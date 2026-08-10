@@ -63,6 +63,26 @@ def audio_stats(raw, text=None):
       * max_gap_ms is strongly anti-correlated with cps (1300ms gap at cps 6.1, 80ms
         at cps 14.5). The cadence swing is INTERIOR PAUSE LENGTH, not word rate.
 
+    THE DEFECT METRIC IS `end_jump`, and it is the only one here validated against
+    owner-adjudicated ground truth (8 renders, 3 defective, 2026-08-10):
+
+        BAD   0.130  0.131  0.138      (click / lost syllable / cut mid-consonant)
+        GOOD  0.001  0.002  0.005  0.011  0.012
+
+    A 10x gap. It works because it measures the defect DIRECTLY: the owner hears a click,
+    a click IS a waveform discontinuity, so measure the discontinuity. `end_level` and a
+    tail-decay ratio also split cleanly but with narrower margins.
+
+    `trail_ms` DOES NOT WORK for this and a prediction based on it FAILED: a defective clip
+    and a clean one both sat at 200ms, and a clean one sat at 100ms below two defective
+    ones. The reason is instructive — a clip can click and THEN pad out to normal trailing
+    silence, so the stop is loud while the ending is quiet. Keep trail_ms for what it does
+    measure (padding), not as a defect signal.
+
+    Caveat kept attached: n=8 with 3 positives, so a clean split could be luck. What earns
+    end_jump more trust than the metrics that failed today is that its mechanism is
+    physical rather than statistical.
+
     Deliberately NOT provided: a flag for "this render has the defect". A first attempt
     (>=400ms gap with <=600ms of audio after) fired on 2 of these 10 ordinary renders.
     With zero owner-adjudicated defective samples to calibrate against, any threshold
@@ -110,6 +130,14 @@ def audio_stats(raw, text=None):
                         st["max_gap_ms"] = int(gaps[gi] * 20)
                         # Voiced audio (not wall-clock span) following that widest gap.
                         st["after_gap_ms"] = int(voiced.size - gi - 1) * 20
+                    # end_jump: the largest sample-to-sample discontinuity in the last 60ms
+                    # of voiced audio. THE validated defect metric — see the block comment.
+                    _e = (voiced[-1] + 1) * win
+                    _seg = mono[max(0, _e - int(rate * 0.06)):_e]
+                    if _seg.size > 1:
+                        st["end_jump"] = round(float(np.abs(np.diff(_seg)).max()) / 32768, 3)
+                    # How loud the signal still is where it ENDS, relative to the clip peak.
+                    st["end_level"] = round(float(env[voiced[-1]] / max(env.max(), 1e-6)), 3)
                 else:
                     st["trail_ms"] = -1  # no frame above threshold: silent render
     except Exception as e:
