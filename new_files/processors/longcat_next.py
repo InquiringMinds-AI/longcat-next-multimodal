@@ -315,7 +315,14 @@ class LongcatNextProcessor(BaseMultimodalProcessor):
                 img_item = MultimodalDataItem(modality=Modality.IMAGE)
                 img_item.feature = img_pixels
                 img_item.image_grid_thw = image_grid_thw[i:i+1]
-                img_item.pad_value = self.image_pad_token_id
+                # pad_value is DELIBERATELY not set here. sglang's set_pad_value()
+                # early-returns when pad_value is already assigned, so pre-setting a
+                # constant suppressed the per-item CONTENT HASH and made two prompts
+                # carrying different media produce identical token ids — letting the
+                # radix prefix cache serve one request's media to another (proven; see
+                # research/FINDINGS.md). Leaving it None lets sglang hash the feature.
+                # longcat_next_mm._compute_mm_embeddings maps the resulting out-of-vocab
+                # pad ids back before the embedding lookup.
 
                 # Insert framing tokens: <img_start> <img_pad>×N <img_end>
                 img_start_id = getattr(self, 'image_start_token_id', 131106)
@@ -372,7 +379,14 @@ class LongcatNextProcessor(BaseMultimodalProcessor):
                 vid_item = MultimodalDataItem(modality=Modality.IMAGE)
                 vid_item.feature = pixel_values
                 vid_item.image_grid_thw = video_grid_thw
-                vid_item.pad_value = self.image_pad_token_id
+                # pad_value is DELIBERATELY not set here. sglang's set_pad_value()
+                # early-returns when pad_value is already assigned, so pre-setting a
+                # constant suppressed the per-item CONTENT HASH and made two prompts
+                # carrying different media produce identical token ids — letting the
+                # radix prefix cache serve one request's media to another (proven; see
+                # research/FINDINGS.md). Leaving it None lets sglang hash the feature.
+                # longcat_next_mm._compute_mm_embeddings maps the resulting out-of-vocab
+                # pad ids back before the embedding lookup.
 
                 # Insert framing tokens
                 img_start_id = getattr(self, 'image_start_token_id', 131106)
@@ -434,7 +448,14 @@ class LongcatNextProcessor(BaseMultimodalProcessor):
                 for mel_features, encoder_length, bridge_length in segments:
                     audio_item = MultimodalDataItem(modality=Modality.AUDIO)
                     audio_item.feature = torch.from_numpy(mel_features).float()
-                    audio_item.pad_value = self._audio_safe_pad
+                    # pad_value is DELIBERATELY not set here. sglang's set_pad_value()
+                    # early-returns when pad_value is already assigned, so pre-setting a
+                    # constant suppressed the per-item CONTENT HASH and made two prompts
+                    # carrying different media produce identical token ids — letting the
+                    # radix prefix cache serve one request's media to another (proven; see
+                    # research/FINDINGS.md). Leaving it None lets sglang hash the feature.
+                    # longcat_next_mm._compute_mm_embeddings maps the resulting out-of-vocab
+                    # pad ids back before the embedding lookup.
                     audio_item.model_specific_data = {'encoder_length': encoder_length, 'bridge_length': bridge_length}
                     audio_item.offsets = [(cur, cur + bridge_length)]
                     cur += bridge_length

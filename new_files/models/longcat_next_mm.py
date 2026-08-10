@@ -1557,12 +1557,6 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         """Compute embeddings with multimodal replacement."""
         image_items, audio_items = self._get_mm_items(forward_batch)
 
-        if self.model.use_ngram_embedding:
-            input_embeds = self.model.embed_tokens(input_ids, forward_batch)
-        else:
-            input_embeds = self.model.embed_tokens(input_ids)
-
-        # Zero embeddings at pad positions before replacement
         def _cfg_val(obj, key, default):
             if isinstance(obj, dict): return obj.get(key, default)
             return getattr(obj, key, default)
@@ -1570,6 +1564,48 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         vc_cfg = getattr(self.config, 'visual_config', {})
         vis_pad_id = _cfg_val(vc_cfg, 'image_pad_token_id', 131108)
         aud_pad_id = _cfg_val(ac_cfg, 'audio_pad_token_id', 131105)
+
+        # --- Map hash-derived multimodal pad ids back into vocab range ---
+        # Media content lives in EMBEDDINGS, not token ids, but the radix prefix cache
+        # keys on token ids. sglang's guard is to derive each item's pad_value from a
+        # HASH of its content (MultimodalDataItem.set_pad_value), so two prompts that
+        # differ only in their media get different token ids and cannot share a cache
+        # entry. This package used to defeat that by pre-assigning a CONSTANT pad_value
+        # (set_pad_value early-returns when pad_value is already set), and the prefix
+        # cache duly served one request's image/audio to another — proven, see
+        # research/FINDINGS.md.
+        # Those hashed pad values are deliberately OUT OF VOCAB (MM_PAD_SHIFT_VALUE =
+        # 1e6 + hash%2^30, against this model's vocab_size 282624) so they can never
+        # collide with a real token. They must therefore be mapped back to the model's
+        # own pad ids BEFORE embed_tokens indexes the embedding table, or the lookup
+        # runs off the end. Positions come from each item's offsets — the same offsets
+        # sglang used to write the pad values in the first place.
+        # Mapping per modality (rather than to one arbitrary id) keeps the n-gram
+        # embedding path's token history byte-identical to the pre-fix behaviour; the
+        # embeddings themselves are zeroed and overwritten immediately below regardless.
+        MM_PAD_SHIFT_VALUE = 1_000_000
+        mm_mask = input_ids >= MM_PAD_SHIFT_VALUE
+        if bool(mm_mask.any()):
+            input_ids = input_ids.clone()
+            for items, pid in ((image_items, vis_pad_id), (audio_items, aud_pad_id)):
+                for item in (items or ()):
+                    for start, end in (getattr(item, 'offsets', None) or ()):
+                        seg = input_ids[start:end]
+                        seg[seg >= MM_PAD_SHIFT_VALUE] = pid
+            # Backstop: an offset that does not cover its pads would otherwise index
+            # out of vocab and crash the forward. Never leave one behind.
+            leftover = input_ids >= MM_PAD_SHIFT_VALUE
+            if bool(leftover.any()):
+                logger.warning("[MM] %d hashed pad id(s) not covered by item offsets; "
+                               "mapped to audio pad as a backstop", int(leftover.sum()))
+                input_ids[leftover] = aud_pad_id
+
+        if self.model.use_ngram_embedding:
+            input_embeds = self.model.embed_tokens(input_ids, forward_batch)
+        else:
+            input_embeds = self.model.embed_tokens(input_ids)
+
+        # Zero embeddings at pad positions before replacement
         pad_mask = (input_ids == vis_pad_id) | (input_ids == aud_pad_id)
         input_embeds[pad_mask] = 0
 
