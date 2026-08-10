@@ -23,7 +23,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from longcat_tools import build_tools_system_block, parse_tool_calls
+from longcat_tools import build_tools_system_block, parse_tool_calls, render_tool_call_xml
 from stream_tools import ToolStreamFilter, MARKERS as _MARKERS
 from stream_util import open_upstream_stream
 
@@ -46,16 +46,6 @@ def _flatten_text(content):
 def _tool_result_text(block):
     txt = _flatten_text(block.get("content", ""))
     return ("ERROR: " + txt) if block.get("is_error") else txt
-
-
-def _render_tool_call_xml(name, args):
-    """Canonical <longcat_tool_call> XML — mirrors the chat template's own rendering,
-    with the TS namespace prefix the model uses when calling."""
-    s = "<longcat_tool_call>functions." + name + "\n"
-    for k, v in (args or {}).items():
-        s += ("<longcat_arg_key>%s</longcat_arg_key>\n<longcat_arg_value>%s</longcat_arg_value>\n"
-              % (k, v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)))
-    return s + "</longcat_tool_call>\n"
 
 
 def _tools_to_openai(tools):
@@ -97,7 +87,7 @@ def _to_openai_messages(system, messages):
                 if b.get("type") == "text":
                     txt += b.get("text", "")
                 elif b.get("type") == "tool_use":
-                    txt += _render_tool_call_xml(b.get("name", ""), b.get("input") or {})
+                    txt += render_tool_call_xml(b.get("name", ""), b.get("input") or {})
             out.append({"role": "assistant", "content": txt})
     sys_txt = _flatten_text(system or "")
     if sys_txt:
