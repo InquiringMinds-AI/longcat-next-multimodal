@@ -187,8 +187,21 @@ class LongcatNextProcessor(BaseMultimodalProcessor):
             return segments or None
 
         except Exception as e:
-            logger.warning(f"Audio processing failed: {e}")
-            return None
+            # FAIL LOUDLY. This used to log and return None, and the caller then built a
+            # request with the media simply absent — so a corrupt file, unsupported codec
+            # or failed fetch produced a fluent, confident HTTP 200 answer generated
+            # WITHOUT the user's Audio, with only a server-side log line recording it.
+            # That is the worst failure shape this project has: plausible output, no error,
+            # invisible to the caller. A user who attaches media is entitled to an error
+            # when it cannot be read. LCN_LENIENT_MEDIA=1 restores the old silent-drop
+            # behaviour for anyone who would rather have a degraded answer than a failure.
+            import os as _os
+            logger.warning("Audio processing failed: %s" % e, exc_info=True)
+            if _os.environ.get("LCN_LENIENT_MEDIA", "0").strip() == "1":
+                return None
+            raise ValueError(
+                "Audio could not be processed and was not sent to the model: %s" % e
+            ) from e
 
     def _process_video(self, video_data):
         """Decode a video into sampled frames (PIL images) using decord.
@@ -243,8 +256,21 @@ class LongcatNextProcessor(BaseMultimodalProcessor):
                     pass
             return frames
         except Exception as e:
-            logger.warning(f"Video processing failed: {e}", exc_info=True)
-            return None
+            # FAIL LOUDLY. This used to log and return None, and the caller then built a
+            # request with the media simply absent — so a corrupt file, unsupported codec
+            # or failed fetch produced a fluent, confident HTTP 200 answer generated
+            # WITHOUT the user's Video, with only a server-side log line recording it.
+            # That is the worst failure shape this project has: plausible output, no error,
+            # invisible to the caller. A user who attaches media is entitled to an error
+            # when it cannot be read. LCN_LENIENT_MEDIA=1 restores the old silent-drop
+            # behaviour for anyone who would rather have a degraded answer than a failure.
+            import os as _os
+            logger.warning("Video processing failed: %s" % e, exc_info=True)
+            if _os.environ.get("LCN_LENIENT_MEDIA", "0").strip() == "1":
+                return None
+            raise ValueError(
+                "Video could not be processed and was not sent to the model: %s" % e
+            ) from e
 
     def _cached_tokenizer(self):
         if getattr(self, "_tok_cache", None) is None:

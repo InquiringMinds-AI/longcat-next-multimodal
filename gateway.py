@@ -71,6 +71,32 @@ app = FastAPI(title="LongCat-Next OpenAI gateway")
 app.include_router(anthropic_router)  # Anthropic Messages API (/v1/messages) — Claude Code etc.
 _client = httpx.AsyncClient(timeout=httpx.Timeout(1800.0))
 
+# Global admission control for GENERATION requests (image + TTS).
+# The per-request cap on `n` bounds ONE request to 4 concurrent generations and nothing
+# bounded the server: two clients at n=4, or five clients at n=1, submitted 8+ simultaneous
+# generations. On a box that hard-powers-off past ~110-115GB claimed this is a safety
+# property, not just a throughput one. The cap preserves the previously ADVERTISED limit
+# (4) as a real server-wide limit; requests queue rather than being rejected, because a
+# client that waits is better than a node that powers off.
+MAX_CONCURRENT_GEN = max(1, int(os.environ.get("LCN_MAX_CONCURRENT_GEN", "4")))
+_gen_slots = asyncio.Semaphore(MAX_CONCURRENT_GEN)
+
+
+def _discard_artifact(path):
+    """Delete a generated artifact after it has been read into the response.
+
+    Generated PNGs/WAVs were never unlinked, so every successful generation leaked a file
+    and output storage grew without bound until generation started failing for lack of
+    space. Set LCN_KEEP_ARTIFACTS=1 to retain them (the test battery does this to let a
+    human inspect what was produced).
+    """
+    if os.environ.get("LCN_KEEP_ARTIFACTS", "0").strip() == "1":
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
 
 @app.middleware("http")
 async def _auth(request: Request, call_next):
@@ -140,7 +166,8 @@ async def _gen_one_image(prompt, sampling):
     ids = (tok(prompt, add_special_tokens=False).input_ids
            + tok(ANYRES, add_special_tokens=False).input_ids + [IMG_START])
     try:
-        r = await _client.post(SGLANG + "/generate", json={"input_ids": ids, "sampling_params": sampling})
+        async with _gen_slots:
+            r = await _client.post(SGLANG + "/generate", json={"input_ids": ids, "sampling_params": sampling})
     except httpx.ConnectError:
         return None, "backend unavailable (model may still be loading)"
     if r.status_code != 200:
@@ -149,9 +176,11 @@ async def _gen_one_image(prompt, sampling):
     if rj is None:
         return None, "backend error: " + raw[:200]
     rid = _san(rj.get("meta_info", {}).get("id", ""))
-    data = await _read_when_ready("%s/longcat_img_%s_refined.png" % (OUT, rid))
+    path = "%s/longcat_img_%s_refined.png" % (OUT, rid)
+    data = await _read_when_ready(path)
     if data is None:
         return None, "image generation produced no output"
+    _discard_artifact(path)
     return data, None
 
 
@@ -192,17 +221,20 @@ async def audio_speech(req: Request):
               "<longcat_user>" + AUDIO_INSTR + text +
               "<longcat_assistant><longcat_audiogen_start>")
     try:
-        r = await _client.post(SGLANG + "/generate", json={"text": prompt, "audio_data": [ref],
-            "sampling_params": {"max_new_tokens": 1200, "temperature": 0.5, "top_k": 5, "top_p": 0.85}})
+        async with _gen_slots:
+            r = await _client.post(SGLANG + "/generate", json={"text": prompt, "audio_data": [ref],
+                "sampling_params": {"max_new_tokens": 1200, "temperature": 0.5, "top_k": 5, "top_p": 0.85}})
     except httpx.ConnectError:
         return JSONResponse({"error": {"message": "backend unavailable (model may still be loading)"}}, status_code=503)
     rj, raw = _json_or_text(r)
     if rj is None:
         return JSONResponse({"error": {"message": "backend error: " + raw[:200]}}, status_code=502)
     rid = _san(rj.get("meta_info", {}).get("id", ""))
-    data = await _read_when_ready("%s/longcat_tts_%s.wav" % (OUT, rid))
+    path = "%s/longcat_tts_%s.wav" % (OUT, rid)
+    data = await _read_when_ready(path)
     if data is None:
         return JSONResponse({"error": {"message": "audio generation produced no output"}}, status_code=500)
+    _discard_artifact(path)
     return Response(content=data, media_type="audio/wav")
 
 
