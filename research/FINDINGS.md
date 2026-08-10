@@ -1335,3 +1335,50 @@ pure cache hit that never prefills). `test/probe_mm_concurrency.py` now gives ea
 own cold image variant per round; variants resize the shape rather than recolour it, since
 a re-tinted "red" is arguably orange and would fail the colour check, making a false BAD
 indistinguishable from real corruption.
+
+## Five verified fixes land; concurrent multimodal corruption resolved (2026-08-10)
+
+Build `v0516-mmfix5`. Four defects came from a Codex audit and were each independently
+verified here before any code was written; the fifth (`pad_mask`/chunk interaction) was
+found while verifying the others.
+
+**Validation, with power this time:**
+
+| check | result |
+|---|---|
+| concurrency probe, 10 rounds | sequential 30/30, **concurrent 30/30** |
+| selftest x2 | 7/7 each |
+| tool parser (offline) | 8/8 |
+| audio cache probe | each clip returns its own content in BOTH phases |
+| anthropic / degeneracy | 5/5, 6/6 |
+| MemAvailable after load | 30.3 GB (unchanged) |
+
+Pre-fix concurrent failure rate was 2 in 18 (~11%), so 30/30 clean is a ~3% outcome if
+unfixed. This is the first concurrency result in this campaign with enough samples to mean
+anything — a 12/12 clean run earlier was read as evidence and was not.
+
+**The root cause, and why it hid.** `accept_tokens` is `predict[accept_index].flatten()`
+over an `(bs, draft_token_num)` index — STRIDED WITH PADDING — while `update_token_table`
+reads CONTIGUOUSLY by cumulative `req_lens`. Request i was read from `sum(accept_lens[:i])`
+while its data sat at `i*stride`. Those agree only while every earlier request accepted the
+full stride, so **request 0 is always correct** and later requests corrupt as soon as one
+accepts short. Single-request-safe, intermittent under concurrency, and invisible to a
+serial test suite.
+
+**The pattern across all four audit findings is one assumption, four times:** correct for
+the first or only request, wrong for the rest — half-open offsets, `extend_prefix_lens_cpu[0]`,
+the flattened item list that discarded request identity, and the strided token write. Not
+four coincidences; a codebase built and tested one request at a time, in which "the batch"
+was never real to the code being written.
+
+**NOT validated by this run, stated plainly:**
+* The chunk-truncation and orphaned-generation-state fixes are UNEXERCISED. Their warnings
+  logged zero times because those conditions never arose — no aborted generation, no chunk
+  boundary inside a media item. Reasoned and code-verified, but untested. Reading zero
+  warnings as success would repeat the exact error made earlier today with the hashed-pad
+  backstop, whose silence meant it never ran at all.
+* selftest passing does NOT prove the inclusive-offset fix is correct, only that it did not
+  regress. A clobbered end marker degrades quality subtly rather than failing a check;
+  confirming it directly needs instrumentation on the actual input_ids.
+* A proper cross-chunk media fix is still owed — the current change makes truncation
+  deterministic and loud, not absent.
