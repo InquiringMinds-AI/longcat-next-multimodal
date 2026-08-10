@@ -1150,3 +1150,66 @@ only after, and judged the same blind way. A predicted split was recorded BEFORE
 labels arrive, from `trail_ms` alone: truncated = adj_04 (60), adj_05 (60), adj_03 (100);
 complete = adj_08 (160), adj_01 (200), adj_07 (200), adj_06 (540), adj_02 (600). The
 100/160 boundary is thin; the extremes are the real test.
+
+## ⚠ PRODUCTION BUG: multimodal prefix-cache collision serves another request's media
+
+Found 2026-08-10, chasing the owner's question about the round-trip contradiction:
+*"none of it explains why the asr is claiming a word that isnt there, and ignoring a word
+that is"*. Neither of the two mechanisms proposed for that could. The answer was that the
+model **was not listening to those files at all**.
+
+**Mechanism.** Multimodal content is not in the token IDs — the processor writes
+placeholder pads and the content arrives as embeddings. The radix prefix cache keys on
+token IDs. sglang's guard is per-item content hashing; `MultimodalDataItem`'s docstring:
+*"Each item has its own hash and pad_value, enabling per-image RadixAttention caching"*,
+and `set_pad_value()` opens with:
+
+```python
+if self.pad_value is not None:
+    return
+```
+
+Our processor assigns a CONSTANT pad_value before sglang can derive one, on all three
+modalities, so `hash` is never computed and every item of a modality shares one pad value:
+
+```
+processors/longcat_next.py:318   img_item.pad_value   = self.image_pad_token_id
+processors/longcat_next.py:375   vid_item.pad_value   = self.image_pad_token_id
+processors/longcat_next.py:437   audio_item.pad_value = self._audio_safe_pad
+```
+
+Same prompt + same media token count => identical input_ids => the later request is served
+the earlier one's KV, i.e. ANOTHER REQUEST'S MEDIA.
+
+**Proof** (`test/probe_mm_cache.py`, two byte-identical-length 3s cuts of the reference
+recording, different content):
+
+```
+phase 1, IDENTICAL prompt      A/B/B/A -> all four: 'Self test all systems'
+phase 2, UNIQUE prompt prefix  A -> 'It was impossible to tell.'
+                               B -> '"was of short duration. My fears were."'  (x2, stable)
+                               A -> '"Me, it was impossible to tell when."'
+```
+
+Phase 1 returns content that is in NEITHER clip — the reference is a woman reading a
+story; "Self test all systems" is the TTS text from EARLIER requests in the same session.
+Stale cross-request content, not merely a mixup between A and B. Phase 2 breaks the shared
+prefix and immediately yields distinct, clip-appropriate transcripts.
+
+**Consequences.**
+1. The entire round-trip analysis is void — every transcript may have been served from a
+   previous request. The owner's 2/2 "contradiction" was the instrument reading a
+   different file, not disagreeing about the same one.
+2. This is a LIVE correctness bug for image, video, and audio understanding, not a test
+   artifact. Repeated identical prompts over different media — an ordinary agent pattern —
+   return stale answers. Cross-request content bleed also has a privacy dimension.
+3. selftest could never catch it: every image it generates is an apple, so a stale answer
+   and a correct one are indistinguishable. A test whose inputs do not VARY cannot detect
+   a bug that returns the wrong input.
+
+**Not yet fixed.** The fix is to stop pre-setting `pad_value` and let `set_pad_value()`
+hash the feature — but `pad_input_ids` rewrites the placeholder tokens to `pad_value`, and
+the model's placeholder detection currently assumes the constant, so both sides must move
+together. Rebuild + full battery + human validation required. Radix cache can be disabled
+(`LCN_RADIX=0`) as an immediate mitigation at the cost of the warm-prefix win that makes
+agentic clients responsive.
