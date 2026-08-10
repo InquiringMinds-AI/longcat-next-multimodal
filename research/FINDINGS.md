@@ -830,3 +830,18 @@ Two outcomes with opposite fixes, and selftest's pass/fail cannot distinguish th
 
 Standing caution for whoever picks this up: do NOT conclude "flaky" from a passing
 repeat. This defect has already survived one such dismissal.
+
+**Sequence replay did NOT reproduce it (0/3) — but the replay was incomplete.**
+`probe_toolcall_sequence.py` covered text -> image gen -> image understanding ->
+audio gen -> audio understanding and stopped, OMITTING selftest's step 6, VIDEO
+understanding, which is the step immediately BEFORE the failing tool call. So that
+run eliminates nothing; the one untested predecessor is the nearest one.
+
+Rather than patch the replay, the reproduction is now the improved `selftest.py`
+itself: it is the exact known trigger (~2 in 3 historically) and, as of this
+session, dumps `content` / `finish_reason` / the full message on failure. Running it
+repeatedly is both the reproducer and the instrument.
+
+Reference: video understanding is also the heaviest multimodal input in the battery
+(an mp4 built from the generated image), which makes it a plausible trigger for
+context-conditioning loss on the following request.
