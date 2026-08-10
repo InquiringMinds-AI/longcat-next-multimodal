@@ -91,6 +91,35 @@ _TS_CALL = re.compile(r"^\s*([\w.]+)\s*\((.*)\)\s*$", re.DOTALL)
 _UNQUOTED_KEY = re.compile(r'([,{]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:')
 
 
+# Syntax 4 (observed 2026-08-10, captured by selftest's raw-emission dump): the XML form
+# is begun but the arguments arrive as ONE JSON object right after <longcat_arg_key>, with
+# no closing tag and no <longcat_arg_value>:
+#     <longcat_tool_call>functions.get_weather\n<longcat_arg_key>{"city": "Tokyo"}
+# finish_reason was 'stop' at 14 completion tokens, so the model considered this COMPLETE —
+# it is a real emission variant, not a truncated syntax-1. Before this was handled, the
+# block matched neither _PAIR (no </longcat_arg_key>, no <longcat_arg_value>) nor _TS_CALL
+# (no parens) and was silently dropped, surfacing as an intermittent "no tool_calls".
+_ARG_OBJ = re.compile(r"<longcat_arg_key>\s*(\{.*)", re.DOTALL)
+
+
+def _parse_object_prefix(s):
+    """Parse a LEADING JSON/JS object and ignore whatever follows. None on failure.
+
+    raw_decode (rather than json.loads) because this dialect has no closing tag, so the
+    object is routinely followed by stray tokens.
+    """
+    s = s.strip()
+    dec = json.JSONDecoder()
+    for candidate in (s, _UNQUOTED_KEY.sub(r'\1"\2":', s)):
+        try:
+            v, _ = dec.raw_decode(candidate)
+            if isinstance(v, dict):
+                return v
+        except Exception:
+            pass
+    return None
+
+
 def _parse_object_literal(s):
     """JS-ish object literal -> dict (strict JSON first, then quote bare keys). None on failure."""
     s = s.strip()
@@ -190,6 +219,14 @@ def parse_tool_calls(text, tools):
             continue
         m = _TS_CALL.match(block)  # syntax 2: TS-style call with object-literal args
         if not m:
+            # syntax 4: name line + <longcat_arg_key>{...all args as one JSON object}
+            mo = _ARG_OBJ.search(block)
+            nm = re.match(r"([^\n<(]+)", block)
+            if mo and nm:
+                name = _strip_ns(nm.group(1).strip())
+                args = _parse_object_prefix(mo.group(1))
+                if name and args is not None:
+                    calls.append(_one_call(name, args))
             continue
         name, args = _strip_ns(m.group(1).strip()), _parse_object_literal(m.group(2))
         if args is None or not name:
