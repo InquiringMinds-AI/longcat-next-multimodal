@@ -109,3 +109,26 @@
          bs = len(batch.reqs)
  
          retrieve_index = self.retrieve_indexes_batch[bs]
+--- a/python/sglang/srt/managers/overlap_utils.py
++++ b/python/sglang/srt/managers/overlap_utils.py
+@@ -417,6 +417,20 @@
+         if draft_input is None:
+             return
+ 
++        # LongCat-Next overlay: a generation batch took the PLAIN decode prep,
++        # which already advanced seq_lens and allocated KV for this step. The
++        # future_map relay carries SPEC bookkeeping published BEFORE that
++        # increment, so gathering it here overwrites the increment -- and since
++        # every fallback step then publishes what it saw, seq_lens settles into
++        # a FIXED POINT. Both observed symptoms follow from that freeze: the
++        # ngram-embedding column (seq_lens - 1) stops advancing, so the model
++        # generates against a stale context (bland, prompt-ignoring output), and
++        # alloc_for_decode keeps writing req_to_token at the same position,
++        # orphaning exactly one KV slot per decode step. Plain prep owns
++        # seq_lens for this batch; leave it alone.
++        if getattr(batch, "lcn_force_plain_decode", False):
++            return
++
+         fi = draft_input.future_indices
+         if fi is None:
+             return

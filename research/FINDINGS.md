@@ -310,14 +310,59 @@ output was correct. This is the third time in this campaign that a green battery
 plus a plausible log signature was reported as validation of a generation change —
 the human eyes/ears gate is the ONLY thing that has ever caught this class.
 
-So the fallback mechanism runs to completion but does not produce correct
-generation. Root cause not yet established; the paired comparison that isolates it
-(same binary, NGRAM on vs off, so the non-spec overlay edits are held constant) is
-the next step. Leading suspicion is the n-gram EMBEDDING context (a different
-mechanism from ngram spec decode, sharing the same token table): corrupting it is
-already known on this port to degrade image generation specifically — that is what
-`LCN_NGRAM_EOS=-1` exists to prevent — and the spec path writes draft tokens into
-that same table.
+The paired comparison (same binary, same prompt and sampling params, only
+`LCN_NGRAM` differing) settled it — owner verdict: **NGRAM on = "a white smudge";
+NGRAM off = "an apple"**. The fallback corrupts generation.
+
+### ROOT CAUSE: the future_map relay freezes seq_lens
+
+`FutureMap.resolve_seq_lens_cpu` (overlap_utils.py:434) overwrites the batch's
+sequence lengths at forward entry:
+
+```python
+draft_input = batch.spec_info
+if draft_input is None: return
+fi = draft_input.future_indices
+if fi is None: return
+...
+batch.seq_lens = self.new_seq_lens_buf[fi]
+```
+
+It is gated only on `future_indices`, which `run_batch` sets for EVERY spec batch —
+including a fallback batch. So each fallback step runs:
+
+1. plain `prepare_for_decode` advances `seq_lens` S -> S+1 and allocates KV at S;
+2. `run_batch` then calls `resolve_seq_lens_cpu`, which **discards that increment**
+   and restores the value published by the previous forward.
+
+Each fallback step publishes what it SAW (`new_seq_lens = batch.seq_lens.clone()`
+in the worker's non-verify branch), so the resolved value is a fixed point:
+`resolved_N = published_{N-1} = resolved_{N-1}`. **seq_lens freezes** for the whole
+generation.
+
+One mechanism, both symptoms, and both quantitatively:
+
+- **The white smudge.** The n-gram embedding reads its context column at
+  `seq_lens - 1` (`_init_ngram_embedding_info`, DECODE branch). Frozen seq_lens ->
+  the column never advances -> the model generates all 1369 visual tokens against a
+  stale context, never seeing its own output. That is low-information output, not
+  noise, which is exactly what a smudge looks like. It also explains why the
+  `[ImageGen] row 30/37` progress logs looked healthy: the model's own state machine
+  counts tokens independently of seq_lens.
+- **The 1405-slot leak.** `alloc_for_decode` writes `req_to_token` at the seq_lens
+  position. Frozen seq_lens -> every step allocates at the SAME position and
+  overwrites that entry, orphaning the previous slot. Exactly one leaked slot per
+  decode step — which is why the leak equalled the generated-token count to the
+  digit, twice.
+
+**Fix:** skip the future_map seq_lens resolution for a batch flagged
+`lcn_force_plain_decode` — plain prep owns seq_lens for that step. Publishing still
+happens each step, so the hand-back to real verify rounds carries the correct value.
+
+Lesson worth keeping: under overlap, `batch.seq_lens` is NOT owned by
+`prepare_for_decode` when speculation is configured — it is relayed. Any path that
+mixes plain preparation into a spec-configured scheduler has to decide who owns the
+relayed state, not just who owns the forward.
 
 **A second, independent defect: a KV pool accounting leak.** The scheduler
 died at the first idle AFTER the image was saved:
