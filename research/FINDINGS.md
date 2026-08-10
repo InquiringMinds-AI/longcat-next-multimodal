@@ -473,13 +473,41 @@ path pre-allocates a reserve via `alloc_for_spec_decode` and tracks
 differs — the spec branch relays `on_publish(new_seq_lens)` where the non-spec
 branch publishes `seq_lens + 1`).
 
-**Status: NOT SHIPPABLE — two open defects.** What IS established: the fatal crash
-is gone, and a generation now runs to completion under a spec-configured scheduler.
-What is NOT established: that the output is correct (it is not — see the owner's
-verdict above), or that KV is accounted correctly. Do not enable `LCN_NGRAM=1`
-without `LCN_AGENT=1`; the entrypoint keeps that coupling as the default and
-`LCN_NGRAM_ALLOW_GEN=1` is a dev-only opt-in.
+### Validation with both fixes (`:v0516-specgen4`, strict leak check ARMED)
 
-Do not repeat the reporting error either: for this path, "generated a valid PNG"
-and "the fallback counter incremented" are progress indicators, NOT validation.
-Only the owner's eyes/ears close a generation change.
+Run with `LCN_NGRAM=1 LCN_AGENT=0 LCN_NGRAM_ALLOW_GEN=1`, decode graphs bs<=32,
+overlap on, and `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE` left at its default so
+any residual leak would CRASH the server rather than warn:
+
+| check | result |
+|---|---|
+| selftest modalities | **7/7** (both generation paths included) |
+| anthropic route | 5/5 incl. tool_call + tool_roundtrip |
+| degeneracy probe | 6/6 |
+| KV leak reports | **0**, server up 25+ min |
+| KV counters at fallback step 1000 | seq_len=1018 kv_alloc=1018 kv_commit=1017 (agree) |
+| agent workload | **76.45 tok/s @ 100% fidelity** (vs ~22 baseline) |
+
+The agent number is the point of the whole exercise: the ~3.3x NGRAM speedup is
+intact IN A SERVER THAT ALSO GENERATES IMAGES AND VOICE. The speed-vs-versatility
+choice the old guard forced is gone.
+
+Owner eyes/ears verdict on this build's artifacts: PENDING — no generation change
+is closed until it lands.
+
+**One anomaly, not dismissed:** the first selftest run of this build scored
+`tool_calling` FAIL ("no tool_calls"); a standalone repeat passed 3/3 identically
+and a full selftest re-run in the SAME sequence (right after both generations)
+scored 7/7. Unexplained, and suspicious because the request runs at temperature 0
+where a one-off should not happen. The n-gram table is server-global and persists
+across requests, so post-generation table state is the natural suspect. Watch for
+it; if it recurs, that is the thread to pull.
+
+**Status: candidate, pending the human gate.** The entrypoint still defaults to the
+old coupling (`LCN_NGRAM_ALLOW_GEN=1` opts in) until the owner's verdict lands and
+a soak has run — a single 25-minute window is not evidence about long-session KV
+behavior.
+
+Do not repeat the reporting error made mid-campaign either: for this path,
+"generated a valid PNG" and "the fallback counter incremented" are progress
+indicators, NOT validation. Only the owner's eyes/ears close a generation change.
