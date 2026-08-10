@@ -333,6 +333,18 @@ from `Scheduler.on_idle`) runs unconditionally, not only under speculation, and 
 shipped non-NGRAM all-modality config passes 7/7 selftest repeatedly, so the leak is
 introduced by the fallback rather than pre-existing.
 
+**Isolated to the fallback by a same-binary control (2026-08-09).** Image
+`:v0516-specgen`, identical prompt and sampling params, only `LCN_NGRAM` differing:
+
+| cell | NGRAM | fallback engagements | leaked slots |
+|---|---|---|---|
+| 1 | on  | yes | 1405 (twice, exactly) |
+| 2 | off | 0   | **0** |
+
+Same binary, so the non-spec overlay edits (the probe registration and the
+`scan_triggers` parameter, both inert without speculation) are held constant. The
+leak is introduced by the fallback path itself.
+
 Not yet root-caused. What is already ruled out: `alloc_for_decode` is NOT missing
 the counter bump — allocation.py:591 does `req.kv.kv_allocated_len += token_per_req`,
 so the plain path is internally self-consistent. The live hypothesis is a mismatch
