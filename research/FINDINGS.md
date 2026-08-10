@@ -359,18 +359,26 @@ One mechanism, both symptoms, and both quantitatively:
 `lcn_force_plain_decode` — plain prep owns seq_lens for that step. Publishing still
 happens each step, so the hand-back to real verify rounds carries the correct value.
 
-**PARTIAL RESULT (2026-08-09, `:v0516-specgen2`).** The guard is live and correctly
-placed (verified in the running container), but **the KV leak is unchanged —
-still exactly 1405.** So the "one mechanism explains both" claim is at least half
-wrong: whatever the seq_lens freeze did to image quality, it is NOT the leak's
-cause. Image verdict pending.
+**RESULT (2026-08-09, `:v0516-specgen2`) — the quality bug is FIXED.** Owner
+verdict on the same prompt with the guard in place: **"It's an apple."** So the
+seq_lens freeze was the generation-quality defect, confirmed by the same human gate
+that caught it. Noted alongside, in the owner's own framing: it is the first apple
+he has seen generated with no apparent stem, "a little odd, but isn't technically a
+defect, since apples can have their stems removed." Recorded as an observation to
+watch on future samples, NOT as a known defect.
+
+**The KV leak is unchanged — still exactly 1405.** So "one mechanism explains both"
+was half wrong: the seq_lens freeze was the quality bug and is NOT the leak's cause.
 
 ### The leak: two more hypotheses killed
 
 The number is EXACTLY 1405 in all three runs (82482/79639/1438, 80882/78047/1430,
 70117/67286/1426 -> 1405 every time), and 1405 is the image generation's full
-sequence length, NOT the decode-step count. So one complete copy of the
-generation's KV leaks, rather than a slot dribbling away per step.
+sequence length. Note `evictable` is ALSO ~1405-1438 — i.e. roughly TWO copies of
+the request's KV exist: one properly cached and one orphaned. Since the request
+generates one token per decode step, "one full extra copy" and "one extra slot per
+decode step" are the same number here; the live hypothesis is a double allocation
+per fallback step, with the second slot never reaching `req_to_token`.
 
 - **Uncond/CFG KV never freed** — dead. The model does allocate a second KV
   sequence for the CFG unconditional path (`_alloc_uncond_kv`, then `alloc.alloc(1)`
