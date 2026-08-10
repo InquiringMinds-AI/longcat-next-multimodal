@@ -987,3 +987,43 @@ Capture readiness is in place instead: selftest dumps the raw emission on failur
 the next occurrence distinguishes the two mutually-exclusive causes (unhandled dialect
 -> shimmable in `parse_tool_calls`; no call attempted -> not shimmable) without
 needing a reproduction harness.
+
+### TTS: OWNER ADJUDICATION — the defect is CONTENT LOSS, not a tail (2026-08-10)
+
+Two renders of "Self test, all systems nominal." were sent for adjudication, chosen as
+the extremes of the pause distribution. Owner verdict:
+
+| render | cps | speech_sec | max_gap_ms | trail_ms | owner |
+|---|---|---|---|---|---|
+| a_110903 | 6.1 | 5.12 | 1300 | 80 | "very slow cadence, and ends with 'all systems' skipping **nominal**" |
+| a_114958 | 11.6 | 2.68 | 260 | 300 | "faster cadence, and no missing words or extra tail" |
+
+**The slow render TRUNCATED.** That retires the framing this was investigated under all
+day. It is not a trailing artifact and not a cadence preference — the model dropped the
+final word. No silence-geometry measurement can see that: a truncated render has a
+perfectly ordinary `trail_ms` (80 ms here, among the smallest observed).
+
+**`cps` was confounded, in the direction that misled.** It is computed as
+`len(input_text) / speech_sec`, which assumes the whole input was spoken. a_110903 spoke
+~23 of 31 characters, so its true rate is ~4.5 cps, not the 6.1 reported. Low cps was
+read as a stylistic slow read when it may simply BE the truncation signature — the
+metric hid the defect inside a plausible explanation.
+
+**Unification with the earlier owner-heard sample.** That one had silence and a stray
+"um?" — content GAIN. Truncation is content LOSS. Both are the acoustic phase ending at
+the wrong time (early vs late), consistent with the already-established finding that the
+TRANSCRIPT phase is clean: the model knows the right words, the acoustic rendering of
+them terminates unreliably. One mechanism, two signs — not two defects.
+
+**Instrument replaced again** (`test/tts_roundtrip.py`): generate, transcribe through
+this same server's audio-understanding path, diff word-by-word against the input.
+`missing` / `extra` are the signal; silence stats ride along so truncation can be
+correlated against them. Two limits kept explicit in the file: the transcriber is itself
+a model (a missing word is evidence, not proof — every render is saved for listening),
+and `cps` is only a cadence measure on a COMPLETE render.
+
+**Standing correction to method:** three instruments in a row failed the same way —
+`seconds`, the deleted `tail_gap_ms` flag, and `cps` — each producing a plausible reading
+for a state it could not actually distinguish. Every one was validated against
+self-consistency rather than against an adjudicated sample. The adjudication took one
+message and overturned a day of measurement.
