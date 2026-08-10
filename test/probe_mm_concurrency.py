@@ -40,16 +40,26 @@ SPECS = [
 ]
 
 
-def make(spec):
+def make(spec, variant=0):
+    """`variant` resizes the shape by a few pixels.
+
+    The point is a DIFFERENT HASH (so the request is cold) with an IDENTICAL DESCRIPTION.
+    Re-colouring would also change the hash, but it changes the right answer too — a
+    tinted "red" becomes arguably orange, the colour keyword check fails, and a false BAD
+    is indistinguishable from real corruption. Size is the safe knob: nobody describes a
+    circle differently because it is 6px larger.
+    """
     _, fill, shape, _, _ = spec
+    v = int(variant)
     img = np.zeros((512, 512, 3), np.uint8)
     img[:, :] = fill
     if shape == "circle":
-        cv2.circle(img, (256, 256), 150, (255, 255, 255), -1)
+        cv2.circle(img, (256, 256), 150 + v, (255, 255, 255), -1)
     elif shape == "square":
-        cv2.rectangle(img, (120, 120), (390, 390), (0, 0, 0), -1)
+        cv2.rectangle(img, (120 - v, 120 - v), (390 + v, 390 + v), (0, 0, 0), -1)
     else:
-        cv2.fillPoly(img, [np.array([[256, 110], [400, 390], [112, 390]])], (255, 255, 255))
+        cv2.fillPoly(img, [np.array([[256, 110 - v], [400 + v, 390], [112 - v, 390]])],
+                     (255, 255, 255))
     return cv2.imencode(".png", img)[1].tobytes()
 
 
@@ -90,18 +100,33 @@ def run(specs, images, concurrent):
 
 
 def main():
+    """Each arm gets its OWN fresh image set.
+
+    This matters more than it looks. The first version of this probe ran CONCURRENT then
+    SEQUENTIAL over the same images and prompt: the concurrent round corrupted the answers
+    AND cached them, so the sequential "control" replayed the cached corruption and both
+    arms scored alike — which reads as "concurrency is innocent" and is exactly wrong.
+    Reversing the order just moves the confound (a correct cache makes the concurrent arm
+    a pure cache hit that never prefills). Disjoint image sets are the only arrangement
+    where both arms are genuinely cold and neither can see the other's cache entries.
+    """
     specs = SPECS[:N]
-    images = [make(s) for s in specs]
-    print(f"probe_mm_concurrency: {len(specs)} distinct images, {ROUNDS} round(s)\n", flush=True)
+    print(f"probe_mm_concurrency: {N} images per arm, disjoint variants, {ROUNDS} round(s)\n",
+          flush=True)
 
     conc_ok = conc_tot = seq_ok = seq_tot = 0
+    v = 0
     for r in range(1, ROUNDS + 1):
-        print(f"round {r}: CONCURRENT", flush=True)
-        conc_ok += run(specs, images, True); conc_tot += len(specs)
-        print(f"round {r}: SEQUENTIAL (control)", flush=True)
-        seq_ok += run(specs, images, False); seq_tot += len(specs)
+        # Distinct variant per arm per round => every request below is a cold prefill,
+        # and no arm can ever hit a cache entry the other arm created.
+        seq_imgs = [make(s, v) for s in specs]; v += 3
+        conc_imgs = [make(s, v) for s in specs]; v += 3
+        print(f"round {r}: SEQUENTIAL (cold, own variants)", flush=True)
+        seq_ok += run(specs, seq_imgs, False); seq_tot += len(specs)
+        print(f"round {r}: CONCURRENT (cold, DIFFERENT variants)", flush=True)
+        conc_ok += run(specs, conc_imgs, True); conc_tot += len(specs)
 
-    print(f"\nRESULT  concurrent {conc_ok}/{conc_tot}   sequential {seq_ok}/{seq_tot}", flush=True)
+    print(f"\nRESULT  sequential {seq_ok}/{seq_tot}   concurrent {conc_ok}/{conc_tot}", flush=True)
     print("READ: sequential passing while concurrent fails implicates batched-prefill "
           "offset handling. Both failing means the images or the check are at fault, "
           "not concurrency.", flush=True)
