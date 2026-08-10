@@ -907,23 +907,40 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 logits[0, end_token_idx] = float('-inf')
                 next_token = self._sample_codebook_logits(logits, level, prev_ids)
 
-            next_token_ids[0, level] = next_token + self.audio_offset_vals[level].item()
+            next_token_ids[0, level] = next_token + self._audio_offset_host(level)
 
         return next_token_ids[0]  # [num_codebooks] with offsets
+
+    def _audio_offset_host(self, level):
+        """Host-side audio codebook offset, cached.
+
+        audio_offset_vals is a GPU buffer, so reading it with .item() costs a host sync —
+        and it was read once per codebook level per generated frame on the hot path. The
+        values are fixed at init, so they are cached on first use.
+        """
+        cache = getattr(self, "_audio_offset_host_cache", None)
+        if cache is None:
+            cache = self.audio_offset_vals.tolist()
+            self._audio_offset_host_cache = cache
+        return cache[level]
 
     def _sample_codebook_logits(self, logits, level, prev_ids):
         """Rep-penalty + temperature + top-k/top-p multinomial sample of one codebook level.
         Clones logits (non-mutating) and returns the raw (pre-offset) token id (0-dim tensor)."""
         logits = logits.clone()
         if prev_ids.shape[0] > 0 and AUDIO_GEN_REPETITION_PENALTY != 1.0:
-            prev_level_ids = (prev_ids[:, level] - self.audio_offset_vals[level].item()).clamp(
+            # Vectorised, and deliberately so: the previous form looped over every unique
+            # prior id calling .item() and then branching on a tensor comparison — two host
+            # syncs per unique id, per codebook level, per frame (hundreds per frame, and
+            # every one of them stalls the pipeline). The arithmetic below is identical:
+            # positive logits divided by the penalty, negative ones multiplied.
+            prev_level_ids = (prev_ids[:, level] - self._audio_offset_host(level)).clamp(
                 min=0, max=logits.shape[-1] - 1)
-            for pid in prev_level_ids.unique():
-                pid_int = pid.item()
-                if logits[0, pid_int] > 0:
-                    logits[0, pid_int] /= AUDIO_GEN_REPETITION_PENALTY
-                else:
-                    logits[0, pid_int] *= AUDIO_GEN_REPETITION_PENALTY
+            idx = prev_level_ids.unique()
+            vals = logits[0, idx]
+            logits[0, idx] = torch.where(
+                vals > 0, vals / AUDIO_GEN_REPETITION_PENALTY,
+                vals * AUDIO_GEN_REPETITION_PENALTY)
         logits = logits / AUDIO_GEN_TEMPERATURE
         if AUDIO_GEN_TOP_K > 0:
             top_k_vals, _ = logits.topk(min(AUDIO_GEN_TOP_K, logits.shape[-1]), dim=-1)
