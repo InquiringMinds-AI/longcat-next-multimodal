@@ -186,3 +186,54 @@ calibration tooling (`calibration/`) are preserved in this repo's **git history*
 `be21cc8` — the snapshot before this restructure. They're the ancestors of the shipped
 `new_files/` overlay; kept in history rather than the working tree because the *story* of
 that path (above) is the asset, not the superseded code.
+
+---
+
+## Spec-decode + generation: why they don't compose, and the shape of a fix
+
+`LCN_NGRAM=1` currently forces `LCN_AGENT=1` (generation endpoints 403'd). That
+coupling is not a design choice — it is a guard around a fatal crash, and the
+crash is worth fixing on its own merits.
+
+**Mechanism.** `ScheduleBatch.prepare_for_decode` (schedule_batch.py:2785):
+
+```python
+if not self.spec_algorithm.is_none():
+    # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
+    spec_prepare_for_decode(self)
+    return
+```
+
+When speculation is configured, decode preparation is delegated wholesale and
+returns early, skipping the plain path — whose own comment notes "input_ids is
+set at end of previous run_batch". Nothing on the spec path assigns `input_ids`,
+so a batch that needs plain decode (because generation is active and must run
+the model's Python state machines) arrives with `input_ids=None`. That yields
+`raw_num_tokens=0` and the eager buffer-registry fill dies:
+
+```
+RuntimeError: The size of tensor a (0) must match the size of tensor b (19)
+  in cuda_graph_buffer_registry._foreach_copy   (slot=positions dst=(0,) src=(1,))
+```
+
+**Why a fix is tractable.** The coarse granularity this needs already exists:
+`lcn_cuda_graph_veto()` is global model state, not per-request — if generation is
+active, the WHOLE batch runs eagerly. The same all-or-nothing rule applies here.
+The missing pieces are a batch-level `force_plain_decode` flag threaded through
+prepare -> spec worker -> forward, and assigning `input_ids` from the accepted
+tokens of the previous verify step.
+
+**Why it is worth doing.** Not to accelerate generation — n-gram drafting has
+nothing to predict from on visual/audio codec token streams. The win is that ONE
+server could run NGRAM for text while still serving image and voice generation,
+with generation batches falling back quietly. That removes the forced choice
+between speed and versatility, and turns a fatal crash into graceful
+degradation for anyone who reaches the path by editing the entrypoint, running
+the engine directly, or porting this overlay forward.
+
+**Known remaining risk.** The model's generation state machines process one
+token per decode step (watching for image_start/audio_start, counting toward the
+1369 visual tokens of a 37x37 image). If a batch ever mixes accepted-multi-token
+spec output with an active generation, those counters need ordered multi-token
+handling. The all-or-nothing veto avoids this by construction, but it is the
+first thing to check if a fix misbehaves.
