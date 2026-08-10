@@ -913,3 +913,77 @@ the model simply read it slower, which is not a defect. The acoustic-phase findi
 above (transcript ruled out) still stands — it rested on transcript step counts and
 byte sizes, not on duration — but "how big is the tail" has NO trustworthy prior
 measurement, and must be re-established with `trail_ms` before any trim is designed.
+
+### TTS: the variance is INTERIOR PAUSE LENGTH (2026-08-10, n=10)
+
+Re-measuring with the replacement instrument (`test/media_stats.py`, extracted from
+selftest so saved artifacts can be re-analyzed offline). Ten renders of the fixed
+sentence "Self test, all systems nominal.", none owner-adjudicated — so this is the
+shape of ORDINARY output, not of the reported defect.
+
+| seconds | speech_sec | cps | lead_ms | trail_ms | max_gap_ms |
+|---|---|---|---|---|---|
+| 5.35 | 5.12 | 6.1 | 140 | 80 | 1300 |
+| 4.77 | 4.46 | 7.0 | 140 | 160 | 600 |
+| 4.74 | 4.54 | 6.8 | 140 | 60 | 900 |
+| 4.70 | 4.56 | 6.8 | 140 | 0 | 460 |
+| 4.46 | 4.16 | 7.5 | 140 | 160 | 900 |
+| 4.15 | 3.38 | 9.2 | 140 | 620 | 500 |
+| 3.88 | 3.52 | 8.8 | 160 | 200 | 480 |
+| 3.14 | 2.68 | 11.6 | 160 | 300 | 260 |
+| 3.02 | 2.44 | 12.7 | 140 | 440 | 140 |
+| 2.52 | 2.14 | 14.5 | 140 | 240 | 80 |
+
+**1. Duration is anti-correlated with the trail.** The longest renders have the
+smallest trails (80, 60, 0 ms); the shortest have larger ones (440, 240). The old
+duration proxy did not merely fail to isolate the tail — it pointed the wrong way, so
+every conclusion drawn from it was worse than uninformed.
+
+**2. The cadence swing is interior silence, not word rate.** `max_gap_ms` tracks `cps`
+almost monotonically: 1300 ms of pause at cps 6.1 down to 80 ms at cps 14.5. A 1.3 s
+pause inside a 5.1 s reading of a one-comma sentence is the single largest component
+of the variance.
+
+**Consequence for the reported defect.** The owner heard silence and then "um?". A
+voiced filler ENDS the trail, so that artifact would register as a large INTERIOR gap,
+not as `trail_ms` — meaning the thing to look for is the extreme upper tail of the
+pause distribution above, not a trailing-silence trim. The energy-based trim proposed
+earlier (as the analogue of `LCN_TTS_TRIM_LEAD_MS`) would not have touched it. That
+proposal is withdrawn pending evidence.
+
+**Deliberately not built:** a "has the defect" flag. A first heuristic (>=400 ms gap
+with <=600 ms of audio after) fired on 2 of these 10 ordinary renders. With zero
+adjudicated defective samples there is nothing to calibrate against, and a threshold
+guessed from the good side only is a verdict wearing a measurement's clothes. The
+numbers are reported; a human adjudicates. (`image_stats`' palette advisory is
+different in kind — it has an adjudicated bad sample on one side, three good on the
+other, and wide margin between.)
+
+**Status:** no defective sample has been captured with the new instrument. The next
+useful step is not a fix but a CAPTURE — the owner flagging a render that sounds wrong
+so its `max_gap_ms` / `after_gap_ms` can be compared against this baseline.
+
+### tool_calling: the ~1-in-3 rate is refuted for this build (2026-08-10)
+
+With the transparent selftest and the corrected sequence probe (video step restored),
+the defect did not reproduce:
+
+| attempt | result |
+|---|---|
+| selftest x3 (earlier) | 3/3 clean |
+| probe_toolcall_sequence x4, full chain incl. video | 4/4 clean |
+| selftest x6 | 6/6 clean, 7/7 modalities each |
+
+That is 9 consecutive clean selftest runs on `v0516-specgen-final`. Under the
+previously inferred ~1-in-3 failure rate, 9 clean runs is a ~2.6% outcome, so that
+rate does not describe this build.
+
+What this does NOT establish: that the defect is fixed. Nothing targeted it, no
+mechanism was identified, and the two original failures were real (2 of 6, across two
+builds). The honest statement is that the rate is LOWER than believed and unmeasured,
+which also means reproducing it on demand is now the expensive part.
+
+Capture readiness is in place instead: selftest dumps the raw emission on failure, so
+the next occurrence distinguishes the two mutually-exclusive causes (unhandled dialect
+-> shimmable in `parse_tool_calls`; no call attempted -> not shimmable) without
+needing a reproduction harness.
