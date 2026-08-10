@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """Does the TTS render every word of its input? (round-trip: generate -> transcribe)
 
+⚠⚠ DISCREDITED AS OF 2026-08-10 — DO NOT DRAW CONCLUSIONS FROM THIS SCRIPT. ⚠⚠
+Run against 11 saved renders it produced a clean-looking result (6/11 truncated, split
+perfectly by cps) that CONTRADICTS the owner's ears on both adjudicated files, in both
+directions. The transcriber appears to reconstruct the expected sentence from priors,
+more readily on longer audio, which manufactures a duration-correlated split that is
+self-consistent and false. It also emitted meta-commentary instead of a transcript on
+one render. See research/FINDINGS.md.
+
+It is kept, not deleted, because the IDEA is sound and only the validation is missing:
+before this is used for anything, run it against a set of owner-LABELLED renders and
+show it agrees. Until then it is a hypothesis generator at best.
+
 WHY THIS EXISTS. The TTS defect on this port was chased for a long time as a TRAILING
 artifact, measured by duration. Both were wrong. The owner adjudicated two renders of
 the same sentence on 2026-08-10:
