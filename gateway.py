@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoTokenizer
 from longcat_tools import build_tools_system_block, parse_tool_calls
 from stream_tools import ToolStreamFilter, MARKERS as STREAM_MARKERS
+from audio_chat import extract_audio_chat
 from anthropic_route import router as anthropic_router
 
 SGLANG = "http://localhost:%s" % os.environ.get("SGLANG_INTERNAL_PORT", "30000")
@@ -238,21 +239,6 @@ async def audio_speech(req: Request):
     return Response(content=data, media_type="audio/wav")
 
 
-def _extract_audio_chat(messages):
-    q, audio_b = "", None
-    for m in messages:
-        c = m.get("content")
-        if isinstance(c, str):
-            q += c
-        elif isinstance(c, list):
-            for p in c:
-                if p.get("type") == "text":
-                    q += p.get("text", "")
-                elif p.get("type") == "input_audio":
-                    audio_b = base64.b64decode(p["input_audio"]["data"])
-    return (q.strip() or "Transcribe this audio."), audio_b
-
-
 async def _stream_chat(body):
     async with _client.stream("POST", SGLANG + "/v1/chat/completions", json=body) as r:
         async for chunk in r.aiter_bytes():
@@ -391,21 +377,27 @@ async def chat_completions(req: Request):
                             media_type=r.headers.get("content-type", "text/plain"))
         return JSONResponse(j, status_code=r.status_code)
     # audio understanding: SGLang's chat schema rejects input_audio -> native /generate
-    q, audio_b = _extract_audio_chat(msgs)
-    path = "%s/_in_%s.wav" % (OUT, uuid.uuid4().hex)
-    with open(path, "wb") as f:
-        f.write(audio_b)
-    prompt = "<longcat_user>" + q + "<longcat_audio_start><longcat_audio_end><longcat_assistant>"
+    prompt, blobs = extract_audio_chat(msgs)
+    if not blobs:
+        return JSONResponse({"error": {"message": "no decodable audio in request; "
+                            "input_audio.data must be base64"}}, status_code=400)
+    paths = []
+    for blob in blobs:
+        p = "%s/_in_%s.wav" % (OUT, uuid.uuid4().hex)
+        with open(p, "wb") as f:
+            f.write(blob)
+        paths.append(p)
     sp = {"max_new_tokens": int(body.get("max_tokens", 256)), "temperature": body.get("temperature", 0.2)}
     for k in ("top_p", "top_k", "frequency_penalty", "presence_penalty", "repetition_penalty", "stop"):
         if body.get(k) is not None:
             sp[k] = body[k]
     try:
-        r = await _client.post(SGLANG + "/generate", json={"text": prompt, "audio_data": [path], "sampling_params": sp})
+        r = await _client.post(SGLANG + "/generate", json={"text": prompt, "audio_data": paths, "sampling_params": sp})
         rj, raw = _json_or_text(r)
     finally:
-        try: os.remove(path)
-        except OSError: pass
+        for p in paths:
+            try: os.remove(p)
+            except OSError: pass
     if rj is None:
         return JSONResponse({"error": {"message": "backend error: " + raw[:200]}}, status_code=502)
     txt = rj.get("text", "")
