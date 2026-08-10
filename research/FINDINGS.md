@@ -777,3 +777,38 @@ cleanup: `LongcatNextProcessor` declares `image_processor_class` /
 `video_processor_class` / `audio_processor_class` directly, which transformers now
 wants registered via `AutoImageProcessor` / `AutoVideoProcessor` /
 `AutoFeatureExtractor`.
+
+### Intermittent tool_calling failure under NGRAM — REAL, not a flake
+
+`selftest` scored `tool_calling: no tool_calls` in **2 of 3 runs** under NGRAM
+(2026-08-09/10). It was initially written off as a one-off when a standalone repeat
+passed 3/3; the second occurrence, on the final validated build, disproves that.
+Recorded as an open defect, because tool calling IS the agent path and NGRAM exists
+to serve that path.
+
+What makes it interesting: the same battery run that failed selftest's check scored
+5/5 on the ANTHROPIC route including `tool_call` and a full `tool_roundtrip`, minutes
+later. So the capability is intact; something about the position of that request in
+the sequence breaks it.
+
+In selftest, `tool_calling` runs last, after: image generation -> image understanding
+-> audio generation -> audio understanding -> video understanding.
+
+**Elimination so far** (`test/probe_toolcall.py`, alternating cold vs
+after-predecessor, temperature 0, selftest's exact tools and prompt):
+
+| predecessor | cold | after |
+|---|---|---|
+| audio generation | 5/5 | **5/5** |
+| image understanding | 5/5 | **5/5** |
+| image generation | pending | pending |
+
+So neither a short generation nor a multimodal understanding request is sufficient
+to trigger it. Image generation — the long fallback (~1400 plain-decode steps) and
+the largest contributor to the server-global n-gram corpus — is the remaining
+single-step candidate; if it also comes back clean, the trigger is cumulative
+sequence state rather than any one predecessor, and the next probe should replay
+selftest's full order.
+
+Standing caution for whoever picks this up: do NOT conclude "flaky" from a passing
+repeat. This defect has already survived one such dismissal.
