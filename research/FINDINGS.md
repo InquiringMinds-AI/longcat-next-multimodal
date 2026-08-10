@@ -492,8 +492,34 @@ The agent number is the point of the whole exercise: the ~3.3x NGRAM speedup is
 intact IN A SERVER THAT ALSO GENERATES IMAGES AND VOICE. The speed-vs-versatility
 choice the old guard forced is gone.
 
-Owner eyes/ears verdict on this build's artifacts: PENDING — no generation change
-is closed until it lands.
+**Owner verdict on this build's artifacts (2026-08-09):** image — "apples good."
+Audio — correct speech, then "a few seconds of silence" and a trailing "um?", with
+his own hedge: "I think that could just be a normal variation for the voice gen."
+
+Taken seriously rather than accepted, because a late end-of-audio detection would
+produce exactly that, and the fallback changes how the audio state machine steps.
+Duration is an objective proxy (a spurious tail lengthens the WAV), so it is
+measurable without either of us judging by ear.
+
+NGRAM ON, same sentence, n=13, sorted seconds:
+
+```
+3.78 3.92 3.92 3.96 4.32 4.36 4.39 4.42 4.76 5.38 6.42 7.44 7.63
+```
+
+A tight ~4s cluster plus a clear long tail — 4/13 run well over, and the clip he
+heard (7.44s) is nearly double the median. So the tail is NOT typical even for this
+build; it is an occasional artifact, not the normal rendering.
+
+Note the documented TTS history for this port is entirely about the ONSET (first-word
+garble, fixed via `LCN_TTS_SILENCE_FRAMES`/`LCN_TTS_TRIM_LEAD_MS`). A trailing
+artifact is NOT documented anywhere, which is why the matched NGRAM-off control is
+worth running rather than assuming known variation.
+
+⚠ Power caveat, stated up front so the result is not over-read: n=13 per arm cannot
+separate a moderate rate difference from noise. A large gap (e.g. 4/13 vs 0/13)
+would be suggestive; anything smaller is not a result. Do not report a single
+favorable arm as a finding.
 
 **One anomaly, not dismissed:** the first selftest run of this build scored
 `tool_calling` FAIL ("no tool_calls"); a standalone repeat passed 3/3 identically
