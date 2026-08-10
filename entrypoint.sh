@@ -15,18 +15,20 @@ INTERNAL="${SGLANG_INTERNAL_PORT:-30000}"
 export SGLANG_INTERNAL_PORT="$INTERNAL"
 export MODEL_PATH="${MODEL_PATH:-/workspace/model}"
 
-# NGRAM spec decode still implies the AGENT profile by DEFAULT. The fatal crash
-# that originally forced this is FIXED (patches/spec_gen_fallback.patch: a batch
-# with an active image/audio generation falls back to plain decode, one token per
-# step, and speculation resumes afterwards) — image generation now runs to
-# completion under a spec-configured scheduler. But that path still leaks one KV
-# slot per fallback decode step, which exhausts the pool over a session, so it is
-# NOT yet a safe default. See research/FINDINGS.md.
-# LCN_NGRAM_ALLOW_GEN=1 opts into the fixed-but-leaking path (dev/debug only).
-if [ "${LCN_NGRAM:-0}" = "1" ] && [ "${LCN_NGRAM_ALLOW_GEN:-0}" != "1" ] \
+# NGRAM spec decode and generation COEXIST as of 2026-08-10 — the old
+# "LCN_NGRAM=1 implies LCN_AGENT=1" coupling is gone. A batch with an active
+# image/audio generation falls back to plain decode (one token per step, the
+# model's Python state machines run), and speculation resumes when it finishes;
+# see patches/spec_gen_fallback.patch and research/FINDINGS.md for the three
+# relayed-state bugs that had to be fixed to get there (input_ids, seq_lens,
+# kv_committed_len).
+# Validated with the strict idle KV-leak check ARMED: selftest 7/7, anthropic
+# 5/5, degeneracy 6/6, and a 12-cycle generation soak (4000+ fallback steps, 3
+# full image generations) with FLAT memory and zero leak reports.
+# LCN_NGRAM_AGENT_COUPLE=1 restores the old always-paired behavior.
+if [ "${LCN_NGRAM:-0}" = "1" ] && [ "${LCN_NGRAM_AGENT_COUPLE:-0}" = "1" ] \
    && [ "${LCN_AGENT:-0}" != "1" ]; then
-  echo "[entrypoint] LCN_NGRAM=1 implies the agent profile — enabling LCN_AGENT=1"
-  echo "[entrypoint]   (set LCN_NGRAM_ALLOW_GEN=1 for generation+NGRAM; known KV leak)"
+  echo "[entrypoint] LCN_NGRAM_AGENT_COUPLE=1 — enabling LCN_AGENT=1 (legacy pairing)"
   export LCN_AGENT=1
 fi
 
@@ -69,7 +71,9 @@ fi
 # was 9.95GB, so the all-modality budget absorbs it. Max-bs 32 (not 8) is what
 # buys the concurrency win — the curve keeps climbing to 64 concurrent requests.
 # LCN_CUDAGRAPH=0 restores the old always-eager behavior.
-GRAPH_FLAG="--cuda-graph-max-bs ${LCN_CUDAGRAPH_BS:-32} --disable-prefill-cuda-graph"
+# (--cuda-graph-max-bs-decode, not --cuda-graph-max-bs: the latter is deprecated
+# upstream and warns on every start.)
+GRAPH_FLAG="--cuda-graph-max-bs-decode ${LCN_CUDAGRAPH_BS:-32} --disable-prefill-cuda-graph"
 [ "${LCN_CUDAGRAPH:-1}" = "0" ] && GRAPH_FLAG="--disable-cuda-graph"
 
 # NGRAM lookup speculative decoding: reworked 2026-07 — verify batches now get

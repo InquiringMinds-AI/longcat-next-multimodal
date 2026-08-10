@@ -739,3 +739,41 @@ without hurting prosody, and whether an energy-based trailing-silence trim (the
 analogue of the existing `LCN_TTS_TRIM_LEAD_MS` onset trim, which already solved the
 mirror-image problem at the START) would remove the tail more cheaply than changing
 generation. The onset got exactly this treatment; the tail never has.
+
+### SOAK PASSED — the NGRAM/generation coupling is removed (2026-08-10)
+
+12-cycle generation soak (`test/soak_specgen.py`) with the strict idle KV-leak
+check ARMED, so a residual leak would kill the server rather than warn. Each cycle:
+3 speculative text decodes + 1 audio generation, plus a full image generation every
+4th. 4000+ plain-decode fallback steps engaged across the run.
+
+MemAvailable per cycle (GB):
+
+```
+25.78  25.81  25.90 | 6.06  6.00  5.97  5.95  5.89  5.89  5.90  5.89  5.94
+       (no image yet) ^ first image generation
+```
+
+The step at cycle 4 is the DOCUMENTED lazy allocation of the generation heads
+(~20GB, outside `--mem-fraction-static`) and lands exactly on the previously
+measured ~6GB floor. After it the series is FLAT — cycle 12 (5.94) sits above
+cycles 8-11 — so nothing accumulates across three full image generations. **Zero
+leak reports. Server alive throughout.**
+
+That was the gate, so the entrypoint default is flipped: **`LCN_NGRAM=1` no longer
+implies `LCN_AGENT=1`.** One server now serves NGRAM-accelerated text AND image /
+voice generation. `LCN_NGRAM_AGENT_COUPLE=1` restores the old pairing.
+
+Verified with MINIMAL env (only `LCN_NGRAM=1` set, everything else defaulted):
+agent not forced, `mem_fraction_static=0.72` (all-modality), decode CUDA graphs on
+at max-bs 32, `speculative_algorithm='NGRAM'`.
+
+Also fixed in the same build: `--cuda-graph-max-bs` is deprecated upstream in
+favour of `--cuda-graph-max-bs-decode` (warned on every start); switched.
+
+Remaining deprecation noise is pre-existing and unrelated (diffusers
+`LoRACompatibleLinear`, `pynvml`), EXCEPT three that are ours and worth a future
+cleanup: `LongcatNextProcessor` declares `image_processor_class` /
+`video_processor_class` / `audio_processor_class` directly, which transformers now
+wants registered via `AutoImageProcessor` / `AutoVideoProcessor` /
+`AutoFeatureExtractor`.
