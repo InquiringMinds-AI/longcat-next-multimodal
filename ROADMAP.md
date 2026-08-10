@@ -352,6 +352,35 @@ Results (2026-07-31, image :v0516-spec = both phases):
       work) — closes a pre-existing leak where raw gen markers in a chat
       prompt could strand a gen state on a reused req_pool_idx. The
       worker patch keeps only the draft/accept table writes.
+- [x] SUPERSEDED 2026-08-09/10 — NGRAM + generation DO compose; the crash and
+      both follow-on defects are fixed (patches/spec_gen_fallback.patch, see
+      research/FINDINGS.md for the full trace). The "deep allocator risk"
+      estimate above was wrong in shape: no spec-shaped KV accounting had to be
+      reimplemented. All three defects were ONE recurring mistake — under a
+      spec-configured scheduler the SPEC bookkeeping owns the relayed
+      per-request state, and plain decode prep must not also write it:
+        1. input_ids  — never assigned on the spec path (the original crash).
+           Cannot come from the FutureMap either: stash() early-returns for
+           ngram, so output_tokens_buf is never written. Rebuilt from
+           spec_info.accept_tokens the way _prepare_draft_tokens does.
+        2. seq_lens   — resolve_seq_lens_cpu overwrote the plain increment, and
+           since each fallback step publishes what it saw, seq_lens FROZE. The
+           ngram-embedding column stopped advancing => the model generated 1369
+           visual tokens against a stale context. Owner verdict on the artifact:
+           "a white smudge" (vs "an apple" with the guard). Guard: skip the
+           relay resolution for a flagged batch.
+        3. kv_committed_len — incremented by BOTH plain prep and
+           batch_result_processor (+num_accept_tokens), i.e. ~2x seq_len,
+           orphaning one KV slot per decode step (measured: exactly 1405 leaked
+           = the image's token count, three times). Guard: skip plain prep's
+           increment for a flagged batch.
+      MEASURED with both fixes, strict idle leak check ARMED: selftest 7/7,
+      anthropic 5/5, degeneracy 6/6, zero leaks, agent workload 76.45 tok/s at
+      100% fidelity (vs ~22 baseline). One server now does NGRAM-accelerated
+      text AND image/voice generation — the speed-vs-versatility choice is gone.
+      NOT YET DEFAULT: entrypoint still pairs NGRAM=>AGENT, with
+      LCN_NGRAM_ALLOW_GEN=1 to opt in, pending a SOAK (25 min says nothing about
+      a defect class whose signature is slow accumulation).
 - [x] Battery on the NGRAM⇒agent config: degeneracy 6/6, anthropic 5/5
       (incl. tool_call + roundtrip), gen endpoints 403 as designed, audio
       UNDERSTANDING passes; selftest image/video-understanding "failures"
