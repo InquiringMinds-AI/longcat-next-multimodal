@@ -29,6 +29,7 @@ from transformers import AutoTokenizer
 from longcat_tools import build_tools_system_block, parse_tool_calls
 from stream_tools import ToolStreamFilter, MARKERS as STREAM_MARKERS
 from audio_chat import extract_audio_chat
+from stream_util import open_upstream_stream
 from anthropic_route import router as anthropic_router
 
 SGLANG = "http://localhost:%s" % os.environ.get("SGLANG_INTERNAL_PORT", "30000")
@@ -239,15 +240,23 @@ async def audio_speech(req: Request):
     return Response(content=data, media_type="audio/wav")
 
 
-async def _stream_chat(body):
-    async with _client.stream("POST", SGLANG + "/v1/chat/completions", json=body) as r:
+async def _stream_chat(r):
+    """Pass an already-opened, already-status-checked upstream stream through verbatim."""
+    try:
         async for chunk in r.aiter_bytes():
             yield chunk
+    finally:
+        await r.aclose()
 
 
-async def _sse_deltas(client, url, body):
-    """Yield (content_piece, finish_reason, usage) triples from an OpenAI SSE stream."""
-    async with client.stream("POST", url, json=body) as r:
+async def _sse_deltas(r):
+    """Yield (content_piece, finish_reason, usage) triples from an open OpenAI SSE stream.
+
+    Takes an OPEN response rather than opening one: the status must already have been
+    settled by stream_util.open_upstream_stream, because a non-200 body yields no
+    "data:" lines here and would otherwise read as a clean, empty, successful stream.
+    """
+    try:
         async for line in r.aiter_lines():
             if not line.startswith("data:"):
                 continue
@@ -261,6 +270,8 @@ async def _sse_deltas(client, url, body):
             ch = (j.get("choices") or [{}])[0] if j.get("choices") else {}
             piece = (ch.get("delta") or {}).get("content") or ""
             yield piece, ch.get("finish_reason"), j.get("usage")
+    finally:
+        await r.aclose()
 
 
 def _earliest_marker(text):
@@ -269,7 +280,7 @@ def _earliest_marker(text):
     return min(idxs) if idxs else -1
 
 
-async def _stream_chat_with_tools(b2, tools, model):
+async def _stream_chat_with_tools(upstream, tools, model):
     """Live token streaming on the tools path: pass text through, go silent at the
     first tool marker, emit parsed tool_calls at the end (ROADMAP #2)."""
     filt = ToolStreamFilter()
@@ -284,18 +295,21 @@ async def _stream_chat_with_tools(b2, tools, model):
 
     yield chunk({"role": "assistant"})
     finish_reason = "stop"
-    b3 = dict(b2)
-    b3["stream"] = True
     try:
-        async for piece, fr, _usage in _sse_deltas(_client, SGLANG + "/v1/chat/completions", b3):
+        async for piece, fr, _usage in _sse_deltas(upstream):
             if fr:
                 finish_reason = fr
             out = filt.feed(piece)
             if out:
                 yield chunk({"content": out})
-    except httpx.ConnectError:
-        yield chunk({"content": "[backend unavailable]"})
-        yield chunk({}, "stop")
+    except Exception as e:
+        # The 200 and its headers are already on the wire, so this cannot become an error
+        # STATUS -- but it must not become a silent truncation either. Emit an SSE error
+        # object (the shape OpenAI clients surface) and terminate the stream properly,
+        # rather than letting the exception kill the connection with no [DONE].
+        yield "data: " + json.dumps({"error": {"message": "stream failed: " + str(e)[:200],
+                                     "type": "upstream_error"}}) + "\n\n"
+        yield chunk({}, "error")
         yield "data: [DONE]\n\n"
         return
     leftover, raw = filt.finish()
@@ -341,8 +355,12 @@ async def chat_completions(req: Request):
             msgs2 = [{"role": "system", "content": block}] + msgs2
         b2 = dict(body); b2["messages"] = msgs2; b2.pop("tools", None); b2.pop("tool_choice", None)
         if b2.pop("stream", False):
+            b3 = dict(b2); b3["stream"] = True
+            up, err = await open_upstream_stream(_client, SGLANG + "/v1/chat/completions", b3)
+            if err:
+                return JSONResponse({"error": {"message": err[1]}}, status_code=err[0])
             return StreamingResponse(
-                _stream_chat_with_tools(b2, tools, body.get("model", MODEL)),
+                _stream_chat_with_tools(up, tools, body.get("model", MODEL)),
                 media_type="text/event-stream")
         try:
             r = await _client.post(SGLANG + "/v1/chat/completions", json=b2)
@@ -366,7 +384,10 @@ async def chat_completions(req: Request):
         if tools:  # tool_choice == "none" reaches here — strip tools so SGLang doesn't apply its broken jinja tool rendering
             body = {k: v for k, v in body.items() if k not in ("tools", "tool_choice")}
         if body.get("stream"):
-            return StreamingResponse(_stream_chat(body), media_type="text/event-stream")
+            up, err = await open_upstream_stream(_client, SGLANG + "/v1/chat/completions", body)
+            if err:
+                return JSONResponse({"error": {"message": err[1]}}, status_code=err[0])
+            return StreamingResponse(_stream_chat(up), media_type="text/event-stream")
         try:
             r = await _client.post(SGLANG + "/v1/chat/completions", json=body)
         except httpx.ConnectError:

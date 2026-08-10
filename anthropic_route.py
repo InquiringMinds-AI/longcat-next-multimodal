@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from longcat_tools import build_tools_system_block, parse_tool_calls
 from stream_tools import ToolStreamFilter, MARKERS as _MARKERS
+from stream_util import open_upstream_stream
 
 SGLANG = "http://localhost:%s" % os.environ.get("SGLANG_INTERNAL_PORT", "30000")
 router = APIRouter()
@@ -127,7 +128,7 @@ def _sse(event, data):
     return "event: %s\ndata: %s\n\n" % (event, json.dumps(data, ensure_ascii=False))
 
 
-async def _stream_live(body, sg_body, oai_tools):
+async def _stream_live(body, upstream, oai_tools):
     """REAL incremental SSE (ROADMAP #2): text deltas pass through as they arrive;
     a tool marker silences pass-through and the buffered tail parses into tool_use
     blocks at the end. The old buffered-then-synthesized path remains for
@@ -142,17 +143,14 @@ async def _stream_live(body, sg_body, oai_tools):
     finish_reason, usage = "stop", {}
     text_open = False
     idx = 0
-    sg2 = dict(sg_body)
-    sg2["stream"] = True
-    sg2["stream_options"] = {"include_usage": True}
 
     def text_delta(t):
         return _sse("content_block_delta", {"type": "content_block_delta", "index": idx,
                     "delta": {"type": "text_delta", "text": t}})
 
     try:
-        async with _client.stream("POST", SGLANG + "/v1/chat/completions", json=sg2) as r:
-            async for line in r.aiter_lines():
+        try:
+            async for line in upstream.aiter_lines():
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
@@ -174,12 +172,21 @@ async def _stream_live(body, sg_body, oai_tools):
                                    "index": idx, "content_block": {"type": "text", "text": ""}})
                         text_open = True
                     yield text_delta(out)
-    except httpx.ConnectError:
-        if not text_open:
-            yield _sse("content_block_start", {"type": "content_block_start", "index": idx,
-                       "content_block": {"type": "text", "text": ""}})
-            text_open = True
-        yield text_delta("[backend unavailable]")
+        finally:
+            await upstream.aclose()
+    except Exception as e:
+        # message_start is already on the wire, so the status cannot change -- but the
+        # stream must still terminate in a shape the client understands rather than dying
+        # mid-message. Anthropic's SSE schema has a dedicated `error` event for this.
+        yield _sse("error", {"type": "error", "error": {"type": "api_error",
+                   "message": "stream failed: " + str(e)[:200]}})
+        if text_open:
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+        yield _sse("message_delta", {"type": "message_delta",
+                   "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                   "usage": {"output_tokens": 0}})
+        yield _sse("message_stop", {"type": "message_stop"})
+        return
     leftover, raw = filt.finish()
     calls = []
     tail_text = leftover
@@ -242,7 +249,20 @@ async def messages(req: Request):
         if body.get(src) is not None:
             sg_body[dst] = body[src]
     if body.get("stream"):
-        return StreamingResponse(_stream_live(body, sg_body, oai_tools),
+        sg2 = dict(sg_body)
+        sg2["stream"] = True
+        sg2["stream_options"] = {"include_usage": True}
+        # Open and status-check BEFORE returning a StreamingResponse: once that response
+        # starts, its 200 is committed and a backend failure can only be reported inside
+        # the stream. A non-200 body would otherwise yield no "data:" lines and reach the
+        # client as an empty but successful message.
+        upstream, err = await open_upstream_stream(_client, SGLANG + "/v1/chat/completions", sg2)
+        if err:
+            status = 529 if err[0] == 503 else err[0]
+            return JSONResponse({"type": "error", "error": {
+                "type": "overloaded_error" if status == 529 else "api_error",
+                "message": err[1]}}, status_code=status)
+        return StreamingResponse(_stream_live(body, upstream, oai_tools),
                                  media_type="text/event-stream")
     try:
         r = await _client.post(SGLANG + "/v1/chat/completions", json=sg_body)
