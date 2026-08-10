@@ -391,6 +391,41 @@ per fallback step, with the second slot never reaching `req_to_token`.
   `[ImageGen] CFG initialized`, and that line never appears while other
   `[ImageGen]` lines from the same logger do.
 
+### ROOT CAUSE #2 (the leak): kv_committed_len is double-counted
+
+Found by measurement, not inference, after three source-reading hypotheses had
+already died. Instrumenting the fallback counter to dump the per-request KV
+counters gave it immediately:
+
+| fallback step | seq_len | kv_allocated_len | kv_committed_len | output_ids |
+|---|---|---|---|---|
+| 1    | 192 | 192 | 192  | 0   |
+| 500  | 478 | 478 | **936**  | 459 |
+| 1000 | 978 | 978 | **1936** | 959 |
+
+`kv_allocated_len` tracks `seq_len` exactly. `kv_committed_len` runs at ~2x, and
+the excess equals `len(output_ids)` — one extra increment per decode step. Exactly
+two writers exist on this path, and BOTH fire for a fallback batch:
+
+- `schedule_batch.py:2909` — `req.kv_committed_len += 1` in plain `prepare_for_decode`
+- `batch_result_processor.py:591` — `req.kv_committed_len += num_accept_tokens`
+  (= 1 for a fallback step), which runs for any batch carrying spec results, and a
+  fallback batch does carry them (accept_lens + speculative_num_draft_tokens)
+
+Commit then desynchronizes from `kv_allocated_len`, the request's KV is released
+against the wrong committed prefix, and one slot per decode step is orphaned.
+
+**Fix:** skip the plain path's increment when `lcn_force_plain_decode` is set. This
+is the SAME ownership rule as the seq_lens fix, and the second instance of the same
+underlying mistake: **when speculation is configured, the spec bookkeeping owns the
+relayed per-request state — plain prep must not also write it.** Two counters
+(`seq_lens`, `kv_committed_len`) needed the same treatment; if a third relayed
+counter surfaces, look here first.
+
+Independent confirmation that the leak scales with generation length, not per
+request: a short TTS generation leaked 39 slots where the 1405-token image leaked
+1405.
+
 **Open question worth its own investigation:** whether CFG is also inactive in the
 SHIPPED build. If it is, production image generation has been running without
 classifier-free guidance — a quality issue independent of any of this work, and one

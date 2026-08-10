@@ -105,6 +105,26 @@
              # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
              from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
  
+@@ -2816,7 +2906,18 @@
+         # Update req-level memory management fields
+         for req in self.reqs:
+             req.decode_batch_idx += 1
+-            req.kv_committed_len += 1
++            # LongCat-Next overlay: on a fallback step this batch still travels
++            # the SPEC result path, and batch_result_processor already does
++            # `req.kv_committed_len += num_accept_tokens` (= 1 here). Doing it
++            # here too double-counts one per decode step: kv_committed_len runs
++            # at ~2x seq_len, desynchronizing it from kv_allocated_len, and the
++            # request's KV is then released against the wrong committed prefix
++            # -- one orphaned slot per decode step. Same ownership rule as
++            # seq_lens: when speculation is configured, the spec bookkeeping
++            # owns the relayed counters, not plain prep. (Measured: at fallback
++            # step 1000, seq_len=978 kv_alloc=978 kv_commit=1936.)
++            if not self.lcn_force_plain_decode:
++                req.kv_committed_len += 1
+ 
+         # New-tensor avoids racing model_worker_batch refs queued for
+         # overlap forward.
 --- a/python/sglang/srt/speculative/ngram_worker.py
 +++ b/python/sglang/srt/speculative/ngram_worker.py
 @@ -267,6 +267,16 @@
