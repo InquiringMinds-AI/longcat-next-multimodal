@@ -359,6 +359,37 @@ One mechanism, both symptoms, and both quantitatively:
 `lcn_force_plain_decode` — plain prep owns seq_lens for that step. Publishing still
 happens each step, so the hand-back to real verify rounds carries the correct value.
 
+**PARTIAL RESULT (2026-08-09, `:v0516-specgen2`).** The guard is live and correctly
+placed (verified in the running container), but **the KV leak is unchanged —
+still exactly 1405.** So the "one mechanism explains both" claim is at least half
+wrong: whatever the seq_lens freeze did to image quality, it is NOT the leak's
+cause. Image verdict pending.
+
+### The leak: two more hypotheses killed
+
+The number is EXACTLY 1405 in all three runs (82482/79639/1438, 80882/78047/1430,
+70117/67286/1426 -> 1405 every time), and 1405 is the image generation's full
+sequence length, NOT the decode-step count. So one complete copy of the
+generation's KV leaks, rather than a slot dribbling away per step.
+
+- **Uncond/CFG KV never freed** — dead. The model does allocate a second KV
+  sequence for the CFG unconditional path (`_alloc_uncond_kv`, then `alloc.alloc(1)`
+  per step, freed in one shot by `_free_uncond_kv`), and an unfreed copy would be
+  exactly this size. But the logs show ZERO "Freed uncond KV" AND zero uncond
+  activity of any kind.
+- **...because CFG is not running at all.** `IMAGE_GEN_CFG_SCALE` defaults to 3.0,
+  so the gate that failed is `self._model_runner is not None` — the reference
+  installed by `_setup_kv_pool_refs`. The success path logs
+  `[ImageGen] CFG initialized`, and that line never appears while other
+  `[ImageGen]` lines from the same logger do.
+
+**Open question worth its own investigation:** whether CFG is also inactive in the
+SHIPPED build. If it is, production image generation has been running without
+classifier-free guidance — a quality issue independent of any of this work, and one
+the automated battery cannot see. The control is cheap (run one image with NGRAM
+off and grep for `CFG initialized`) and has NOT been run yet; do not assume either
+answer.
+
 Lesson worth keeping: under overlap, `batch.seq_lens` is NOT owned by
 `prepare_for_decode` when speculation is configured — it is relayed. Any path that
 mixes plain preparation into a spec-configured scheduler has to decide who owns the
