@@ -521,6 +521,35 @@ separate a moderate rate difference from noise. A large gap (e.g. 4/13 vs 0/13)
 would be suggestive; anything smaller is not a result. Do not report a single
 favorable arm as a finding.
 
+**CONTROL RESULT — the tail is BASELINE TTS behavior, not caused by the fallback.**
+Same build, same sentence, NGRAM off, n=13:
+
+```
+3.34 3.49 3.56 3.62 3.63 3.82 4.54 5.07 5.29 5.36 5.84 6.02 7.11
+```
+
+| | NGRAM ON | NGRAM OFF |
+|---|---|---|
+| median | 4.39 s | 4.54 s |
+| mean | 4.98 s | 4.67 s |
+| >5 s | 4/13 | **6/13** |
+| >6 s | 3/13 | 2/13 |
+| max | 7.63 s | 7.11 s |
+
+The long tail appears in BOTH arms, and the control has MORE samples over 5s with a
+slightly longer median. There is no signal that speculation or the plain-decode
+fallback causes it. The owner's own hedge ("could just be a normal variation for the
+voice gen") was correct and the Claude-side suspicion was wrong — recorded that way
+deliberately, because the suspicion was reasonable (a late end-of-audio detection
+produces exactly this shape) and the only thing that separated it from the truth was
+running the control.
+
+What this does NOT establish: that the tail is harmless or unimprovable. It is a
+pre-existing TTS quality issue on this port, independent of all the spec-decode
+work, and a candidate for its own investigation (the ONSET got one; the tail never
+has). Rate is roughly 2-6 in 13 depending on threshold — frequent enough to be
+worth a look if voice output quality matters.
+
 **One anomaly, not dismissed:** the first selftest run of this build scored
 `tool_calling` FAIL ("no tool_calls"); a standalone repeat passed 3/3 identically
 and a full selftest re-run in the SAME sequence (right after both generations)
