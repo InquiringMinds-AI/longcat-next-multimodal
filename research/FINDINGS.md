@@ -605,3 +605,39 @@ exhausting it) plus a second backbone forward per decode step, so expect image
 generation to run roughly 2x slower. Memory headroom must be re-measured, and the
 owner's eyes decide whether the quality difference is worth it — paired samples,
 same prompt, CFG on vs off.
+
+### CFG wired up and verified live (2026-08-10)
+
+`ModelRunner.lcn_setup_model_kv_pool_refs()`, called at the end of
+`init_ngram_embedding_manager`, now invokes the model's `_setup_kv_pool_refs(self)`.
+Confirmed active in the log for the first time in this project's history:
+
+```
+[ImageGen] CFG initialized: uncond_req=2, seq_len=19
+[ImageGen] Freed uncond KV: 1423 tokens
+```
+
+The unconditional sequence is allocated AND freed cleanly (1423 tokens), so CFG
+introduces no KV leak of its own.
+
+**Measured cost** (same build, NGRAM off both arms, only `IMAGE_GEN_CFG_SCALE`
+differing — so the two arms are one build and one env var, no rebuild needed):
+
+| | CFG on (3.0) | CFG off (1.0) |
+|---|---|---|
+| apple, end-to-end | 411 s | 331 s |
+
+~1.24x slower end-to-end. The ~95s refiner is a fixed cost, so the decode portion
+roughly doubled (316s vs 236s) — consistent with a second backbone forward per step.
+
+Paired samples delivered for the owner's eyes on two prompts: the easy apple
+(sanity — should stay good) and a compositional prompt with two objects, colors and
+a spatial relation ("a red apple to the left of a yellow banana"), which is the
+discriminating case because prompt adherence is what CFG buys.
+
+⚠ Note for interpreting the project's history: FINDINGS Act I lists "CFG sweeps"
+among the sampling knobs tried against the tiling problem, and Act II says the
+anyres fix "made the classifier-free-guidance unconditional path correct too".
+Since `_setup_kv_pool_refs` has never been called, **CFG cannot have been running
+during any of that work** — those sweeps were almost certainly no-ops on an
+unguided model. Do not treat the earlier CFG conclusions as evidence about CFG.
