@@ -1265,13 +1265,17 @@ back-to-back with an identical prompt, which is the worst case — may have been
 different file than the one submitted.
 
 Known to be affected in kind (flagged, not re-litigated here):
-* The 2026-07-31 v0.5.12-vs-v0.5.16 TTS comparison recorded in ROADMAP §1: *"v512 clips run
-  2.2-3.4s and their transcripts STOP AT THE FIRST CLAUSE; v516 clips run 5.1-7.3s and
-  speak further."* Those transcripts came from this path. Note the phenomenon described —
-  clause truncation, and "every v512 clip SKIPS the word 'Self' entirely" — is the SAME
-  content-loss defect re-derived today from the acoustic sampler, so the conclusion may
-  well survive; but the EVIDENCE for it is no longer sound, and the two must not be
-  confused.
+* The 2026-07-31 v0.5.12-vs-v0.5.16 TTS comparison recorded in ROADMAP §1 — but ONLY its
+  transcript-derived line: *"their transcripts STOP AT THE FIRST CLAUSE"*. That came from
+  this path and is no longer sound evidence.
+
+  **CORRECTION (owner, 2026-08-10): _"My ears heard these clips, not asr."_** The
+  OWNER EAR VERDICT in that same section — *"every v512 clip SKIPS the word 'Self'
+  entirely"* — is human adjudication and is NOT affected; an earlier draft of this caveat
+  wrongly swept it in. The clip durations (2.2-3.4s vs 5.1-7.3s) are direct measurements
+  and stand too. So the v512 content-loss finding rests on ears and a stopwatch, both
+  sound, and it independently corroborates the acoustic-sampler truncation re-derived
+  today. Only the ASR transcript line needs re-taking.
 * Today's `tts_roundtrip` run (already marked discredited above, for what turns out to be
   the wrong reason — the transcriber was not biased, it was reading other files).
 

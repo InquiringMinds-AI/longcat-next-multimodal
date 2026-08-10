@@ -1212,7 +1212,16 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         return torch.cat(all_embeddings, dim=0)
 
     def _get_mm_items(self, forward_batch):
-        """Extract multimodal items from the forward batch."""
+        """Extract multimodal items, PAIRED WITH THE INDEX OF THE REQUEST THEY BELONG TO.
+
+        The request index is load-bearing, not bookkeeping: each item's `offsets` are
+        relative to its OWN request's sequence, while the forward tensors are flattened
+        across the whole batch. An item cannot be placed without knowing which request it
+        came from. This previously returned bare items, discarding that association, which
+        silently corrupted every request after the first whenever two multimodal requests
+        landed in one batched prefill — measured 3/3 correct sequentially vs 1/3
+        concurrently on identical inputs.
+        """
         mm_inputs_list = getattr(forward_batch, 'mm_inputs', None)
         if not mm_inputs_list:
             return [], []
@@ -1222,9 +1231,9 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 continue
             for item in mm_input.mm_items:
                 if item.is_image():
-                    image_items.append(item)
+                    image_items.append((i, item))
                 elif item.is_audio():
-                    audio_items.append(item)
+                    audio_items.append((i, item))
         return image_items, audio_items
 
     # --- Gen-trigger latch (see __init__ comment) ---
@@ -1578,8 +1587,13 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         # 1e6 + hash%2^30, against this model's vocab_size 282624) so they can never
         # collide with a real token. They must therefore be mapped back to the model's
         # own pad ids BEFORE embed_tokens indexes the embedding table, or the lookup
-        # runs off the end. Positions come from each item's offsets — the same offsets
-        # sglang used to write the pad values in the first place.
+        # runs off the end.
+        # Matched BY VALUE, not by offset: each item's pad_value is globally unique now
+        # that it is content-derived, so `input_ids == pad_value` finds its positions with
+        # no position arithmetic at all — no request base, no prefix length, nothing that
+        # can be wrong under batching. (The scatter below still needs offsets, because it
+        # must know WHICH embeddings go where; this only needs to know WHICH MODALITY a
+        # position belongs to.)
         # Mapping per modality (rather than to one arbitrary id) keeps the n-gram
         # embedding path's token history byte-identical to the pre-fix behaviour; the
         # embeddings themselves are zeroed and overwritten immediately below regardless.
@@ -1588,10 +1602,11 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         if bool(mm_mask.any()):
             input_ids = input_ids.clone()
             for items, pid in ((image_items, vis_pad_id), (audio_items, aud_pad_id)):
-                for item in (items or ()):
-                    for start, end in (getattr(item, 'offsets', None) or ()):
-                        seg = input_ids[start:end]
-                        seg[seg >= MM_PAD_SHIFT_VALUE] = pid
+                for _req_idx, item in (items or ()):
+                    pv = getattr(item, 'pad_value', None)
+                    if pv is None or pv < MM_PAD_SHIFT_VALUE:
+                        continue
+                    input_ids[input_ids == pv] = pid
             # Backstop: an offset that does not cover its pads would otherwise index
             # out of vocab and crash the forward. Never leave one behind.
             leftover = input_ids >= MM_PAD_SHIFT_VALUE
@@ -1609,41 +1624,67 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         pad_mask = (input_ids == vis_pad_id) | (input_ids == aud_pad_id)
         input_embeds[pad_mask] = 0
 
-        # Replace audio embeddings
+        # The encoders take bare items; only the scatter needs the request index. Encode
+        # order must match scatter order — both walk the same list, so keep it that way.
         if audio_items:
-            audio_embeds = self.get_audio_feature(audio_items)
+            audio_embeds = self.get_audio_feature([it for _, it in audio_items])
             if audio_embeds is not None:
                 self._replace_mm_embeddings(input_embeds, audio_items, audio_embeds, forward_batch)
 
-        # Replace image embeddings
         if image_items:
-            image_embeds = self.get_image_feature(image_items)
+            image_embeds = self.get_image_feature([it for _, it in image_items])
             if image_embeds is not None:
                 self._replace_mm_embeddings(input_embeds, image_items, image_embeds, forward_batch)
 
         return input_embeds
 
     def _replace_mm_embeddings(self, input_embeds, items, embeds, forward_batch):
-        """Replace placeholder embeddings with multimodal embeddings."""
+        """Scatter encoded media embeddings into their placeholder positions.
+
+        `items` is [(req_idx, item)] from _get_mm_items. Each item's offsets are relative
+        to its own request's FULL sequence, while `input_embeds` covers the batch-flattened
+        EXTEND region only, so every offset needs two corrections:
+
+          - subtract THAT request's cached prefix length (the extend region begins there);
+          - add THAT request's start position within the flattened batch.
+
+        Both were wrong before: the prefix was always read from index [0] (the first
+        request's), and the per-request base was missing entirely. With a single request in
+        flight the base is 0 and index 0 is the right request, so it worked — and every
+        prior test issued one request at a time. Under batched prefill it corrupted every
+        request after the first, which measured as 3/3 correct sequentially vs 1/3
+        concurrently on identical inputs, with the damaged requests collapsing to a
+        one-token reply.
+        """
+        prefix_lens = list(getattr(forward_batch, 'extend_prefix_lens_cpu', None) or [])
+        seq_lens = list(getattr(forward_batch, 'extend_seq_lens_cpu', None) or [])
+        # Start of each request within the flattened extend region.
+        bases, acc = [], 0
+        for L in seq_lens:
+            bases.append(acc)
+            acc += L
+
         embed_idx = 0
-        for item in items:
+        for req_idx, item in items:
             offsets = getattr(item, 'offsets', None)
             if offsets is None:
                 continue
+            prefix_len = prefix_lens[req_idx] if req_idx < len(prefix_lens) else 0
+            base = bases[req_idx] if req_idx < len(bases) else 0
             for start, end in offsets:
                 n_tokens = end - start
                 if embed_idx + n_tokens > embeds.shape[0]:
                     n_tokens = embeds.shape[0] - embed_idx
                 if n_tokens <= 0:
                     continue
-                prefix_len = 0
-                if hasattr(forward_batch, 'extend_prefix_lens_cpu') and forward_batch.extend_prefix_lens_cpu:
-                    prefix_len = forward_batch.extend_prefix_lens_cpu[0]
-                adj_start = start - prefix_len
-                adj_end = adj_start + n_tokens
-                if adj_start < 0:
+                rel_start = start - prefix_len
+                if rel_start < 0:
+                    # Media lies inside this request's cached prefix: its KV is already
+                    # resident and must not be re-scattered. Still consume the embeddings.
                     embed_idx += n_tokens
                     continue
+                adj_start = base + rel_start
+                adj_end = adj_start + n_tokens
                 if adj_end > input_embeds.shape[0]:
                     adj_end = input_embeds.shape[0]
                     n_tokens = adj_end - adj_start
