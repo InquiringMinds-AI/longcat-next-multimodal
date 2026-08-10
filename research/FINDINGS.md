@@ -700,3 +700,42 @@ the harness now exists, and an arm is one env var.
 second KV sequence per in-flight image and was only ever exercised single-request.
 Anyone enabling it on this box (which hard-powers-off past ~110-115GB) must
 re-measure first.
+
+### TTS tail: transcript hypothesis REFUTED; the acoustic phase is the cause
+
+Chasing the trailing "(silence) um?" artifact (owner-heard, ~2-6 in 13 depending on
+threshold, present with AND without speculation so it is baseline behaviour).
+
+The obvious suspect was the transcript phase: the model recites the requested text
+before the acoustic codebooks render it, and that recitation is SAMPLED, not greedy
+(`LCN_TRANSCRIPT_TEMPERATURE` 0.5, top-k 5, top-p 0.85 — deliberately, because the
+original detects on the sampled token, not argmax). A wandering transcript that
+appended "um" before emitting the pad token would render as speech and explain the
+artifact exactly.
+
+**Refuted at zero cost by correlating existing logs**, no test cycle needed. The
+engine already logs why each transcript ended, and the soak logs audio byte counts
+per cycle:
+
+```
+transcript ended (natural (audiotext_pad)) after 6 steps   x4, every sample
+soak cycle 1: audio_bytes 79244
+soak cycle 2: audio_bytes 135884      <- 1.7x the audio, SAME 6-step transcript
+```
+
+Identical transcript length, wildly different audio length => the extra duration is
+produced AFTER the transcript, in the acoustic phase. The transcript sampler is not
+the cause and `LCN_TRANSCRIPT_GREEDY=1` is not the fix.
+
+**Where to look next:** the acoustic phase runs until `_is_audio_end_token` fires,
+which requires level-0 to sample exactly `codebook_sizes[0]` (8192); the only other
+stop is a 1000-frame safety cap (~40s), which is not being hit (no "hit safety cap"
+warnings). So the model simply takes a variable number of frames to emit end-of-audio,
+and sometimes fills that time with silence and a filler utterance. The lever is the
+acoustic stopping criterion / its sampling, not the transcript.
+
+Not yet investigated: whether the acoustic codebook sampling params can be tightened
+without hurting prosody, and whether an energy-based trailing-silence trim (the
+analogue of the existing `LCN_TTS_TRIM_LEAD_MS` onset trim, which already solved the
+mirror-image problem at the START) would remove the tail more cheaply than changing
+generation. The onset got exactly this treatment; the tail never has.
