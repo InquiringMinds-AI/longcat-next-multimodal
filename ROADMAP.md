@@ -780,6 +780,16 @@ optimizations that trade modalities for speed:
 - [ ] **`LCN_PREWARM=1`**: opt-in startup warmup of the image/audio generation heads —
       moves the ~25 GB lazy allocation and the 4–5 min first-image surprise to load
       time, where the operator expects cost.
+- [x] **Multimodal prefix-cache collision** (FIXED 2026-08-10, validated) — image/video/
+      audio understanding could return ANOTHER request's media, because the processor
+      pre-assigned a constant `pad_value` and thereby suppressed sglang's per-item content
+      hash. Radix caching stays ON; the cache key is now correct rather than avoided.
+      Proof, fix and validation in research/FINDINGS.md.
+- [x] **Tool-call syntax 4** (FIXED 2026-08-10, validated) — the long-running
+      "intermittent tool_calling" was never flaky: a fourth emission dialect (all args as
+      one JSON object after `<longcat_arg_key>`) matched no parser branch and was dropped
+      silently. `test/test_tool_parsing.py` now covers all four dialects offline.
+
 - [ ] **Processor registration cleanup** — NOT the easy win it reads as. Investigated
       2026-08-10 against the live image (transformers **5.12.1**); do not start this
       without the findings below.
