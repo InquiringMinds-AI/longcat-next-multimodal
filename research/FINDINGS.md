@@ -301,7 +301,25 @@ fallback signature. Text passed too. The explicit counter matters: without it a
 green selftest could not distinguish "fallback worked" from "generation never
 reached the spec path".
 
-**But a NEW, distinct defect surfaced: a KV pool accounting leak.** The scheduler
+**The generated image was CONTENT-BROKEN — owner verdict, 2026-08-09: "the image
+doesn't even have a hint of an apple"** (prompt: "A photograph of a red apple on a
+wooden table"). A valid 1040x1040 PNG with the full 1369 visual tokens, and the
+wrong picture. `selftest.py` checks only the PNG magic bytes and byte count, so it
+scored PASS; the fallback counter proved only that the PATH ran, not that its
+output was correct. This is the third time in this campaign that a green battery
+plus a plausible log signature was reported as validation of a generation change —
+the human eyes/ears gate is the ONLY thing that has ever caught this class.
+
+So the fallback mechanism runs to completion but does not produce correct
+generation. Root cause not yet established; the paired comparison that isolates it
+(same binary, NGRAM on vs off, so the non-spec overlay edits are held constant) is
+the next step. Leading suspicion is the n-gram EMBEDDING context (a different
+mechanism from ngram spec decode, sharing the same token table): corrupting it is
+already known on this port to degrade image generation specifically — that is what
+`LCN_NGRAM_EOS=-1` exists to prevent — and the spec path writes draft tokens into
+that same table.
+
+**A second, independent defect: a KV pool accounting leak.** The scheduler
 died at the first idle AFTER the image was saved:
 
 ```
@@ -324,7 +342,13 @@ path pre-allocates a reserve via `alloc_for_spec_decode` and tracks
 differs — the spec branch relays `on_publish(new_seq_lens)` where the non-spec
 branch publishes `seq_lens + 1`).
 
-**Status: NOT SHIPPABLE.** The fallback mechanism is validated; the KV accounting is
-not. Do not enable `LCN_NGRAM=1` without `LCN_AGENT=1` until the leak is fixed — a
-leak of one slot per generated token exhausts the KV pool across a session.
-`LCN_NGRAM_AGENT_COUPLE=1` restores the old always-safe guard.
+**Status: NOT SHIPPABLE — two open defects.** What IS established: the fatal crash
+is gone, and a generation now runs to completion under a spec-configured scheduler.
+What is NOT established: that the output is correct (it is not — see the owner's
+verdict above), or that KV is accounted correctly. Do not enable `LCN_NGRAM=1`
+without `LCN_AGENT=1`; the entrypoint keeps that coupling as the default and
+`LCN_NGRAM_ALLOW_GEN=1` is a dev-only opt-in.
+
+Do not repeat the reporting error either: for this path, "generated a valid PNG"
+and "the fallback counter incremented" are progress indicators, NOT validation.
+Only the owner's eyes/ears close a generation change.
