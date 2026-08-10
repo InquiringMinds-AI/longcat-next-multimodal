@@ -566,3 +566,42 @@ behavior.
 Do not repeat the reporting error made mid-campaign either: for this path,
 "generated a valid PNG" and "the fallback counter incremented" are progress
 indicators, NOT validation. Only the owner's eyes/ears close a generation change.
+
+---
+
+## CFG has never run: `_setup_kv_pool_refs` is defined but never called
+
+Surfaced while chasing the KV leak (2026-08-09), and independent of all the
+spec-decode work.
+
+`LongcatNextForCausalLM._setup_kv_pool_refs(model_runner)` sets
+`self._model_runner`, which every classifier-free-guidance path depends on. Its
+docstring says "Called by model_runner to provide KV pool access for CFG
+dual-path" — but **nothing calls it**: not the overlay, not any patch, not
+upstream sglang. The only other assignment is `self._model_runner = None` in
+`__init__`.
+
+So `self._model_runner` is permanently None and the whole CFG feature is dead:
+
+- the gate `if IMAGE_GEN_CFG_SCALE != 1.0 and self._model_runner is not None` is
+  always False (the scale itself defaults to 3.0, so the scale is not what
+  disables it),
+- `_alloc_uncond_kv` early-returns,
+- `_free_uncond_kv` no-ops.
+
+**Verified by log absence in BOTH configs**: zero `[ImageGen] CFG initialized`,
+zero `uncond` lines of any kind, with NGRAM on AND with NGRAM off (the
+shipped-equivalent path) — while other `[ImageGen]` lines from the same logger
+appear normally.
+
+Every image this project has ever generated has therefore been UNGUIDED. This is
+a live quality question on the flagship's headline capability, and it is a wiring
+bug, not a tuning choice.
+
+**Cost of enabling it, so the tradeoff is judged on evidence:** the unconditional
+path is a full second KV sequence (~1405 slots for a 37x37 image — the pool
+demonstrably absorbs that, since the leak consumed exactly that much without
+exhausting it) plus a second backbone forward per decode step, so expect image
+generation to run roughly 2x slower. Memory headroom must be re-measured, and the
+owner's eyes decide whether the quality difference is worth it — paired samples,
+same prompt, CFG on vs off.
