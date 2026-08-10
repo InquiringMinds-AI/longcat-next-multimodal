@@ -801,14 +801,32 @@ after-predecessor, temperature 0, selftest's exact tools and prompt):
 |---|---|---|
 | audio generation | 5/5 | **5/5** |
 | image understanding | 5/5 | **5/5** |
-| image generation | pending | pending |
+| image generation | 3/3 | **3/3** |
 
-So neither a short generation nor a multimodal understanding request is sufficient
-to trigger it. Image generation — the long fallback (~1400 plain-decode steps) and
-the largest contributor to the server-global n-gram corpus — is the remaining
-single-step candidate; if it also comes back clean, the trigger is cumulative
-sequence state rather than any one predecessor, and the next probe should replay
-selftest's full order.
+**No single predecessor triggers it** — not a short generation, not a multimodal
+understanding request, not even the long image generation that drives ~1400
+plain-decode fallback steps. So the trigger is CUMULATIVE sequence state, which
+matches the observation that the failure has only ever appeared inside selftest's
+full run and never in isolation.
+
+Next: `test/probe_toolcall_sequence.py` replays selftest's exact modality order and
+then issues selftest's exact tool-call request, dumping `content`, `finish_reason`
+and the full message on failure. That capture is the decision point, because the
+gateway leaves unparsed model output in `content` untouched:
+
+```python
+normal, calls = parse_tool_calls(msg.get("content") or "", tools)
+if calls:                      # content is only rewritten when parsing SUCCEEDS
+```
+
+Two outcomes with opposite fixes, and selftest's pass/fail cannot distinguish them:
+* an unhandled tool-call DIALECT (the parser already normalizes three: the
+  `<longcat_tool_call>` XML arg-pairs, the TS-style object-literal call, and the
+  Claude-imitation `<function_calls>` JSON) -> a few lines in `parse_tool_calls`
+  plus a regression fixture built from the captured text;
+* ordinary prose with no call attempted -> a parser shim cannot help, and the
+  question becomes why the tools system block stops conditioning the model after a
+  long multimodal context.
 
 Standing caution for whoever picks this up: do NOT conclude "flaky" from a passing
 repeat. This defect has already survived one such dismissal.
