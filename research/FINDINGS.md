@@ -641,3 +641,24 @@ anyres fix "made the classifier-free-guidance unconditional path correct too".
 Since `_setup_kv_pool_refs` has never been called, **CFG cannot have been running
 during any of that work** — those sweeps were almost certainly no-ops on an
 unguided model. Do not treat the earlier CFG conclusions as evidence about CFG.
+
+**First owner signal on the CFG pair (2026-08-10):** on the compositional prompt he
+flagged the CFG-OFF image — "the fourth image has a really bizarre shape for its
+'banana'" — and did not flag the CFG-ON one. That points the expected direction
+(guidance improves prompt adherence), but it is ONE sample per arm and is NOT
+treated as a result: the TTS-tail investigation earlier the same day died exactly
+that way, where a suspicion that looked obvious dissolved once a matched control ran.
+
+Follow-up designed for generality rather than repeat-variance: FOUR distinct
+compositional prompts per arm, each probing a different failure mode that guidance
+is supposed to fix —
+
+| prompt | probes |
+|---|---|
+| red apple to the left of a yellow banana | two objects, colors, spatial relation |
+| blue mug next to a green book | color binding across objects |
+| three oranges in a white bowl | COUNT |
+| black cat sitting under a wooden chair | containment / occlusion |
+
+Count and color-binding are the classic guidance-sensitive cases, so a real effect
+should be most visible there. Same build, same env-var-only arm switch.
