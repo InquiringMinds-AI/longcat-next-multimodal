@@ -1382,3 +1382,44 @@ was never real to the code being written.
   confirming it directly needs instrumentation on the actual input_ids.
 * A proper cross-chunk media fix is still owed — the current change makes truncation
   deterministic and loud, not absent.
+
+### Chunk-boundary media truncation: REFUTED empirically (2026-08-10)
+
+Codex's audit finding #5, and my own independent code-level confirmation of it, are both
+WRONG. Tested directly with `chunked_prefill_size=8192` (confirmed enabled from the server
+args) by calibrating `usage.prompt_tokens` to force the boundary through a 2512-token image
+span at five positions:
+
+```
+pad=8465  prompt=10326  before_img=7814  boundary_inside_image=True  -> correct
+pad=7920  prompt=9824   before_img=7312  boundary_inside_image=True  -> correct
+pad=7512  prompt=9447   before_img=6935  boundary_inside_image=True  -> correct
+pad=7105  prompt=9071   before_img=6559  boundary_inside_image=True  -> correct
+pad=6560  prompt=8568   before_img=6056  boundary_inside_image=True  -> correct
+```
+
+Every description was right (four coloured quadrants, centred black circle) and the guard
+never fired. sglang keeps media items whole across chunk boundaries. The guard stays as a
+cheap canary; the "proper cross-chunk fix" recorded as owed is NOT owed.
+
+**Why a careful trace and an independent audit both got it wrong.** The deduction was
+sound: IF a boundary bisects a media item, `_replace_mm_embeddings` loses the tail. What
+neither of us checked was the ANTECEDENT — whether the scheduler ever produces that state.
+Verifying a MECHANISM is not verifying a BUG; a valid proof from an unreachable premise is
+indistinguishable from a confirmed defect until someone tests the premise.
+
+Two earlier attempts to test this were themselves worthless and are recorded so the pattern
+is visible: the first used a 1400x1400 RANDOM NOISE image, whose correct description
+("featureless") is identical to its corrupted one — zero discriminating power; the second
+swept padding blindly and reported silence, which cannot distinguish "fixed" from "not
+reachable" from "missed the target". Only the calibrated version, which prints the
+CONDITION (`boundary_inside_image`) alongside the result, produced an interpretable answer.
+
+### Orphaned generation state: fix stands, trigger is RARER than estimated
+
+The abort test did not orphan anything: a client timeout does not abort a non-streaming
+request, so the generation completed server-side and cleaned up normally. No `[GenState]`
+warning, and the subsequent image-understanding requests were correct — but that validates
+nothing about the prune. Orphaning needs genuine preemption/eviction or an explicit abort.
+The fix is code-verified and cheap, and is insurance against a rare event rather than a
+live wound. Left UNEXERCISED deliberately rather than manufacturing a preemption for it.

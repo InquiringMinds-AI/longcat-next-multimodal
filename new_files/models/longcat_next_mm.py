@@ -1699,14 +1699,15 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 adj_start = base + rel_start
                 adj_end = adj_start + n_tokens
                 if adj_end > input_embeds.shape[0]:
-                    # The extend window ends inside this media item — chunked prefill put
-                    # a chunk boundary mid-item. The remainder is NOT written on the next
-                    # chunk either: there this item's rel_start goes negative and the whole
-                    # item is skipped as cached. So part of the media never reaches the
-                    # model. Zero the uncovered tail so the result is at least DETERMINISTIC
-                    # rather than whatever embed_tokens returned for a clamped pad id, and
-                    # say so loudly — a silently half-embedded image is exactly the kind of
-                    # plausible-looking corruption this project keeps getting burned by.
+                    # CANARY, not a known bug. The arithmetic here would lose the tail of
+                    # a media item bisected by a chunked-prefill boundary (the remainder is
+                    # skipped as cached on the next chunk). That deduction is sound, but the
+                    # ANTECEDENT was tested on 2026-08-10 and does not hold: with
+                    # chunked_prefill_size=8192, five calibrated requests that placed the
+                    # boundary a verified 15%-85% THROUGH a 2512-token image span all
+                    # described the image correctly and this branch never fired. sglang keeps
+                    # media items whole across chunks. Kept as a cheap canary in case that
+                    # ever changes; if it fires, the cross-chunk case is real after all.
                     dropped = adj_end - input_embeds.shape[0]
                     logger.warning(
                         "[MM] media item truncated by the extend window: %d of %d tokens "
