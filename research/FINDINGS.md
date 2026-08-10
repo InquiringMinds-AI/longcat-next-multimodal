@@ -1104,3 +1104,49 @@ BLIND labelling — stats deliberately withheld so the labels are not anchored b
 numbers hoped to be predictive. Stats are recorded and will be compared after. This is
 the labelled set that every candidate metric must be tested against BEFORE use, per the
 four-instrument lesson above.
+
+### ROOT-CAUSE CANDIDATE: the end-of-audio token is SAMPLED, and rep-penalty targets held sounds
+
+Owner, on the truncated render (2026-08-10): *"systems ends abruptly at the end of the
+audiofile, truncating the sibilance of the ending s, there is no space for it so shatter
+or have jack shit"*.
+
+That refutes the "present but shattered" hypothesis outright — the WAVEFORM ends
+mid-fricative, so there is no audio for "nominal" to be shattered into. It also INVERTS
+the reading of `trail_ms`: a complete render ends with some trailing silence, while one
+cut off mid-word has no room for any. Low `trail_ms` is the TRUNCATION signature, not the
+clean result it was recorded as. Both adjudicated clips fit (truncated 80ms, complete
+300ms), and it explains the earlier duration anti-correlation: `a_110903` is long AND
+truncated — bloated by two 1.2s internal silences, then cut before finishing.
+
+**Not the safety cap.** `longcat_next_mm.py:53` sets `max_audio_steps = 1000` (~40s);
+these renders use ~60-140 steps. Ruled out.
+
+**The mechanism, from the code.** Level-0 acoustic tokens are drawn with
+`torch.multinomial` (`_generate_audio_codebook_step`, ~line 912-936) under
+`AUDIO_GEN_TEMPERATURE=0.5`, `TOP_K=5`, `TOP_P=0.85`, `REPETITION_PENALTY=1.3`. The
+end-of-audio token is `codebook_sizes[0]` (8192) and sits in that SAME distribution, with
+no minimum-length guard. If it enters the top-5 at any step it can be drawn mid-word.
+This explains the abrupt cut, the absent trailing silence, and the variability across
+identical input (it is stochastic), and it covers BOTH signs of the defect: sampled early
+-> truncation; not sampled when due -> run-on silence and a stray "um?".
+
+**Why a fricative specifically.** `AUDIO_GEN_REPETITION_PENALTY=1.3` is applied to level-0
+codebook tokens. A sustained sound — a held /s/, a long vowel, silence — IS a repeated
+token, so the penalty suppresses exactly the tokens that CONTINUE the sound, raising
+everything else relative to it including the end token. Repetition penalty is a text-
+decoding heuristic where repeats signal degeneracy; in an acoustic codebook a repeat is
+just a held sound. Predicts truncation should concentrate on sustained sounds, which is
+where the owner heard it.
+
+**Both testable with NO code change** — all four are env vars read at module import, so a
+container restart suffices (no rebuild):
+  * `AUDIO_GEN_REPETITION_PENALTY=1.0` — does truncation stop when held sounds are not penalized?
+  * `AUDIO_GEN_TOP_K=1` — does it stop when the end token must be the argmax?
+
+**Sequencing (owner's paired-comparison rule):** 8 baseline renders are already with the
+owner for BLIND labelling. Those labels are the control arm; the variant arm is generated
+only after, and judged the same blind way. A predicted split was recorded BEFORE the
+labels arrive, from `trail_ms` alone: truncated = adj_04 (60), adj_05 (60), adj_03 (100);
+complete = adj_08 (160), adj_01 (200), adj_07 (200), adj_06 (540), adj_02 (600). The
+100/160 boundary is thin; the extremes are the real test.
