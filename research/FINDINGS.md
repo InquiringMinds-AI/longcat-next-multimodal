@@ -1489,3 +1489,40 @@ The general form, worth carrying beyond this project: *a metric that is missing,
 never fires, and a bug that is absent all produce identical output.* Any harness that cannot
 distinguish those three states will eventually report the wrong one, and it will do so in the
 direction that looks like success.
+
+### TWO TTS defects, not one — and the end-gate may be converting one into the other
+
+Owner adjudication of four clips from the end-gate build, with predictions stated in advance
+(2026-08-10):
+
+| clip | end_jump | predicted | owner |
+|---|---|---|---|
+| gate_15 | 0.195 | defective | defective — "nonsense at the end" |
+| gate_05 | 0.191 | defective | defective — "nonsense at the end" |
+| gate_08 | 0.000 | clean | clean |
+| gate_07 | 0.032 | clean | **THE WORST** — *"self test. oooOoOoOooo.. nomina"* |
+
+**`end_jump` is a PARTIAL metric.** It detects a terminal discontinuity and is blind to
+mid-utterance garble: the ending of gate_07 is clean while its middle is a sustained vowel
+smear, and it also truncates ("nomina"). Two defect populations:
+
+1. terminal click/cut — `end_jump` catches it, validated twice more here;
+2. mid-utterance babble — invisible to `end_jump`, and audibly the worse of the two.
+
+The metric is not retired: it has now made three correct calls on data it was not fitted to.
+But its coverage claim is retracted — it detects ONE failure mode, not "the TTS defect".
+
+**The gate is now suspect, and this is the important part.** "oooOoOoOooo" is a sustained
+repeated acoustic token — precisely what AUDIO_GEN_REPETITION_PENALTY exists to suppress. The
+argmax gate makes ending HARDER: when the model wants to stop and the gate refuses because the
+end flag was not the argmax, the model must emit something, and filler is what it emits.
+
+So the observed 4/16 -> 2/16 improvement may be a CONVERSION rather than a fix: type-1 clicks
+turned into type-2 babble, with only type 1 measured. That would also explain why the click
+count halved while the audible defect rate did not (15, 05 AND 07 are all defective on the
+gate build = at least 3/16 by ear, of which end_jump saw 2).
+
+**Consequence for method:** the matched n=32 run in flight cannot settle this — it measures
+end_jump only, and saves only flagged clips, so it is structurally incapable of observing the
+defect that matters most. Needed instead: matched gate-ON/gate-OFF sets with ALL clips
+retained, shuffled and blind-labelled by ear. Do not ship the gate on the end_jump numbers.
