@@ -1287,3 +1287,51 @@ nobody had guessed.
 
 Re-running any affected comparison is cheap now that the fix is in; none is currently
 load-bearing for an open decision, so this is recorded rather than actioned.
+
+## Batched prefill corrupts concurrent multimodal requests (2026-08-10) — PARTIALLY FIXED
+
+Investigated at the owner's direction after a deferred note about offsets being used as
+direct indices into the batch-flattened tensor.
+
+**It is a real, active bug, not a latent risk.** `_get_mm_items` flattened every request's
+items into one list, discarding which request each came from; `_replace_mm_embeddings`
+then used request-relative offsets as direct indices into the batch-flattened EXTEND
+region, reading `extend_prefix_lens_cpu[0]` — the FIRST request's prefix — for every item
+and adding no per-request base at all.
+
+With ONE request in flight the base is 0 and index 0 is the right request, so the buggy
+and correct code agree exactly. **Every test in this project issues one request at a time,
+so the bug is invisible to the suite by construction.** A server whose entire value is
+serving many clients had only ever been tested serving one.
+
+**Measured, identical images and prompts, only batching differing:** sequential 3/3,
+concurrent 1/3, with the damaged requests collapsing to a one-token reply.
+
+**Fix applied** (`f05d5e9`): items carry their request index; the scatter subtracts that
+request's own prefix and adds its start within the flattened batch. The hashed-pad
+remapping was also switched from offset arithmetic to matching on `pad_value`, which is
+globally unique now that it is content-derived and so needs no position arithmetic at all.
+
+**Result: improved but NOT resolved.** Post-fix, sequential 6/6 and concurrent 4/6 — the
+failure went from systematic to intermittent (round 1 concurrent 3/3, round 2 concurrent
+1/3). Batch composition varies run to run (`#new-seq: 2 ... #running-req: 1` — three
+requests fired, two batched), which fits an intermittent presentation.
+
+**Do not read the improvement as a fix.** The residual failure text is the lead:
+`'Aplain the design principles behind this image and why it might be effective.'` — a
+coherent continuation of a DIFFERENT prompt, i.e. the model holds an image and answers a
+question nobody asked. That is context bleeding between batched sequences, not scrambled
+embeddings, which points away from the offsets and toward per-request state elsewhere.
+`LCN_NGRAM=1` is on and the n-gram embedding manager carries per-request history; an
+`LCN_NGRAM=0` arm is in flight to isolate it.
+
+**Method note — a probe that exonerated the bug it was built to find.** The first
+concurrency probe ran CONCURRENT then SEQUENTIAL over the same images and prompt. The
+concurrent round corrupted the answers and CACHED them; the sequential "control" replayed
+the cache. Both arms scored 2/6, which by the probe's own stated criterion means
+"concurrency is innocent" — and that reading was reported before the confound was caught.
+Reversing the order only moves the confound (a correct cache makes the concurrent arm a
+pure cache hit that never prefills). `test/probe_mm_concurrency.py` now gives each arm its
+own cold image variant per round; variants resize the shape rather than recolour it, since
+a re-tinted "red" is arguably orange and would fail the colour check, making a false BAD
+indistinguishable from real corruption.
