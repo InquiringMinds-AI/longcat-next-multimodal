@@ -1256,3 +1256,30 @@ without a GPU, so this specific regression can never again require a server to d
 **Incidental TTS signal** (unlabelled, consistent-with only): 3 of 4 renders in this battery
 had `trail_ms=0` at cps 6.4/6.5/7.9 — slow renders with no trailing silence, the predicted
 truncation signature. The owner's blind labels on the 8 adjudication clips remain the gate.
+
+### ⚠ Retroactive caveat: past conclusions drawn from server-side transcription are suspect
+
+The cache collision was present for the whole campaign, not just today. Any earlier finding
+that used THIS SERVER to transcribe or describe media — especially batches issued
+back-to-back with an identical prompt, which is the worst case — may have been reading a
+different file than the one submitted.
+
+Known to be affected in kind (flagged, not re-litigated here):
+* The 2026-07-31 v0.5.12-vs-v0.5.16 TTS comparison recorded in ROADMAP §1: *"v512 clips run
+  2.2-3.4s and their transcripts STOP AT THE FIRST CLAUSE; v516 clips run 5.1-7.3s and
+  speak further."* Those transcripts came from this path. Note the phenomenon described —
+  clause truncation, and "every v512 clip SKIPS the word 'Self' entirely" — is the SAME
+  content-loss defect re-derived today from the acoustic sampler, so the conclusion may
+  well survive; but the EVIDENCE for it is no longer sound, and the two must not be
+  confused.
+* Today's `tts_roundtrip` run (already marked discredited above, for what turns out to be
+  the wrong reason — the transcriber was not biased, it was reading other files).
+
+What is NOT affected: anything adjudicated by the owner's own eyes and ears, anything
+measured from the waveform or pixels directly (`media_stats`, segment structure), and the
+code-level findings. This is precisely why the standing rule puts owner labels above
+model-generated judgments — the rule held here even though the reason it held was one
+nobody had guessed.
+
+Re-running any affected comparison is cheap now that the fix is in; none is currently
+load-bearing for an open decision, so this is recorded rather than actioned.
