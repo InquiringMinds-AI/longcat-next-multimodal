@@ -662,3 +662,41 @@ is supposed to fix —
 
 Count and color-binding are the classic guidance-sensitive cases, so a real effect
 should be most visible there. Same build, same env-var-only arm switch.
+
+### CFG VERDICT: worse at the configured scale — kept wired, default OFF
+
+Owner judgment on the four paired prompts (2026-08-10), CFG on vs off, same build,
+arms differing only by `IMAGE_GEN_CFG_SCALE` 3.0 vs 1.0:
+
+| prompt | probes | preferred |
+|---|---|---|
+| blue mug next to a green book | colour binding | **CFG OFF** |
+| three oranges in a white bowl | count | **CFG OFF** |
+| black cat under a wooden chair | containment | **CFG OFF** |
+| red apple left of a yellow banana | spatial relation | ambiguous — he flagged the OFF banana's shape as "really bizarre" but did not call the ON image better overall |
+
+Verdict: **"I like the second image of each pair better"** — the OFF arm, on all
+three of the cleanly-judged prompts.
+
+So classifier-free guidance at the checkpoint's own configured scale makes output
+WORSE by the only instrument that counts here. The accidental behaviour this
+project has always shipped (CFG never wired, therefore never active) turns out to
+have been the better setting.
+
+**Resolution:** keep the wiring — it fixes a genuine bug, and a never-called method
+whose docstring claims it is called is a trap for the next reader — but gate it
+behind `LCN_CFG=1`, DEFAULT OFF. That reproduces exactly the behaviour every
+validated image in this project was generated with, while making the feature
+reachable for experiments. Cost when enabled: ~1.24x slower image generation plus a
+full second KV sequence per in-flight image.
+
+**Not concluded:** that CFG is useless here. Only scale 3.0 was tested, and the
+early evidence was mixed rather than uniform (the one prompt where the OFF sample
+drew a complaint was the spatial-relation one). A gentler scale (1.5-2.0) is
+untested and is the obvious next experiment if image quality is ever revisited —
+the harness now exists, and an arm is one env var.
+
+⚠ Also untested: memory headroom with CFG active under CONCURRENCY. It allocates a
+second KV sequence per in-flight image and was only ever exercised single-request.
+Anyone enabling it on this box (which hard-powers-off past ~110-115GB) must
+re-measure first.

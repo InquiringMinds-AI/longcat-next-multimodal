@@ -169,7 +169,7 @@
              return
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -509,6 +509,25 @@
+@@ -509,6 +509,38 @@
              max_running_requests=self.max_running_requests,
              device=self.device,
          )
@@ -189,6 +189,19 @@
 +        req_to_token_pool / token_to_kv_pool_allocator / attn_backend lazily at
 +        generation time. Set IMAGE_GEN_CFG_SCALE=1.0 to disable CFG.
 +        """
++        import os
++
++        if os.environ.get("LCN_CFG", "0").strip() != "1":
++            # OFF BY DEFAULT on evidence, not oversight. Wiring this reference
++            # is what activates classifier-free guidance, and CFG at the
++            # checkpoint's configured scale (IMAGE_GEN_CFG_SCALE=3.0) was judged
++            # WORSE by the owner's eye on 3 of 4 paired prompts (colour binding,
++            # count, containment) -- see research/FINDINGS.md. Leaving it
++            # unwired reproduces the behaviour every validated image in this
++            # project was generated with. LCN_CFG=1 enables it for experiments
++            # (e.g. sweeping a gentler scale); expect ~1.24x slower image
++            # generation and a second KV sequence per in-flight image.
++            return
 +        _setup = getattr(self.model, "_setup_kv_pool_refs", None)
 +        if _setup is not None:
 +            _setup(self)
