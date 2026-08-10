@@ -9,6 +9,7 @@ with temporal grid_thw = (num_frames, H, W).
 
 import base64
 import io
+import os
 import logging
 import tempfile
 from typing import List, Union
@@ -215,8 +216,16 @@ class LongcatNextProcessor(BaseMultimodalProcessor):
             import decord
             from PIL import Image
 
-            DESIRED_FPS = 2   # sample 2 frames/sec
-            MAX_FRAMES = 64   # cap
+            # 64 frames at 2fps covers 32 seconds. Beyond that the budget is spent by
+            # STRETCHING the sampling interval over the whole video rather than by
+            # truncating: a 5-minute clip previously became "the first 32 seconds", and
+            # the model answered confidently about a fraction of what was sent, with no
+            # signal to the caller that the rest existed. Coarser coverage of everything
+            # beats fine coverage of the opening and silence about the remainder.
+            # The frame COUNT is what costs visual tokens and memory, so it is unchanged
+            # and this is free; both are env-tunable for callers who want to spend more.
+            DESIRED_FPS = float(os.environ.get('LCN_VIDEO_FPS', '2'))
+            MAX_FRAMES = int(os.environ.get('LCN_VIDEO_MAX_FRAMES', '64'))
 
             # Resolve input to a local file path decord can open.
             tmp_path = None
@@ -232,7 +241,7 @@ class LongcatNextProcessor(BaseMultimodalProcessor):
                 path = video_data  # plain filesystem path
                 vid_bytes = None
             if vid_bytes is not None:
-                import tempfile, os
+                import tempfile
                 fd, tmp_path = tempfile.mkstemp(suffix='.mp4'); os.close(fd)
                 with open(tmp_path, 'wb') as f:
                     f.write(vid_bytes)
@@ -241,17 +250,34 @@ class LongcatNextProcessor(BaseMultimodalProcessor):
             vr = decord.VideoReader(path)
             total = len(vr)
             fps = float(vr.get_avg_fps() or 30.0)
-            step = max(1, int(round(fps / DESIRED_FPS)))
-            idx = list(range(0, total, step))[:MAX_FRAMES]
+            step = max(1, int(round(fps / max(DESIRED_FPS, 1e-6))))
+            idx = list(range(0, total, step))
+            truncated_from = None
+            if len(idx) > MAX_FRAMES:
+                # Spread MAX_FRAMES evenly across the ENTIRE video instead of keeping the
+                # first MAX_FRAMES. dict.fromkeys dedupes when rounding collides on very
+                # short videos, so the frame list stays strictly increasing.
+                truncated_from = len(idx)
+                span = total - 1
+                picks = [int(round(span * i / (MAX_FRAMES - 1))) for i in range(MAX_FRAMES)] \
+                    if MAX_FRAMES > 1 else [0]
+                idx = list(dict.fromkeys(picks))
             if not idx:
                 idx = [0]
             frames_np = vr.get_batch(idx).asnumpy()  # (N, H, W, C) uint8
             frames = [Image.fromarray(f) for f in frames_np]
-            logger.info(f"Video: {len(frames)} frames sampled (~{DESIRED_FPS}fps, "
-                       f"max {MAX_FRAMES}) from {total} total @ {fps:.1f}fps")
+            dur = total / fps if fps else 0.0
+            eff_fps = (len(frames) / dur) if dur > 0 else DESIRED_FPS
+            logger.info(
+                f"Video: {len(frames)} frames over the full {dur:.1f}s "
+                f"(effective {eff_fps:.2f}fps, requested {DESIRED_FPS}fps, cap {MAX_FRAMES}) "
+                f"from {total} frames @ {fps:.1f}fps"
+                + (f" — downsampled from {truncated_from} candidate frames; the whole "
+                   f"video is covered, at reduced temporal resolution"
+                   if truncated_from else ""))
             if tmp_path:
                 try:
-                    import os; os.remove(tmp_path)
+                    os.remove(tmp_path)
                 except OSError:
                     pass
             return frames
