@@ -878,6 +878,13 @@ Baseline for the A/B, same box, same build (`v0516-syncfix`):
       diffed; row logits vs batch-1 agree to ~4e-7 with matching argmax, and batch-COMPOSITION
       independence is exactly 0.00e+00. Still needs owner eyes on output, per the standing rule.
       Does NOTHING at n=1 — it is a concurrency optimization.
+- [ ] **Audio head batching is NOT the same change — do not copy the image one.** Assessed
+      2026-08-11 by reading `_generate_audio_codebook_step`: sampling there carries PER-REQUEST
+      state that the image path does not have. `prev_ids` (the last 50 frames) feeds a
+      repetition penalty via `_sample_codebook_logits(logits, level, prev_ids)`, frame counts
+      differ per request so a batched `prev_ids` needs padding/masking, and `next_token_ids`
+      is allocated `torch.zeros(1, num_codebooks)`. Real correctness risk, and TTS's bigger
+      usability win is streaming (Tier 3) rather than concurrent throughput.
 - [ ] Lower priority than it looks: KV-cache the head across levels. Saves O(depth^2) recompute
       but not weight reads; if the head is bandwidth-bound this is nearly free of benefit.
 - Measured baseline: n=1 238.8s, n=2 422.9s (1.77x), n=4 796.9s (3.34x) — ~84% serial.
