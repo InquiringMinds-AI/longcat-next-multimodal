@@ -2048,3 +2048,46 @@ where tensors move.
 
 Three theories about this budget failed (eager overhead, head cost, CFG uncond forward). The
 profiler cost fifteen minutes and one grep of the endpoint signature.
+
+### Host syncs removed and VERIFIED — but op time is not critical-path time (2026-08-11)
+
+Three sync removals shipped: the visual codebook offset applied on device instead of via
+`.item()` (8 syncs/token), `_codebook_embed_fn` made branchless (`if mask.any()` forced a sync
+purely to evaluate a Python `if`; called 56x per generated token), and `_sdpa_varlen_fallback`
+reading `cu_seqlens` once with `tolist()` instead of per element.
+
+**Positive control passed — the fixes demonstrably took effect:**
+
+| op | before | after |
+|---|---|---|
+| `aten::item` | 340/step, 12.80 ms | **90.6/step, 0.86 ms** |
+| `aten::nonzero` | 200/step, 7.17 ms | **30.7/step, 1.14 ms** |
+| `aten::index_put_` | 161/step, 5.63 ms | **75.7/step, 1.57 ms** |
+
+**22 ms/step of host op time removed. Wall clock gained: 1.4 ms/step.**
+
+| measure | before | after |
+|---|---|---|
+| `step[DECODE bs=1]` mean | 115.5 ms | **114.1 ms** |
+| single image | 235.9 s | **231.0 s (-2.1%)** |
+
+**THE LESSON: op time is not critical-path time.** A profiler's CPU op totals can exceed wall
+clock because those ops run CONCURRENTLY with GPU work. The 340 syncs per step were real and
+their removal is verified, but the CPU was running ahead of the GPU, so deleting its work did
+not shorten the step. Predicted 12%, delivered 2%. The "36 ms GPU idle" gap identified in the
+first profile therefore has a cause OTHER than these syncs, and remains unexplained.
+
+Sixth refuted hypothesis of the campaign, and the first refuted AFTER shipping rather than
+before. The change is kept regardless: bit-identical (verified on GPU across five id
+distributions including the gap case and above-range ids), battery green on all three suites,
+and free.
+
+**Instrument error, mine:** I first reported a 228 ms step span by dividing the span total by an
+ASSUMED 25 steps. The trace held 50. Always count the spans; never divide by the number you
+requested. (`num_steps` is not the number of spans recorded.)
+
+**Also settled by measurement, not to be re-attempted:** the depth transformer's einsum does NOT
+copy its reshaped weight per call. The reshape is a genuine view (identical `data_ptr`) and
+einsum at 0.556 ms/call vs a precomputed-layout `bmm` at 0.547 ms is a 2% difference. 0.556 ms
+is 134 MB of FFN weight at the measured 220 GB/s — the head already runs at memory-bandwidth
+speed, so only FEWER BYTES (int8) or AMORTISATION (cross-request batching) can make it cheaper.
