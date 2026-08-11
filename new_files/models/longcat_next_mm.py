@@ -155,18 +155,6 @@ IMAGE_GEN_TEMPERATURE = _envf("IMAGE_GEN_TEMPERATURE", 0.5)
 IMAGE_GEN_TOP_K = _envi("IMAGE_GEN_TOP_K", 1024)
 IMAGE_GEN_TOP_P = _envf("IMAGE_GEN_TOP_P", 0.75)
 IMAGE_GEN_CFG_SCALE = _envf("IMAGE_GEN_CFG_SCALE", 3.0)  # Classifier-Free Guidance scale
-# Merge the CFG unconditional path into the MAIN backbone forward instead of running it as a
-# separate batch-1 call per request per step (_run_uncond_decode). Measured motivation: that
-# separate forward is a complete pass over the 75B-A3B backbone, and on this bandwidth-bound
-# box a forward's cost is dominated by reading weights rather than by batch width -- text
-# concurrency measured n=1 26.6 tok/s aggregate vs n=2 64.7 (2.43x), i.e. the second row rides
-# along nearly free. Merging should therefore save close to a whole backbone pass per frame,
-# with IDENTICAL math (same inputs, same KV, only the batching changes).
-#
-# Default OFF: this conditions image composition, so it ships only after a paired A/B on the
-# same prompts adjudicated by eye. The flag exists to make that comparison possible without a
-# rebuild between arms, and collapses to a default (flag deleted) once parity is confirmed.
-LCN_CFG_MERGE = os.environ.get("LCN_CFG_MERGE", "0").strip() == "1"
 AUDIO_GEN_WAVE_OVERLAP = 1200
 
 
@@ -332,9 +320,6 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         # (kind, req_pool_idx) -> consecutive decode steps absent from the batch.
         # Backs the orphaned-generation-state prune in forward(); see the note there.
         self._gen_state_absent: Dict[tuple, int] = {}
-        # CFG-merge scratch: req_idx -> (predicted_kind, uncond_hidden) for THIS forward.
-        self._uncond_merged: Dict[int, tuple] = {}
-        self._uncond_merge_plan: list = []
         self._tokenizer = None  # lazy-loaded for diagnostic logging
 
         # --- Gen-trigger latch: sync-free steady-state text decode ---
@@ -497,148 +482,6 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         except Exception as e:
             logger.error(f"[ImageGen] Failed to allocate uncond KV: {e}", exc_info=True)
             return -1, None
-
-    # ---- CFG uncond merge (LCN_CFG_MERGE) ----------------------------------------
-    # The uncond row must be appended to the batch BEFORE the backbone runs, but which KIND
-    # of step this is (newline vs ordinary token) is decided AFTER, inside the state machine.
-    # It is deterministic from state carried out of the previous step, so it can be predicted
-    # -- but predicting it in a second place is how the two silently diverge and the uncond
-    # path starts conditioning on the wrong thing, which shows up as worse composition rather
-    # than as an error. So the decision lives HERE, once, and the state machine asserts that
-    # what it actually did matches what was predicted (see _uncond_merge_check).
-
-    def _uncond_merge_prepare(self, forward_batch, input_embeds, positions):
-        """Append one uncond row per CFG-active generating request to THIS forward.
-
-        Returns (input_embeds, positions, saved) where `saved` restores forward_batch, or
-        (input_embeds, positions, None) when nothing was appended. The caller MUST restore
-        before returning, because everything downstream (sampling, logits) expects the
-        original batch width.
-        """
-        # Any row left from the previous forward was predicted but never consumed -- the
-        # state machine took a branch that did not ask for it. Its hidden state is STALE and
-        # must never be handed to a later step, so clear first and say so: a recurring
-        # leftover means the prediction disagrees with the state machine somewhere.
-        if self._uncond_merged:
-            logger.error("[CFG-merge] %d uncond row(s) went unconsumed last forward (reqs %s) "
-                         "-- discarding as stale; recurring means a prediction bug",
-                         len(self._uncond_merged), sorted(self._uncond_merged))
-            self._uncond_merged.clear()
-        if not LCN_CFG_MERGE or not self._image_gen_states or input_embeds is None:
-            return input_embeds, positions, None
-        if self._model_runner is None:
-            return input_embeds, positions, None
-        rtp = self._model_runner.req_to_token_pool
-        alloc = self._model_runner.token_to_kv_pool_allocator
-        rows, locs, plan = [], [], []
-        live = forward_batch.req_pool_indices.tolist()
-        for bi, req_idx in enumerate(live):
-            state = self._image_gen_states.get(req_idx)
-            if state is None or not state.uncond_initialized or state.uncond_req_pool_idx < 0:
-                continue
-            kind = self._uncond_step_kind(state)
-            if kind is None:
-                continue
-            loc = alloc.alloc(1)
-            if loc is None:      # out of KV: fall back to the separate forward for this req
-                continue
-            rtp.req_to_token[state.uncond_req_pool_idx, state.uncond_seq_len] = loc
-            rows.append(self._uncond_embed(state, kind, input_embeds.device).reshape(1, -1))
-            locs.append(loc)
-            plan.append((req_idx, state, kind, forward_batch.positions[bi].item()))
-        if not rows:
-            return input_embeds, positions, None
-
-        saved = {k: getattr(forward_batch, k) for k in
-                 ("batch_size", "req_pool_indices", "seq_lens", "seq_lens_sum",
-                  "positions", "out_cache_loc")}
-        n = len(rows)
-        dev = forward_batch.req_pool_indices.device
-        extra_pool = torch.tensor([st.uncond_req_pool_idx for _, st, _, _ in plan], device=dev)
-        extra_lens = torch.tensor([st.uncond_seq_len + 1 for _, st, _, _ in plan],
-                                  dtype=forward_batch.seq_lens.dtype, device=forward_batch.seq_lens.device)
-        extra_pos = torch.tensor([p for _, _, _, p in plan], device=forward_batch.positions.device)
-        forward_batch.batch_size = saved["batch_size"] + n
-        forward_batch.req_pool_indices = torch.cat([saved["req_pool_indices"], extra_pool])
-        forward_batch.seq_lens = torch.cat([saved["seq_lens"], extra_lens])
-        forward_batch.seq_lens_sum = int(saved["seq_lens_sum"]) + int(extra_lens.sum().item())
-        forward_batch.positions = torch.cat([saved["positions"], extra_pos])
-        forward_batch.out_cache_loc = torch.cat(
-            [saved["out_cache_loc"], torch.cat([l.reshape(-1) for l in locs]).to(saved["out_cache_loc"].device)])
-        # Attention metadata must describe the WIDENED batch. _run_uncond_decode already
-        # re-inits the shared backend mid-forward for its own batch, so this is the same
-        # established pattern rather than a new liberty.
-        self._model_runner.attn_backend.init_forward_metadata(forward_batch)
-        input_embeds = torch.cat([input_embeds, torch.cat(rows, dim=0).to(input_embeds.dtype)], dim=0)
-        positions = forward_batch.positions
-        self._uncond_merge_plan = plan
-        return input_embeds, positions, saved
-
-    def _uncond_merge_finish(self, forward_batch, hidden_states, saved):
-        """Split the uncond rows off, stash them per request, restore the batch width."""
-        plan = getattr(self, "_uncond_merge_plan", None) or []
-        n = len(plan)
-        if saved is None or n == 0:
-            return hidden_states
-        cond_rows = hidden_states.shape[0] - n
-        for k, (req_idx, state, kind, _pos) in enumerate(plan):
-            self._uncond_merged[req_idx] = (kind, hidden_states[cond_rows + k:cond_rows + k + 1])
-            state.uncond_seq_len += 1     # the merged row advanced the uncond cache
-        for k, v in saved.items():
-            setattr(forward_batch, k, v)
-        self._uncond_merge_plan = []
-        return hidden_states[:cond_rows]
-
-    def _uncond_step_kind(self, state: ImageGenState) -> Optional[str]:
-        """'newline' | 'token' | None -- what the uncond path will need this step.
-
-        Mirrors the state machine's own branch order: image_end consumes the step without an
-        uncond forward, newline runs one with the newline embedding, otherwise it is an
-        ordinary token step."""
-        if state.is_img_end:
-            return None
-        if state.is_img_newline:
-            return "newline"
-        return "token"
-
-    def _uncond_embed(self, state: ImageGenState, kind: str, device) -> torch.Tensor:
-        """The uncond input embedding for this step -- byte-identical to the embedding
-        _run_uncond_decode builds, so the merged path is the same computation."""
-        if kind == "newline":
-            newline_id = torch.tensor([self._image_newline_id], device=device)
-            if self.model.use_ngram_embedding:
-                return self.model.embed_tokens.word_embeder(newline_id)
-            return self.model.embed_tokens(newline_id)
-        # CFG differs from the conditional path only in the TEXT prompt, never in the
-        # autoregressive history, so the uncond row feeds back the same generated codebook
-        # tokens the cond row does.
-        if len(state.accumulated_ids) > 0:
-            _pv = state.accumulated_ids[-1].unsqueeze(0).to(device)
-            return self.visual_tokenizer.visual_embedding_layer(
-                self._embed_multimodal_ids(_pv)).to(torch.bfloat16).reshape(1, -1)
-        return torch.zeros(1, self.config.hidden_size, dtype=torch.bfloat16, device=device)
-
-    def _uncond_merge_check(self, req_idx: int, actual_kind: Optional[str]) -> Optional[torch.Tensor]:
-        """Hand back the pre-computed uncond hidden state for this request, but ONLY if the
-        step the state machine actually took matches the one predicted before the forward.
-
-        On mismatch the prediction was wrong: the row that rode along conditioned on the wrong
-        embedding and its KV write is already committed, so the safe move is to discard it,
-        say so loudly, and let the caller fall back to a separate forward. Silent divergence
-        here is invisible in every automated check and only shows up as degraded composition."""
-        entry = self._uncond_merged.pop(req_idx, None)
-        if entry is None:
-            return None
-        predicted, hidden = entry
-        if predicted != actual_kind:
-            logger.error(
-                "[CFG-merge] prediction mismatch for req %d: predicted %r, state machine took "
-                "%r. Discarding the merged uncond row and falling back to a separate forward. "
-                "The merged row's KV write is already committed, so this step's uncond cache "
-                "is advanced -- treat repeated occurrences as a correctness bug, not noise.",
-                req_idx, predicted, actual_kind)
-            return None
-        return hidden
 
     def _run_uncond_decode(self, state: ImageGenState, position: int,
                           forward_batch, is_newline: bool = False) -> Optional[torch.Tensor]:
@@ -1594,34 +1437,16 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 _fb = self._embed_multimodal_ids(_pv)
                 input_embeds[_fi] = _fb.to(input_embeds.dtype).reshape(-1)
 
-        # CFG uncond rows ride along in THIS forward rather than paying a second batch-1
-        # backbone pass per request per step. Restored immediately after the split, since
-        # everything downstream expects the original batch width.
-        _uc_saved = None
-        if is_decode:
-            input_embeds, positions, _uc_saved = self._uncond_merge_prepare(
-                forward_batch, input_embeds, positions)
-        try:
-            if input_embeds is not None:
-                hidden_states = self.model(
-                    input_ids=None, positions=positions,
-                    forward_batch=forward_batch, input_embeds=input_embeds,
-                )
-            else:
-                hidden_states = self.model(
-                    input_ids=input_ids, positions=positions,
-                    forward_batch=forward_batch,
-                )
-        finally:
-            if _uc_saved is not None and not self.capture_aux_hidden_states:
-                hidden_states = self._uncond_merge_finish(forward_batch, hidden_states, _uc_saved)
-            elif _uc_saved is not None:
-                # aux capture returns a tuple; restore the batch and skip the merge rather
-                # than guess at the tuple layout.
-                for _k, _v in _uc_saved.items():
-                    setattr(forward_batch, _k, _v)
-                self._uncond_merge_plan = []
-                self._uncond_merged.clear()
+        if input_embeds is not None:
+            hidden_states = self.model(
+                input_ids=None, positions=positions,
+                forward_batch=forward_batch, input_embeds=input_embeds,
+            )
+        else:
+            hidden_states = self.model(
+                input_ids=input_ids, positions=positions,
+                forward_batch=forward_batch,
+            )
 
         # Handle aux_hidden_states from layer capture
         aux_hidden_states = None
@@ -2167,11 +1992,8 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 if state.is_img_newline:
                     # Run uncond forward for newline too (to keep KV caches in sync)
                     if state.uncond_initialized:
-                        # The newline uncond forward exists only to keep the uncond KV in
-                        # step with the cond path; its hidden state is unused.
-                        if self._uncond_merge_check(req_idx, "newline") is None:
-                            pos = forward_batch.positions[i].item()
-                            self._run_uncond_decode(state, pos, forward_batch, is_newline=True)
+                        pos = forward_batch.positions[i].item()
+                        self._run_uncond_decode(state, pos, forward_batch, is_newline=True)
                     overrides[i] = self._image_newline_id
                     state.current_image_token_num += 1
                     if state.current_image_token_num % (state.token_w + 1) == 0:
@@ -2234,9 +2056,7 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                     # uncond state — a decode step here would double-process it.
                     uncond_hs = first_uncond_hs
                 else:
-                    uncond_hs = self._uncond_merge_check(req_idx, "token")
-                    if uncond_hs is None:
-                        uncond_hs = self._run_uncond_decode(state, position, forward_batch)
+                    uncond_hs = self._run_uncond_decode(state, position, forward_batch)
 
         visual_ids = self._generate_image_codebook_step(cond_hs, uncond_hs, state)
         state.accumulated_ids.append(visual_ids)

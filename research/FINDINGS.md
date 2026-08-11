@@ -594,9 +594,12 @@ zero `uncond` lines of any kind, with NGRAM on AND with NGRAM off (the
 shipped-equivalent path) — while other `[ImageGen]` lines from the same logger
 appear normally.
 
-Every image this project has ever generated has therefore been UNGUIDED. This is
-a live quality question on the flagship's headline capability, and it is a wiring
-bug, not a tuning choice.
+Every image this project has ever generated has therefore been UNGUIDED.
+
+**RESOLVED 2026-08-11 — do not reopen.** The owner reports having tried CFG earlier and seeing
+*"no apparent improvements"*. So the wiring bug is real but NOT worth fixing: guidance buys
+nothing visible on this checkpoint, and enabling it would add a full backbone forward per
+generation step for no benefit. The open quality question above is closed by that verdict.
 
 **Cost of enabling it, so the tradeoff is judged on evidence:** the unconditional
 path is a full second KV sequence (~1405 slots for a 37x37 image — the pool
@@ -1970,3 +1973,32 @@ by n=4, so this supports merging cond+uncond, not unbounded batching.
 Note the method: reading `_image_gen_token_step` to size a DIFFERENT optimization (head batching)
 is what surfaced this. The frame budget was closed by reading the call path, not by profiling —
 after two theories about it had already failed.
+
+
+### I optimized a code path that never executes — and the answer was already in this file
+
+The CFG unconditional forward described in the frame-budget entry above **does not run**. Zero
+`CFG initialized` lines in the logs of both arms; `_setup_kv_pool_refs` is never called, so
+`self._model_runner` stays None and every CFG gate is permanently False.
+
+That was documented in THIS document on 2026-08-09, under the heading "CFG has never run:
+`_setup_kv_pool_refs` is defined but never called". I listed that heading in a grep of this
+file's structure earlier the same day and did not read it. I then re-derived the uncond forward
+by reading the model code, treated it as the missing frame-budget term, verified a premise
+UNDERNEATH it (does batching cost extra on an MoE? — real, and irrelevant), and implemented a
+merge for a path that cannot execute.
+
+Measured proof it never engaged: single-image 235.9s with the flag off, 235.2s with it on. The
+four-concurrent figure of 793.2s against an earlier 898.6s is build-to-build variance, not the
+change — those were never matched arms and should not be read as a gain.
+
+**The lesson is specific, and it is not the same as the day's other refutations.** Those came
+from premises with no cheap check available. This one had a written answer in the repo. I
+verified the premise I had chosen to doubt and never verified the one beneath it: *does this
+code path execute at all?* A positive control on the FEATURE rather than on the optimization —
+one grep for `CFG initialized` — would have cost seconds and prevented the entire build.
+
+Standing consequences: the merge is REVERTED (it optimizes a forward that will never happen,
+and a knob that does nothing invites a future session to switch it on); CFG stays unwired per
+the owner's verdict above; and **the ~120ms/frame of the generation budget is once again
+unexplained** — three theories have now failed, so the next step is a profiler, not a fourth.
