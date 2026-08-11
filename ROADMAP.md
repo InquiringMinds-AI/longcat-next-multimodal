@@ -889,9 +889,12 @@ Baseline for the A/B, same box, same build (`v0516-syncfix`):
       `test/test_codebook_batching.py` (5/7 broken → 7/7 fixed, offline/CPU/deterministic).
       Isolated with `LCN_HEAD_BATCH=0`, which forces the per-request path in the same build:
       taxi request returned a barn with batching ON, a taxi with it OFF.
-      **Speed, same build, flag off vs on: 414 s → 327 s (−21%) for 2 concurrent images.**
-      Re-validation of the FIXED build is the open item — no number here is trustworthy until
-      the paired output has been looked at again.
+      **DONE — final, shipping config (batching default-on, diagnostics off): 414 s → 346 s
+      (−16.4%)** for 2 concurrent images. Output correct (taxi request returns a taxi); owner
+      verdict on the fixed pair: "looks good". Battery green on the shipping build (codebook
+      batching 7/7, head batching 40/40, tool parsing, audio-chat 8/8, stream util 5/5,
+      selftest 7/7, anthropic 6/6, degeneracy 6/6). The broken build's 327 s is void — its
+      fused sampling ran one row instead of two, i.e. it did less work.
 - [ ] **Audio head batching is NOT the same change — do not copy the image one.** Assessed
       2026-08-11 by reading `_generate_audio_codebook_step`: sampling there carries PER-REQUEST
       state that the image path does not have. `prev_ids` (the last 50 frames) feeds a
