@@ -1846,3 +1846,30 @@ that holds, the dominant cost of image generation is not the heads at all — it
 overhead across 1369 sequential decode steps, and int8 heads would be a sideshow next to making
 generation graph-compatible. Explicitly a hypothesis; the deciding measurement is text
 throughput with `LCN_CUDAGRAPH=0` versus the current build, warm on both arms.
+
+### Owner eyes-on: no regression from the nine fixes (2026-08-10)
+
+Four concurrent requests on `v0516-fixes8` ("a cow", "an airplane", "a cafe", "a mural on a
+brick wall"), 898.6s wall clock, four distinct outputs. Owner verdict: *"these images all have
+issues, except the mural on the brick wall, which is smaller than I think of murals, but
+technically correct. However, they're pretty in keeping with previous achievements in image
+generation with this model."*
+
+**That is the validation the generation-path changes needed.** The bar was never image quality —
+it was whether today's nine fixes degraded output. "In keeping with previous achievements" says
+they did not, and the failure modes are the model's established compositional limits at this
+quant, not serving defects. Distinctness matters independently: the prefix-cache collision and
+the spec-decode stride bug both produced cross-contaminated or duplicated output under exactly
+this four-concurrent shape, and four distinct images is what those bugs cannot produce.
+
+Combined with the owner-adjudicated 12-clip TTS set earlier, both generation paths now have
+human sign-off on this build. The one change still lacking end-to-end validation is the stream
+ERROR path: backend failures no longer become empty 200s by construction and by offline stub
+test, but a real SGLang error has never been induced to watch it surface.
+
+**Consequence for the int8 head work, and it cuts against it.** Images already "have issues" at
+BF16 heads. Quantization spends output quality to buy bandwidth, and there is less headroom
+above "usable" here than a clean baseline would give. This raises the value of the de-risked
+variant — quantize only the transformer layers (81–87% of the bytes) and keep the per-level
+output projections at BF16 — and makes the paired A/B on identical prompts mandatory rather
+than nice to have. A ~15% latency gain is not worth dropping below usable.
