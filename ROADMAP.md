@@ -816,6 +816,27 @@ optimizations that trade modalities for speed:
       Either path touches model loading on a production master and needs a rebuild plus
       the full battery. Cost is real; the deadline is a hypothetical future bump.
 
+## 6b. Known limitations left UNFIXED on purpose (audited 2026-08-10)
+
+Both were confirmed real by code reading. Neither is implemented, because the obvious fix
+would be a half-fix that hides the problem rather than solving it. Recorded here so a later
+session does not "discover" them and ship the shallow version.
+
+- **No cancellation when a client disconnects.** An abandoned request keeps generating to
+  completion. Verified: the request holds one of the four `_gen_slots` for its full duration.
+  Note what this is NOT — the slot is always released eventually (`async with`), so this wastes
+  compute, it does not leak. The reason it is not fixed: cancelling only the gateway side
+  ORPHANS the backend work, which is the expensive half. A real fix needs SGLang's
+  `/abort_request` wired to the disconnect, plus the request id tracked per generation. That is
+  a genuine feature, not a patch, and on a single-user box the waste is bounded by the 4-slot
+  cap. Worth doing if this ever serves more than one person.
+- **Blocking file I/O inside async handlers.** The audio path base64-decodes and writes clips
+  with plain `open()` in an `async def`. Real, and technically it stalls the event loop. Left
+  alone because the payloads are seconds of audio (tens to hundreds of KB) and the stall is
+  microseconds against multi-second generations — moving it to a thread pool would add
+  machinery to buy nothing measurable. Revisit if long-audio input is ever supported, where the
+  decode grows with clip length.
+
 ## 7. Final numbers + legibility (last — documents whatever the above produced)
 
 - [ ] Re-run the full bench suite on the final configuration; update README numbers
