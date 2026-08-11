@@ -1480,6 +1480,18 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         # Decay-based, mirroring the trigger latch below: a slot absent from the batch for
         # 64 consecutive decode steps is not coming back. The tolist() is a host sync, but
         # this runs only while generation state exists, and that path is already eager.
+        # Decay alone is NOT sufficient, and the gap is what matters most here: it clears a
+        # slot only while that slot is ABSENT from the batch. If the aborted request's slot is
+        # promptly recycled to ordinary traffic, the slot is present on every step, the absent
+        # counter resets every step, and the entry is never cleared. `lcn_gen_watch_active()`
+        # reads exactly these dicts, so a single aborted generation whose slot gets reused
+        # LATCHES the CUDA-graph and spec-decode veto ON for every request, permanently, until
+        # the server restarts — presenting only as "it got slow and stayed slow".
+        # So evict on IDENTITY as well: the state records the rid that created it, and a slot
+        # now serving a different rid is holding a corpse. rid-based eviction is immediate and
+        # needs no absence; the decay below remains for the case where the slot simply goes
+        # idle, and for when rids are unavailable (then `_rid_for` returns "" and this is
+        # skipped — failing back to the pre-existing behaviour rather than evicting live state).
         if is_decode and (self._audio_gen_states or self._image_gen_states):
             _live = set(forward_batch.req_pool_indices.tolist())
             for _store, _kind in ((self._audio_gen_states, "audio"),
@@ -1487,6 +1499,18 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 for _k in list(_store.keys()):
                     _key = (_kind, _k)
                     if _k in _live:
+                        _st = _store.get(_k)
+                        _now = self._rid_for(_k, forward_batch)
+                        if _st is not None and _st.rid and _now and _st.rid != _now:
+                            logger.warning(
+                                "[GenState] %s generation state for pool slot %d belongs to "
+                                "request %s but the slot now serves %s — evicting. The "
+                                "original request died mid-generation; keeping this would "
+                                "pin the CUDA-graph veto on for every request.",
+                                _kind, _k, _st.rid, _now)
+                            _store.pop(_k, None)
+                            self._gen_state_absent.pop(_key, None)
+                            continue
                         self._gen_state_absent.pop(_key, None)
                         continue
                     _n = self._gen_state_absent.get(_key, 0) + 1
@@ -1782,6 +1806,11 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 # Let lm_head generate text normally (transcript of what to speak)
                 self._trigger_sticky = False  # latch consumed (see __init__)
                 state = AudioGenState(mode="transcript")
+                # Stamp the owning request AT CREATION. rid was previously only set at
+                # completion (for the output filename), so stale-state eviction had nothing
+                # to compare against while the state was live -- which is exactly when the
+                # comparison is needed.
+                state.rid = self._rid_for(req_idx, forward_batch)
                 self._audio_gen_states[req_idx] = state
                 logger.info(f"[AudioGen] req={req_idx}: entered audio mode, starting transcript phase")
                 # No override — let lm_head generate transcript text
@@ -1892,6 +1921,7 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 if last_token == self._audiogen_start_id:
                     req_idx = forward_batch.req_pool_indices[i].item()
                     state = AudioGenState(mode="transcript")
+                    state.rid = self._rid_for(req_idx, forward_batch)  # stamp owner at creation
                     self._audio_gen_states[req_idx] = state
                     # Let lm_head's transcript token pass through — the scheduler
                     # writes it to the N-gram token table for correct hash context.
@@ -1922,6 +1952,7 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             if token == self._image_start_id:
                 self._trigger_sticky = False  # latch consumed (see __init__)
                 state = ImageGenState()
+                state.rid = self._rid_for(req_idx, forward_batch)  # stamp owner at creation
                 self._image_gen_states[req_idx] = state
                 logger.info(f"[ImageGen] req={req_idx}: entered visual mode (37x37 grid), "
                             f"generating visual token 1 from the image_start hidden state")
