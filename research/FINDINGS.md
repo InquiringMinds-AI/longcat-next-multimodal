@@ -2331,3 +2331,23 @@ human gate for this generation-path change — the barn and the taxi, generated 
 batching on, each matching its own prompt. Worth stating what that verdict does and does not
 cover: it confirms the two images are correct and acceptable, not that the speed numbers are
 final (the clean shipping-config measurement was still running when he said it).
+
+### Final numbers, shipping configuration (batching default-on, diagnostics OFF)
+
+| build / config | 2 concurrent images |
+|---|---|
+| batching OFF (`LCN_HEAD_BATCH=0`) | 414 s |
+| batching ON, fixed, **shipping config** | **346 s (−16.4%)** |
+| batching ON, fixed, diagnostics on | 357 s |
+| ~~batching ON, broken~~ | ~~327 s~~ — void (fused sampling did less work) |
+
+Output correct at this configuration (taxi request returns a taxi), and the owner's verdict on
+the fixed paired output was **"looks good."**
+
+Battery, shipping build, all green: `test_codebook_batching` 7/7, `test_head_batching` 40/40,
+tool parsing all passed, audio-chat prompt 8/8, stream util 5/5, selftest **7/7** modalities,
+anthropic route **6/6**, degeneracy **6/6**.
+
+**So the optimisation is real and worth having: −16.4% wall on two concurrent images, no quality
+cost, nothing at n=1.** It cost a correctness bug and roughly three hours to get there, and the
+bug was caught by a human looking at pictures rather than by any of the eight suites.
