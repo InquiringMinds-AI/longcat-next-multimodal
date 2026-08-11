@@ -2155,3 +2155,45 @@ join and leave the batch mid-image, which they do constantly.
 
 **Scope of the win, stated honestly: this does NOTHING at n=1.** It is a concurrency optimization.
 Single-image latency is unchanged; only multi-user/agentic load benefits.
+
+### Result: two images now generate in the time one used to take
+
+Same box, same prompts, same concurrency; baseline `v0516-syncfix` vs `v0516-headbatch`. The
+new build was given a warm-up image that was DISCARDED, because the generation heads lazily
+allocate ~25GB on first use and the baseline was measured on an already-warm container (the
+warm-up itself took 338.9 s -- timing that as the result would have manufactured a regression).
+
+| measure | baseline | head-batched | change |
+|---|---|---|---|
+| 2 concurrent images, wall | 410.8 s | **345 s** | **-16%** |
+| generation phase (both images) | 214 s | **129 s** | **-40%** |
+| steady state, 10 raster rows, n=2 | 58 s | **36 s / 35 s** | **-39%** |
+| steady state, 10 raster rows, SOLO | ~36.5 s | -- | -- |
+
+The batched n=2 cadence (36 s, 35 s) equals the SOLO cadence (~36.5 s). That is the theoretical
+best case: the head's weight traffic is paid once for the pair, and the backbone was already
+batched. Aggregate generation throughput at n=2 went from 1.26x solo to ~2.0x -- perfect scaling.
+
+**Positive control, on the optimization rather than the feature.** The flush logs its first
+grouped call and every 500th: engaged at call 1 (08:24:46), 500 (08:25:35) and 1000 (08:26:23),
+always "2 requests in one call". This mattered: a batched call and N serial calls are otherwise
+indistinguishable in the logs, so "batching didn't help" and "batching never ran" would have
+looked identical -- which is exactly how the previous change got measured before anyone noticed
+its path never executed.
+
+**Why this converted to wall clock when yesterday's sync removal did not.** Removing 22 ms/step
+of HOST op time bought 1.4 ms, because the CPU was already running ahead of the GPU and the
+deleted work was overlapped. This removes ~1.5 GB of GPU MEMORY TRAFFIC per step on a box that
+is bandwidth-bound ("its all ram bandwidth choking us out" -- owner). Same machine, same week,
+opposite outcomes; the discriminator is WHICH RESOURCE WAS SATURATED, not how much work was
+removed. Worth remembering before predicting the next optimization's payoff.
+
+**The refiner is now the dominant cost at n=2**: ~196 s of the remaining 345 s (~57%), and it
+still runs strictly one image at a time (req=2 saved 08:28:35, req=3 only started after). It has
+never been profiled. That is the next lever, and it is bigger than what was just won.
+
+**Scope, restated because it is easy to over-read these numbers: nothing here helps a single
+image.** Solo latency is unchanged. This is throughput under concurrent load.
+
+Battery green on the shipped image: head-batching 40/40, tool parsing all passed, audio-chat
+prompt 8/8, stream util 5/5.

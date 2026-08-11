@@ -878,6 +878,12 @@ Baseline for the A/B, same box, same build (`v0516-syncfix`):
       diffed; row logits vs batch-1 agree to ~4e-7 with matching argmax, and batch-COMPOSITION
       independence is exactly 0.00e+00. Still needs owner eyes on output, per the standing rule.
       Does NOTHING at n=1 — it is a concurrency optimization.
+      **MEASURED 2026-08-11, shipped in `v0516-headbatch`:** 2 concurrent images
+      410.8 s → **345 s wall (−16%)**; generation phase 214 s → **129 s (−40%)**; steady state
+      58 s → **36 s per 10 raster rows**, which EQUALS the solo cadence (~36.5 s) — two images
+      now generate in the time one used to take, i.e. perfect n=2 scaling on the generation
+      phase. Positive control fired at grouped calls 1/500/1000, always "2 requests in one
+      call". Awaiting owner's eyes on the paired output.
 - [ ] **Audio head batching is NOT the same change — do not copy the image one.** Assessed
       2026-08-11 by reading `_generate_audio_codebook_step`: sampling there carries PER-REQUEST
       state that the image path does not have. `prev_ids` (the last 50 frames) feeds a
