@@ -1807,3 +1807,42 @@ micro-benchmark (ROADMAP 5b) should now sweep dtype as well as batch.
 
 Incidental: `codebook_embeddings.safetensors` is permission-denied to the host user (readable
 inside the container). Harmless today; it blocks host-side checkpoint inspection.
+
+### Both generation heads are pinned to the memory-bandwidth roof (measured, unloaded)
+
+Corrected harness (the first run sized the stand-in embedding to `transformer_dim` instead of
+`hidden_size`; audio has `transformer_dim == hidden_size == 3072` so it passed by coincidence
+and only the visual head failed). Both heads re-measured; audio reproduces the first run to
+within 1ms, so those numbers were sound despite the latent bug.
+
+| head | size | layers / output heads | bs=1 | bs=2 | bs=4 | bs=8 |
+|---|---|---|---|---|---|---|
+| visual | 1.49 GB | 81% / 18% | 51.60 ms | 1.05× | 1.10× | 1.22× |
+| audio | 3.14 GB | 87% / 13% | 137.96 ms | 0.78× | 0.80× | 0.85× |
+
+Achievable copy bandwidth 220 GB/s (read+write). Effective bandwidth of the heads themselves:
+
+* visual — 1.49GB × 8 reads = 11.92 GB/frame in 51.6ms = **231 GB/s**, at or above the copy figure
+* audio — 3.14GB × 8 = 25.12 GB/frame in 138ms = **182 GB/s**, 83% of it
+
+Both sit at the bandwidth roof. Confirms the owner's ground truth directly rather than by
+inference, and it means head time scales with BYTES, essentially linearly.
+
+**Byte split makes the de-risked quantization viable.** The FFN-heavy transformer layers are
+81–87% of each head; the per-level output projections — the ones that actually select a codebook
+entry — are only 13–18%. Quantizing the layers alone captures the large majority of the saving
+while leaving full precision where a rounding error changes which token is chosen.
+
+**CORRECTION to an earlier estimate in this document.** int8 heads were projected at ~41% off
+generation, from an estimate that the head was ~134ms of each 174ms frame. Measured, the visual
+head is 51.6ms of 174ms — about **30%**. Halving its bytes at the bandwidth roof halves its
+time, so the realistic gain on single-image latency is **~15%** (238.8s → ~200s), not 41%.
+Worth having; does not make image generation fast.
+
+**Open and unexplained: ~120ms of every 174ms frame is not the head.** Backbone decode at the
+graphed text rate would be ~40ms. Hypothesis: the remainder is EAGER-MODE overhead, since
+generation vetoes CUDA graphs while the 25–40 tok/s text figures were measured WITH graphs. If
+that holds, the dominant cost of image generation is not the heads at all — it is paying eager
+overhead across 1369 sequential decode steps, and int8 heads would be a sideshow next to making
+generation graph-compatible. Explicitly a hypothesis; the deciding measurement is text
+throughput with `LCN_CUDAGRAPH=0` versus the current build, warm on both arms.
