@@ -211,8 +211,36 @@ async def _prewarm_task():
         _prewarm_state.update(status="failed", error=f"image: {e}")
         logger.warning("[prewarm] image warmup failed (serving continues): %s", e)
         return
+
+    # Audio too: the TTS head and the cosy24k vocoder have their own lazy allocation, and
+    # a deployment that prewarms images while leaving the first TTS caller to pay is only
+    # half a fix. Kept SHORT -- a few words is enough to fault in the weights, and warmup
+    # should not cost more startup than it saves.
+    try:
+        t0 = _t.monotonic()
+        async with _gen_slots:
+            r = await _client.post(SGLANG + "/generate", json={
+                "text": _tts_prompt("Ready."), "audio_data": [DEFAULT_VOICE],
+                "sampling_params": {"max_new_tokens": 1200, "temperature": 0.5,
+                                    "top_k": 5, "top_p": 0.85}})
+        if r.status_code != 200:
+            raise RuntimeError("backend error: " + r.text[:200])
+        rj, raw = _json_or_text(r)
+        if rj is None:
+            raise RuntimeError("backend error: " + raw[:200])
+        path = "%s/longcat_tts_%s.wav" % (OUT, _san(rj.get("meta_info", {}).get("id", "")))
+        if await _read_when_ready(path) is not None:
+            _discard_artifact(path)
+        _prewarm_state["audio_s"] = round(_t.monotonic() - t0, 1)
+        logger.info("[prewarm] audio path warm in %.1fs", _prewarm_state["audio_s"])
+    except Exception as e:                     # noqa: BLE001
+        # Image is already warm, which is the expensive half — report the miss, keep going.
+        _prewarm_state.update(error=f"audio: {e}")
+        logger.warning("[prewarm] audio warmup failed (serving continues): %s", e)
+
     _prewarm_state.update(status="ready")
-    logger.info("[prewarm] complete: image=%ss", _prewarm_state["image_s"])
+    logger.info("[prewarm] complete: image=%ss audio=%ss",
+                _prewarm_state["image_s"], _prewarm_state["audio_s"])
 
 
 @app.on_event("startup")
@@ -296,6 +324,19 @@ async def images_generations(req: Request):
     return {"created": int(time.time()), "data": data}
 
 
+def _tts_prompt(text: str) -> str:
+    """The voice-clone TTS prompt. Shared by the endpoint and prewarm.
+
+    Extracted rather than duplicated: prewarm must exercise the SAME path a real request
+    takes, and a copy would silently stop matching the moment either side is edited —
+    warming a path nobody uses is worse than not warming at all, because it looks warm.
+    """
+    return ("<longcat_system>Replicate the voice in the audio clip to formulate an answer:"
+            "<longcat_audio_start><longcat_audio_end>"
+            "<longcat_user>" + AUDIO_INSTR + text +
+            "<longcat_assistant><longcat_audiogen_start>")
+
+
 @app.post("/v1/audio/speech")
 async def audio_speech(req: Request):
     if AGENT_MODE:
@@ -305,10 +346,7 @@ async def audio_speech(req: Request):
     text = body.get("input", "")
     voice = str(body.get("voice", "en"))
     ref = _resolve_voice(voice)
-    prompt = ("<longcat_system>Replicate the voice in the audio clip to formulate an answer:"
-              "<longcat_audio_start><longcat_audio_end>"
-              "<longcat_user>" + AUDIO_INSTR + text +
-              "<longcat_assistant><longcat_audiogen_start>")
+    prompt = _tts_prompt(text)
     try:
         async with _gen_slots:
             r = await _client.post(SGLANG + "/generate", json={"text": prompt, "audio_data": [ref],
