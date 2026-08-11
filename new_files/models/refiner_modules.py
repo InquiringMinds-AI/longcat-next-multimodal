@@ -3,9 +3,59 @@
 # ---------------------------------------------------------------------------
 
 import itertools
+import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+_logger = logging.getLogger(__name__)
+
+# Refiner attention fast path, ON by default; LCN_REFINER_FAST=0 restores the old path.
+#
+# This image has no flash_attn, so the refiner's attention always took an SDPA fallback
+# that (a) still ran _upad_input every layer every denoising step -- work only the flash
+# branch consumes, including a .item() host sync -- and (b) handed SDPA an explicit FLOAT
+# mask. A float mask disqualifies the flash and mem-efficient backends and forces the
+# MATH backend, which materialises the full [B, heads, S, S] score matrix: at this
+# model's largest sequence length (9819 tokens x 21 heads) that is ~4GB per layer per
+# step, 32 layers deep, 10 steps per image.
+#
+# Both wins are IDENTICAL MATH, not approximations: an all-true additive mask is an
+# all-zeros no-op, and the unpad outputs were discarded. MEASURED on GB10, matched warm
+# pair: 9.46 -> 5.58 s/denoising step (-41%), refiner span 95.4s -> 56.5s, single image
+# 246.5s -> 196.5s (-20.3%). Owner reviewed both images: "these are both up to the
+# standard."
+_LCN_REFINER_FAST = os.environ.get("LCN_REFINER_FAST", "1").strip() != "0"
+
+# Debug only: per-state log of the attention path's real runtime shape.
+_LCN_DIAG_REFINER = os.environ.get("LCN_DIAG_REFINER", "0").strip() == "1"
+
+_LCN_REFINER_DIAG_SEEN = set()
+
+
+def _lcn_refiner_diag(attention_mask, seq_len, q_shape, fast, all_true, mask_dropped):
+    """Log the attention path's ACTUAL runtime shape once per DISTINCT state.
+
+    Exists because every claim about this path was first read off source -- that a mask is
+    always present, that it is all-true, that S is ~4225. Ground truth corrected the last
+    of those: the refiner attends at 1369 / 4225 / 5594 / 9819 tokens, not one length.
+
+    Keyed on the state rather than fired once per process, so an A/B records BOTH arms; a
+    once-per-process log would leave the second arm unobserved, which is the hole that
+    lets 'it didn't help' and 'it never engaged' look identical.
+    """
+    if not _LCN_DIAG_REFINER:
+        return
+    key = (fast, all_true, mask_dropped, seq_len)
+    if key in _LCN_REFINER_DIAG_SEEN:
+        return
+    _LCN_REFINER_DIAG_SEEN.add(key)
+    _logger.info(
+        "[refiner-diag] mask=%s seq_len=%s q=%s fast=%s all_true=%s mask_dropped=%s",
+        None if attention_mask is None else tuple(attention_mask.shape),
+        seq_len, tuple(q_shape), fast, all_true, mask_dropped,
+    )
 
 try:
     from flash_attn import flash_attn_varlen_func  # type: ignore
@@ -419,17 +469,25 @@ class AttnProcessorFlash2Varlen:
         else:
             softmax_scale = attn.scale
 
-        (
-            query_states, key_states, value_states, indices_q,
-            cu_seq_lens, max_seq_lens,
-        ) = self._upad_input(query, key, value, attention_mask, sequence_length, attn.heads)
+        # LCN_REFINER_FAST: skip the unpad entirely when the flash path cannot run.
+        # _upad_input exists ONLY to build flash_attn_varlen_func's ragged inputs; on an
+        # image without flash_attn its outputs are computed and discarded, and it costs a
+        # `.max().item()` host sync plus a nonzero() per layer per denoising step (32
+        # layers x 10 steps). Guarded rather than deleted so the flash path is untouched
+        # on any image that ships flash_attn.
+        _fast = _LCN_REFINER_FAST and flash_attn_varlen_func is None
+        if not _fast:
+            (
+                query_states, key_states, value_states, indices_q,
+                cu_seq_lens, max_seq_lens,
+            ) = self._upad_input(query, key, value, attention_mask, sequence_length, attn.heads)
 
-        cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-        max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
 
-        if kv_heads < attn.heads:
-            key_states = repeat(key_states, "l h c -> l (h k) c", k=attn.heads // kv_heads)
-            value_states = repeat(value_states, "l h c -> l (h k) c", k=attn.heads // kv_heads)
+            if kv_heads < attn.heads:
+                key_states = repeat(key_states, "l h c -> l (h k) c", k=attn.heads // kv_heads)
+                value_states = repeat(value_states, "l h c -> l (h k) c", k=attn.heads // kv_heads)
 
         if flash_attn_varlen_func is not None:
             attn_output_unpad = flash_attn_varlen_func(
@@ -449,14 +507,36 @@ class AttnProcessorFlash2Varlen:
                 k = k.repeat_interleave(attn.heads // kv_heads, dim=1)
                 v = v.repeat_interleave(attn.heads // kv_heads, dim=1)
             attn_mask = attention_mask.bool() if attention_mask is not None else None
+
+            # An ALL-TRUE mask is an additive all-zeros no-op, so dropping it is IDENTICAL
+            # MATH, not an approximation. It is worth dropping because handing SDPA an
+            # explicit float mask disqualifies the flash and mem-efficient backends and
+            # forces the MATH backend, which materialises the full [B, heads, S, S] score
+            # matrix -- at S=4225 and 21 heads that is ~7.5GB of traffic per layer per
+            # step, 32 layers deep, 10 steps per image.
+            # Checked EVERY call, not assumed, and the host sync is accepted on purpose.
+            # Today every refiner mask is all-true (measured at seq_len 1369/4225/5594/
+            # 9819) because one unpadded image is refined at a time — but the obvious next
+            # optimisation, batching concurrent refines, would introduce ragged batches
+            # whose masks are genuinely NOT all-true. Hard-coding today's observation would
+            # turn that future change into a silent correctness bug of exactly the kind
+            # this project just shipped once. The sync costs well under 1% of a 5.6s step.
+            _all_true = False
+            if _fast and attn_mask is not None:
+                _all_true = bool(attn_mask.all())
+
             # Convert 2D mask [B, S] to 4D [B, 1, S, S] for SDPA
-            if attn_mask is not None and attn_mask.dim() == 2:
+            if attn_mask is not None and attn_mask.dim() == 2 and not _all_true:
                 attn_mask_4d = attn_mask[:, None, None, :].expand(-1, -1, q.shape[2], -1)
                 attn_mask_4d = attn_mask_4d.to(dtype=q.dtype)
                 attn_mask_4d = attn_mask_4d.masked_fill(~attn_mask_4d.bool(), float('-inf'))
                 attn_mask_4d = attn_mask_4d.masked_fill(attn_mask_4d.bool(), 0.0)
             else:
                 attn_mask_4d = None
+
+            _lcn_refiner_diag(attention_mask, sequence_length, q.shape, _fast, _all_true,
+                              attn_mask_4d is None)
+
             hidden_states = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask_4d, scale=softmax_scale)
             hidden_states = hidden_states.transpose(1, 2)  # [B, S, heads, D]
