@@ -878,12 +878,20 @@ Baseline for the A/B, same box, same build (`v0516-syncfix`):
       diffed; row logits vs batch-1 agree to ~4e-7 with matching argmax, and batch-COMPOSITION
       independence is exactly 0.00e+00. Still needs owner eyes on output, per the standing rule.
       Does NOTHING at n=1 — it is a concurrency optimization.
-      **MEASURED 2026-08-11, shipped in `v0516-headbatch`:** 2 concurrent images
-      410.8 s → **345 s wall (−16%)**; generation phase 214 s → **129 s (−40%)**; steady state
-      58 s → **36 s per 10 raster rows**, which EQUALS the solo cadence (~36.5 s) — two images
-      now generate in the time one used to take, i.e. perfect n=2 scaling on the generation
-      phase. Positive control fired at grouped calls 1/500/1000, always "2 requests in one
-      call". Awaiting owner's eyes on the paired output.
+      ⚠ **The first version of this SHIPPED A CORRECTNESS BUG and its speedup numbers were
+      measured on contaminated output.** With exactly 2 concurrent requests both images came
+      out the SAME — the owner caught it by LOOKING ("barn a, barn b, sailboat, barn b
+      duplicate") after a fully green battery. Cause: `_generate_image_codebook_step` gated
+      its CFG fusion on `logits.shape[0] == 2`, using batch size as a proxy for "these rows
+      are a cond/uncond pair"; batching gave 2 a second meaning, so request B's logits were
+      fused into request A's and A's sampled token broadcast to both rows. FIXED by gating on
+      `uncond_hidden is not None` + explicit shape guards; regression test
+      `test/test_codebook_batching.py` (5/7 broken → 7/7 fixed, offline/CPU/deterministic).
+      Isolated with `LCN_HEAD_BATCH=0`, which forces the per-request path in the same build:
+      taxi request returned a barn with batching ON, a taxi with it OFF.
+      **Speed, same build, flag off vs on: 414 s → 327 s (−21%) for 2 concurrent images.**
+      Re-validation of the FIXED build is the open item — no number here is trustworthy until
+      the paired output has been looked at again.
 - [ ] **Audio head batching is NOT the same change — do not copy the image one.** Assessed
       2026-08-11 by reading `_generate_audio_codebook_step`: sampling there carries PER-REQUEST
       state that the image path does not have. `prev_ids` (the last 50 frames) feeds a
