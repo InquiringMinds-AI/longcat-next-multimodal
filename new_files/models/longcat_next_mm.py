@@ -1139,8 +1139,14 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
 
-            next_token_with_offset = next_token + self.visual_offset_vals[level].item()
-            next_token_ids[:, level] = next_token_with_offset
+            # Offset applied ON DEVICE. This previously read the offset back with .item(),
+            # which is a blocking host sync once per codebook level -- 8 per generated token,
+            # ~11k per image -- on a loop the profiler shows is HOST-BOUND (36ms of every
+            # 115ms step is GPU idle waiting on Python). visual_offset_vals is a GPU tensor
+            # and next_token is a GPU tensor, so the add never needed the host at all.
+            # The audio path already avoids this via _audio_offset_host; the visual path was
+            # simply never given the same treatment.
+            next_token_ids[:, level] = next_token + self.visual_offset_vals[level]
 
         return next_token_ids[0]
 
