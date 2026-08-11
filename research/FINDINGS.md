@@ -1721,3 +1721,46 @@ so the veto is not "fixed" again by someone reading it the way the audit did.
 
 Note this is the third hypothesis refuted today, and the first one refuted BEFORE the code was
 written rather than after. The check cost one grep of the scheduler.
+
+### Generation concurrency: measured 84% serial, cause located, fix premise NOT yet verified
+
+Measured on the shipping build (warmup generation discarded — instrument note #10):
+
+| n | total | per-image | vs n=1 | fully serial would be |
+|---|---|---|---|---|
+| 1 | 238.8s | 238.8s | 1.00× | 1.00× |
+| 2 | 422.9s | 211.4s | 1.77× | 2.00× |
+| 4 | 796.9s | 199.2s | 3.34× | 4.00× |
+
+~84% serial. Marginal cost of each additional concurrent image is ~136ms/step against
+174ms/step for the first, which is what you get when the BACKBONE is batched (it shares the
+decode batch) and the HEADS are not.
+
+**Cause, located in code.** `CasualDepthTransformerHead.forward` runs the whole depth
+transformer and then uses ONE position: `logits = self.heads[level](hidden_states[:, level])`.
+It is called once per codebook level, per request, with `hidden_states[i:i+1]` — batch 1. The
+transformer weights are SHARED across levels (only the final `self.heads[level]` projection
+differs), so a single frame re-reads the same weights 8 times. Config: image head
+dim 2048 / ffn×16 / 4 layers ≈ 600M params; audio head dim 3072 / ffn×16 / 4 layers ≈ 1.2B.
+
+**Two candidate optimizations, with predicted value:**
+
+1. **Batch the head across concurrent requests.** At batch 1 the head is bandwidth-bound on
+   weight loading, so N requests read the same weights N times; one batch-N call would read
+   them once. Arithmetic supports it — batch-4 compute at seq=8 is microseconds against
+   milliseconds of weight transfer at 270 GB/s — and it would move n=4 from 3.34× toward ~1×.
+   **UNVERIFIED.** See the blocker below.
+2. **KV-cache the depth transformer across levels.** The head is causal, so positions 0..L-1
+   produce identical outputs at every level and are recomputed 8 times per frame — O(depth²)
+   instead of O(depth). But this saves COMPUTE, not weight reads, and the head appears
+   bandwidth-bound, so predicted gain is small. Lower priority than it first looks.
+
+**Neither helps single-image latency (238.8s).** That is 8 sequential passes over the head
+weights per frame × 1369 frames, and the levels are sequentially dependent by construction
+(level L consumes tokens sampled at 0..L-1). Structural, absent a smaller head.
+
+**BLOCKED on a safe measurement window.** Confirming premise 1 means instantiating the head at
+real dimensions (1.2–2.4GB BF16) inside the running container. `MemAvailable` is 10.1GB of
+127.6GB with this box's documented hard-power-off ceiling nearby, and a crash requires physical
+power-on. The micro-benchmark belongs in a window when the model is NOT loaded — e.g. before
+the next rebuild. Deliberately not run against a loaded server.

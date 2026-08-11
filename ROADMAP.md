@@ -837,6 +837,22 @@ session does not "discover" them and ship the shallow version.
   machinery to buy nothing measurable. Revisit if long-audio input is ever supported, where the
   decode grows with clip length.
 
+## 5b. Generation concurrency (measured 2026-08-10; NEXT perf item, premise unverified)
+
+- [ ] **Micro-benchmark the depth head at batch 1 vs 2/4/8 — RUN THIS FIRST, WITH THE MODEL
+      UNLOADED.** It decides whether the refactor below is worth anything: if batch-4 costs
+      ~batch-1, the head is bandwidth-bound and batching pays ~3x on n=4; if it costs ~4x, it
+      is compute-bound and the refactor buys nothing. Needs 1.2-2.4GB, so do it while nothing
+      is loaded — NOT against a live server at ~117GB in use.
+- [ ] If it pays: batch `CasualDepthTransformerHead` across concurrent generating requests
+      (today: one batch-1 call per request per level per step). Touches the code that produces
+      the actual image/voice, so it needs owner eyes/ears on n=4 output, not a green battery.
+- [ ] Lower priority than it looks: KV-cache the head across levels. Saves O(depth^2) recompute
+      but not weight reads; if the head is bandwidth-bound this is nearly free of benefit.
+- Measured baseline: n=1 238.8s, n=2 422.9s (1.77x), n=4 796.9s (3.34x) — ~84% serial.
+- NOT fixable this way: single-image latency. 8 sequential weight-read passes per frame x 1369
+  frames, levels sequentially dependent by construction.
+
 ## 7. Final numbers + legibility (last — documents whatever the above produced)
 
 - [ ] Re-run the full bench suite on the final configuration; update README numbers
