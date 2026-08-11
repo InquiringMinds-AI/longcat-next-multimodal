@@ -2002,3 +2002,49 @@ Standing consequences: the merge is REVERTED (it optimizes a forward that will n
 and a knob that does nothing invites a future session to switch it on); CFG stays unwired per
 the owner's verdict above; and **the ~120ms/frame of the generation budget is once again
 unexplained** — three theories have now failed, so the next step is a profiler, not a fourth.
+
+### PROFILED at last: image generation is HOST-BOUND, not weight-bound (2026-08-11)
+
+25 generation decode steps captured mid-raster via SGLang `/start_profile` with `num_steps`
+(generation started first, profiler opened 25s in, so the window holds steady-state generation
+rather than prefill or the image_start trigger).
+
+**Instrument caveat, stated because it inflated the first read:** the two largest rows,
+`scheduler.run_batch` and `step[DECODE bs=1]`, are profiler ANNOTATIONS spanning the whole step,
+not kernels; my aggregator counted them as GPU work. Excluding them:
+
+| quantity | per step |
+|---|---|
+| real GPU kernel time | **79.1 ms** |
+| `step[DECODE bs=1]` span | **115.5 ms** |
+| **GPU idle (gap)** | **36.4 ms — 31%** |
+
+CPU-side, taking only the OUTERMOST of each nesting chain (`aten::to` → `_to_copy` → `copy_`;
+`aten::item` → `_local_scalar_dense`), since summing them triple-counts:
+
+* `aten::to` — **26.5 ms/step** of tensor conversions
+* `aten::item` — **12.8 ms/step** of blocking host syncs
+
+≈39 ms/step of host work against a 36 ms GPU gap: they match. **The image generation loop is
+host-bound.** The GPU finishes and waits while Python converts dtypes and pulls back scalars.
+
+Two more structural facts from the same trace:
+
+* **153 `gemvx` calls per step.** Matrix-VECTOR kernels — what a GEMM degenerates into at batch
+  1 — confirming the `bs=1` annotation. This is why cross-request batching helps concurrency:
+  it turns gemv back into gemm.
+* **`fused_moe_kernel` is only 5.9 ms/step.** The MoE backbone is not the expensive part of
+  image generation, which is why every backbone-centred theory failed.
+
+**This overturns a recorded conclusion.** An earlier entry found that removing ~800 host syncs
+per frame produced no measurable change and called the workload "forward-pass bound". That was
+measured on the AUDIO path. The IMAGE path is a different state machine and is host-bound: the
+earlier verdict does not transfer, and was wrongly generalised.
+
+**Target, measured rather than theorised:** eliminate per-step `.to()` conversions and `.item()`
+syncs in the image generation loop. Upper bound ~31% of single-image latency — roughly twice
+what int8 heads offered — and with NO quality risk, because it changes no math, only when and
+where tensors move.
+
+Three theories about this budget failed (eager overhead, head cost, CFG uncond forward). The
+profiler cost fifteen minutes and one grep of the endpoint signature.
