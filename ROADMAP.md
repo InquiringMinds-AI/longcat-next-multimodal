@@ -839,11 +839,14 @@ session does not "discover" them and ship the shallow version.
 
 ## 5b. Generation concurrency (measured 2026-08-10; NEXT perf item, premise unverified)
 
-- [ ] **Micro-benchmark the depth head at batch 1 vs 2/4/8 — RUN THIS FIRST, WITH THE MODEL
-      UNLOADED.** It decides whether the refactor below is worth anything: if batch-4 costs
-      ~batch-1, the head is bandwidth-bound and batching pays ~3x on n=4; if it costs ~4x, it
-      is compute-bound and the refactor buys nothing. Needs 1.2-2.4GB, so do it while nothing
-      is loaded — NOT against a live server at ~117GB in use.
+- [ ] **int8 the generation heads — HIGHEST VALUE, and the only item that touches single-image
+      latency.** They are 71/71 BF16 (audio 2.86GB, visual 1.76GB) while the backbone is int8;
+      they are read 8x per frame. On a box where "its all ram bandwidth choking us out" (owner),
+      halving their width halves the traffic of every generation. Needs owner eyes/ears on
+      output — this changes what the images and voice actually are.
+- [ ] **Micro-benchmark the depth head, sweeping BOTH batch (1/2/4/8) AND dtype (bf16/int8),
+      WITH THE MODEL UNLOADED.** Sizes both items above before either is built. Needs
+      1.2-2.4GB, so never against a live server at ~117GB in use.
 - [ ] If it pays: batch `CasualDepthTransformerHead` across concurrent generating requests
       (today: one batch-1 call per request per level per step). Touches the code that produces
       the actual image/voice, so it needs owner eyes/ears on n=4 output, not a green battery.

@@ -1764,3 +1764,46 @@ real dimensions (1.2–2.4GB BF16) inside the running container. `MemAvailable` 
 127.6GB with this box's documented hard-power-off ceiling nearby, and a crash requires physical
 power-on. The micro-benchmark belongs in a window when the model is NOT loaded — e.g. before
 the next rebuild. Deliberately not run against a loaded server.
+
+### Owner ground truth: nothing on this box is compute bound — and the heads are BF16
+
+Owner, 2026-08-10: *"nothing on the spark is compute bound. this thing has so many flops which
+stay unused, that we clocked down the processor. its all ram bandwidth choking us out."*
+
+That resolves the premise flagged unverified above, and reorders the whole perf list: bytes
+read is the only currency, so an optimization is worth exactly the traffic it removes.
+
+**The generation heads were never quantized.** Read from the safetensors headers (no load, no
+allocation):
+
+| component | dtypes | bytes |
+|---|---|---|
+| `audio_head` | 71/71 BF16 | 2.86 GB |
+| `visual_head` | 71/71 BF16 | 1.76 GB |
+| backbone layer 0 | 768×I8 + F32 scales | 2.78 GB |
+
+The backbone is int8 throughout; the heads are full precision and are read 8× per frame on the
+hottest path in the model.
+
+**Reordered candidates:**
+
+1. **int8 the generation heads.** Halves traffic on every generation — including SINGLE-image
+   latency, which the previous entry called structural. That was wrong in an instructive way:
+   the eight passes are indeed irreducibly sequential, but sequential passes over HALF the bytes
+   cost half as much. Sequence length was the wrong axis; byte width is the right one.
+2. **Batch the head across concurrent requests.** Amortizes both the weight reads AND the ~224
+   kernel launches per frame (4 layers × ~7 kernels × 8 levels) across N requests, since one
+   batch-N call issues the same launches as one batch-1 call. Should move n=4 from 3.34× toward
+   ~1×. No effect on single-image.
+3. **KV-cache the head across levels — DEAD.** It removes O(depth²) recompute, and recompute is
+   free on this machine. Confirmed by the owner's ground truth rather than by measurement.
+
+**A caveat against my own arithmetic, which bounds the claim.** Visual head 1.76GB × 8 reads =
+52ms/frame at 270 GB/s, against ~134ms/frame measured — plausible. But the same model on the
+audio head predicts 84.7ms/frame, which EXCEEDS the measured per-frame TTS cost. That is
+impossible if all eight reads reached DRAM, so some are being served from cache. The "8 full
+reads" model over-predicts, so the int8 saving above is an UPPER BOUND, not a forecast. The
+micro-benchmark (ROADMAP 5b) should now sweep dtype as well as batch.
+
+Incidental: `codebook_embeddings.safetensors` is permission-denied to the host user (readable
+inside the container). Harmless today; it blocks host-side checkpoint inspection.
