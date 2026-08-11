@@ -1618,3 +1618,45 @@ partway down, which made `os` a function-local name for the entire body — so a
 `os.environ` read *above* it would have raised `UnboundLocalError` on every video request. No
 test in the battery exercises video, so this would have shipped. Python binds locals at compile
 time; the import's position offers no protection to code above it.
+
+### `end_jump` re-characterized by owner labels; TTS termination closed at ~17%
+
+A 12-render blind set from the shipping config (gate removed), numbers withheld until after
+adjudication. Owner labels: **04** "crackle at the end", **05** "distorts from nom~", **06**
+"odd prosody... stressing and extending 'all'... plausible, but odd", rest good.
+
+| clip | end_jump | verdict |
+|---|---|---|
+| 04 | 0.201 | crackle at end |
+| 05 | 0.070 | distortion from "nom~" |
+| 01 | 0.044 | good |
+| others | 0.001–0.011 | good (06 = odd prosody) |
+
+The two highest values in the set are exactly the two defective clips, with clean separation
+(bad ≥0.070, good ≤0.044) and the 0.06 threshold sitting in the gap. **Five correct calls on
+unfitted data.**
+
+**The metric's scope is now correctly stated, and my earlier split was on the wrong axis.** I
+had said `end_jump` catches "terminal clicks" and is blind to "mid-utterance babble". Clip 05
+is distortion rather than a click and was caught. The actual rule:
+
+> `end_jump` detects defects that are STILL PRESENT AT THE END of the clip, whatever their
+> character. It is blind to defects that occur mid-utterance and RESOLVE before the ending.
+
+That explains both observations: 05 distorts from "nom~" onward and never recovers, so the
+final 60ms is disturbed; the earlier "oooOoOoOooo.. nomina" smeared mid-utterance and then
+recovered to finish the word, leaving a clean ending and end_jump=0.032.
+
+**Owner ruling: "I think this is fine for now."** TTS termination work stops here. Standing
+state for whoever picks it up:
+
+- Audible defect rate **~17%** (2/12 by ear; ~16% by metric across 64 matched renders). Three
+  approaches measured and rejected: argmax end-gate (no effect, removed), REPETITION_PENALTY=1.0
+  (clean metric, 2/16 HTTP 500s), TOP_K=1 (halved, unmatched, flattens the voice).
+- **The one untested lever** is `AUDIO_END_CONFIRM` (hardcoded 2) — consecutive end-flags
+  required before terminating. Raising it is mechanically the OPPOSITE of the failed gate: that
+  made ending harder to TRIGGER, this makes it slower to COMMIT. Not attempted.
+- Screening is now cheap: the defect is end-present by definition, which is the class end_jump
+  is validated for, so a matched pair can be screened by metric with ears only on the finalist.
+- A FOURTH phenomenon exists and has no metric: prosody oddity (clip 06). Whether it is a
+  defect at all is an owner judgment, not a measurable one.
