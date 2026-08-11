@@ -2289,3 +2289,39 @@ carries no equivalent shape-as-intent guard — so when `_generate_audio_codeboo
 eventually batched, THIS bug is not waiting there. Its own obstacle is different and already
 recorded in ROADMAP 5b: per-request sampling state (a repetition penalty over the last 50
 frames).
+
+### Fix verified end-to-end, and the honest speed number
+
+Fixed build, batching ON, same two prompts that had produced two barns:
+
+| check | result |
+|---|---|
+| taxi request | **a taxi** — correct |
+| `HS-DIAG rows_identical` | **False** at tokens 1/2/3/50/200 |
+| `ID-DIAG identical` | **False** at every checkpoint |
+| positive control | grouped calls 1/500/1000, "2 requests in one call" |
+
+`HS-DIAG` also closes the question the diagnostic was built to answer: **the hidden states going
+INTO the head always differed**, before and after the fix. The backbone, KV and prefix cache were
+never contaminated — the defect was entirely the caller fusing two requests' logits. Had this
+diagnostic existed before the code, it would have pointed at the caller immediately instead of
+sending me to read the attention kernels.
+
+**Speed, restated honestly.** The original 327 s was INFLATED BY THE BUG: after the bad fusion the
+sampling ran on ONE row instead of two, so the broken build was doing strictly less work. The
+correct comparison is same-build, flag off vs on:
+
+| build | 2 concurrent images |
+|---|---|
+| batching OFF (`LCN_HEAD_BATCH=0`) | 414 s |
+| batching ON, FIXED, **with debug diagnostics still enabled** | **357 s (−13.8%)** |
+| ~~batching ON, broken~~ | ~~327 s~~ — void, less work done |
+
+So the real win is **at least 14%** and the 357 s still carries `LCN_DIAG_HS` host syncs; a clean
+number needs a re-measure in the shipping configuration. **The earlier claims of −16% wall and
+−40% on the generation phase are WITHDRAWN** — they were measured on the contaminated run.
+
+Note what survived and what did not. The PREMISE (concurrent requests are co-resident; the head
+is called per-request per level) was correct and remains measured. The MECHANISM (batching the
+head amortises its weight traffic) was correct. Only the IMPLEMENTATION was broken, and only the
+numbers taken from it are void.
