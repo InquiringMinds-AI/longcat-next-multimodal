@@ -584,6 +584,13 @@ class RefinerPipeline(DiffusionPipeline):
         freqs_cis = self._get_freqs_cis(device=device, dtype=weight_dtype)
 
         progress_bar = self.progress_bar(total=num_inference_steps) if enable_processor_bar else None
+        # Positive control for the cost model: the CFG branch issues THREE transformer
+        # forwards per step (text, ref, uncond) against ~3.2B params, so a step costs 3x
+        # a bare denoise. Counted rather than inferred -- the 3x was first derived from
+        # attention token counts (9819 = 4225 latent + 4225 ref + 1369 cond, vs 5594 with
+        # no ref), and a derivation is not a measurement.
+        _n_cfg_steps = 0
+        _n_plain_steps = 0
         for i, t in enumerate(timesteps_sched):
             if self._interrupt:
                 continue
@@ -595,6 +602,10 @@ class RefinerPipeline(DiffusionPipeline):
             use_cfg = (cfg_range[0] <= step_frac <= cfg_range[1]) and (
                 text_guidance_scale > 1.0 or image_guidance_scale > 1.0
             )
+            if use_cfg:
+                _n_cfg_steps += 1
+            else:
+                _n_plain_steps += 1
 
             if not use_cfg:
                 optional_kwargs: Dict[str, Any] = {}
@@ -654,6 +665,14 @@ class RefinerPipeline(DiffusionPipeline):
 
         if progress_bar is not None:
             progress_bar.close()
+
+        print(
+            f"[Refiner] denoise: {_n_cfg_steps} CFG steps (3 forwards each) + "
+            f"{_n_plain_steps} plain steps (1 forward each) = "
+            f"{_n_cfg_steps * 3 + _n_plain_steps} transformer forwards, B={B}, "
+            f"cfg_range={cfg_range}, text_gs={text_guidance_scale}, image_gs={image_guidance_scale}",
+            flush=True,
+        )
 
         self._current_timestep = None
 

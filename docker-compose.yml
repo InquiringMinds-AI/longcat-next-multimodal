@@ -27,6 +27,11 @@ services:
       # - MEM_FRACTION=0.72   # 0.74 is the default under LCN_YARN
       # - MAX_TOTAL_TOKENS=131072
       # - IMAGE_GEN_CFG_SCALE=3.0
+      # - LCN_REFINER_CFG_RANGE=0.0,0.5  # run refiner guidance on the first half of the
+      #                       # denoise steps only. ~2/3 of refiner compute is the 3-forward
+      #                       # guidance path; narrowing it is the one big FLOP cut available
+      #                       # (it is compute-bound, so batching cannot help). CHANGES THE
+      #                       # OUTPUT IMAGE -- review before adopting. Default 0.0,1.0.
       # - LCN_VERBOSE=0
       # - LCN_PREWARM=1       # warm the generation heads at startup (~4 min) instead of
       #                       # making the first real request pay ~140s of lazy allocation

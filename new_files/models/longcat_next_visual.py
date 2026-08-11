@@ -677,12 +677,27 @@ class LongcatNextVisualTokenizer(nn.Module):
             generators = [torch.Generator(device=device).manual_seed(42 + b) for b in range(batch_size)]
             import os
             refiner_steps = int(os.environ.get('REFINER_STEPS', '10'))  # 10 is visually on par with canonical 28 here, ~1.5x faster; raise via env for max fidelity
+            # Classifier-free guidance is the refiner's dominant cost: on a CFG step the
+            # pipeline runs THREE transformer forwards (text, ref, uncond) instead of one,
+            # and the default range covers every step -- so ~2/3 of refiner compute is
+            # guidance. The transformer is compute-bound, not bandwidth-bound (a 9819-token
+            # forward is ~63 TFLOP but only ~6.4GB of weights: ~64x the weight-read floor),
+            # so this compute cannot be batched away -- it can only be not-spent. Narrowing
+            # the range runs guidance on early steps only, where it shapes composition, and
+            # leaves later steps as bare denoises. The non-CFG branch still receives
+            # ref_image_hidden_states, so the reference image conditions EVERY step either
+            # way; only the guidance term is dropped.
+            # DEFAULT "0.0,1.0" reproduces the shipped behavior exactly. Changing it changes
+            # the output image, so it is gated on human review, not on a green test.
+            _cfg_rng = os.environ.get('LCN_REFINER_CFG_RANGE', '0.0,1.0').split(',')
+            cfg_range = (float(_cfg_rng[0]), float(_cfg_rng[1]))
             out = self._refiner_pipeline(
                 encoder_hidden_states=quant_features,
                 grid_thw_list=grid_thw_list,
                 image=ref_input,
                 generator=generators[0] if batch_size == 1 else generators,
                 num_inference_steps=refiner_steps,
+                cfg_range=cfg_range,
                 output_type="pil",
                 return_dict=True,
             )
