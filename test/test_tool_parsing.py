@@ -123,13 +123,15 @@ def _roundtrip_cases():
 
 
 # ---------------------------------------------------------------------------
-# Name validation: a call naming a tool the client never offered must NOT be
-# emitted. The parser used `tools` only for argument type coercion, so the model
-# could name any function and the client received a well-formed call for it.
-# Covers all four dialects, including the imitation one that returns early.
+# Tool NAMES pass through verbatim -- pinned by owner decision, not by accident.
+# An audit flagged unvalidated names as a defect and validation was implemented;
+# the owner reversed it: "let the client decide what the model's string is allowed
+# to do." The parser reports what the model emitted. Nothing is executed here, so
+# an unrecognised name is information for the client, not a hazard.
+# These cases exist to make a future re-fix fail loudly instead of landing quietly.
 # ---------------------------------------------------------------------------
 
-def _name_validation_cases():
+def _passthrough_cases():
     T = [{"type": "function", "function": {"name": "get_weather", "description": "",
                                            "parameters": {}}}]
     XML = ('<longcat_tool_call>functions.%s\n<longcat_arg_key>city</longcat_arg_key>\n'
@@ -137,22 +139,16 @@ def _name_validation_cases():
     IMIT = '<function_calls>[{"name": "%s", "parameters": {"city": "Tokyo"}}]</function_calls>'
     TS = '<longcat_tool_call>functions.%s({"city": "Tokyo"})</longcat_tool_call>'
     out = []
-    for label, raw, want_names, want_visible in (
-        ("xml: unoffered tool is not emitted", XML % "delete_all_files", [], True),
-        ("xml: offered tool still works", XML % "get_weather", ["get_weather"], False),
-        ("xml: case variant repaired to the offered name", XML % "Get_Weather", ["get_weather"], False),
-        ("imitation: unoffered tool is not emitted", IMIT % "rm_rf", [], True),
-        ("imitation: offered tool still works", IMIT % "get_weather", ["get_weather"], False),
-        ("ts-style: unoffered tool is not emitted", TS % "wipe_disk", [], True),
+    for label, raw, want in (
+        ("xml: unoffered name passes through", XML % "delete_all_files", ["delete_all_files"]),
+        ("xml: case variant is NOT normalised", XML % "Get_Weather", ["Get_Weather"]),
+        ("xml: offered name unaffected", XML % "get_weather", ["get_weather"]),
+        ("imitation: unoffered name passes through", IMIT % "rm_rf", ["rm_rf"]),
+        ("ts-style: unoffered name passes through", TS % "wipe_disk", ["wipe_disk"]),
     ):
-        normal, calls = parse_tool_calls(raw, T)
+        _n, calls = parse_tool_calls(raw, T)
         names = [c["function"]["name"] for c in calls]
-        ok = names == want_names
-        # A rejected call must stay VISIBLE, not vanish -- silently swallowing an attempted
-        # call is the failure that hid an entire dialect until raw output was captured.
-        if ok and want_visible:
-            ok = bool(normal.strip())
-        out.append((label, ok, names, normal[:60]))
+        out.append((label, names == want, names))
     return out
 
 
@@ -167,13 +163,13 @@ if __name__ == "__main__":
             print("       got: %r" % (got,))
     print("=== round-trip: %s ===" % ("all passed" if not rt_fail else "%d FAILED" % rt_fail))
 
-    print("\n=== tool-name validation ===")
-    nv_fail = 0
-    for label, ok, names, normal in _name_validation_cases():
+    print("\n=== tool-name pass-through (owner decision) ===")
+    pt_fail = 0
+    for label, ok, names in _passthrough_cases():
         print("[%s] %s" % ("PASS" if ok else "FAIL", label))
         if not ok:
-            nv_fail += 1
-            print("       names=%r normal=%r" % (names, normal))
-    print("=== name validation: %s ===" % ("all passed" if not nv_fail else "%d FAILED" % nv_fail))
-    rt_fail += nv_fail
+            pt_fail += 1
+            print("       got names=%r" % (names,))
+    print("=== pass-through: %s ===" % ("all passed" if not pt_fail else "%d FAILED" % pt_fail))
+    rt_fail += pt_fail
     sys.exit(1 if (rt_fail or rc) else 0)

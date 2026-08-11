@@ -164,10 +164,7 @@ def _one_call(name, args):
 _FC_BLOCK = re.compile(r"<function_calls>\s*(\[.*?)(?:</function_calls>|$)", re.DOTALL)
 
 
-def _parse_imitation_calls(text, resolve=None):
-    """`resolve` maps an emitted name to one the client offered (None => never offered).
-    Passed in because this dialect returns EARLY from parse_tool_calls and would otherwise
-    skip name validation entirely -- the same hole, in the one path that bypasses it."""
+def _parse_imitation_calls(text):
     m = _FC_BLOCK.search(text)
     if not m:
         return None
@@ -181,85 +178,37 @@ def _parse_imitation_calls(text, resolve=None):
             arr = None
     if not isinstance(arr, list):
         return None
-    calls, rejected = [], False
+    calls = []
     for e in arr:
         if isinstance(e, dict) and e.get("name"):
             args = e.get("parameters") if isinstance(e.get("parameters"), dict) else e.get("input", {})
-            nm = _strip_ns(str(e["name"]))
-            canon = resolve(nm) if resolve else nm
-            if canon is None:
-                rejected = True
-                continue
-            calls.append(_one_call(canon, args or {}))
-    if not calls:
-        # Every call named a tool the client never offered: keep the block visible rather
-        # than returning None, which would hand back the raw text as if nothing happened.
-        return (text.strip(), []) if rejected else None
-    return (text[:m.start()].strip(), calls)
-
-
-def _tool_name_resolver(tools):
-    """Map a model-emitted tool name onto a name the CLIENT actually offered.
-
-    Returns a callable name -> canonical name, or None when the name was never offered.
-    The parser previously used `tools` only for argument TYPE coercion and never checked
-    the name, so the model could emit any identifier and we would hand the client a
-    well-formed call for a function it does not have. Measured before this existed:
-
-        <longcat_tool_call>functions.delete_all_files ... -> {"name": "delete_all_files",
-                                                              "arguments": {"path": "/"}}
-
-    Case-insensitive repair is included because the model does emit case variants of real
-    tools ("Get_Weather"), and a client matching its own registry exactly would reject
-    them; that is a name the client DID offer, so repairing it is honest rather than
-    permissive. Ambiguous case-folds (two offered tools differing only in case) are
-    treated as unknown rather than guessed.
-    """
-    exact, folded = set(), {}
-    for t in tools or []:
-        n = ((t.get("function") or {}).get("name") if isinstance(t, dict) else None)
-        if not n:
-            continue
-        exact.add(n)
-        folded.setdefault(n.lower(), []).append(n)
-
-    def resolve(name):
-        if not exact:
-            return name  # nothing offered to validate against; preserve prior behaviour
-        if name in exact:
-            return name
-        cands = folded.get(name.lower(), [])
-        return cands[0] if len(cands) == 1 else None
-    return resolve
+            calls.append(_one_call(_strip_ns(str(e["name"])), args or {}))
+    return (text[:m.start()].strip(), calls) if calls else None
 
 
 def parse_tool_calls(text, tools):
     """Return (normal_text, tool_calls[]). tool_calls in OpenAI shape (arguments = JSON string).
 
-    Names are validated against `tools`: a call naming a function the client never offered
-    is NOT emitted. Its raw block is appended to normal_text instead of being discarded, so
-    the attempt stays visible to the user rather than vanishing -- silently dropping a
-    call the model meant to make is the same failure that hid a whole tool-call dialect
-    until it was found by capturing raw output."""
+    Names are reported AS THE MODEL EMITTED THEM. `tools` is consulted only to coerce
+    argument types -- deliberately not to validate the name.
+
+    This is a standing decision, not an oversight, and it has already been made twice: an
+    audit flagged unvalidated names as a defect, name validation was implemented, and the
+    owner reversed it -- "let the client decide what the model's string is allowed to do."
+    The parser's job is to report faithfully what the model produced; whether a given name
+    is permissible belongs to the client, which owns the handler registry and the policy.
+    Nothing is executed here, so a name we do not recognise is information, not a hazard.
+
+    Do not re-add validation, name repair, or normalisation without the owner reversing
+    this. test/test_tool_parsing.py pins the behaviour."""
     if "<longcat_tool_call>" not in text:
-        imit = _parse_imitation_calls(text, _tool_name_resolver(tools))
+        imit = _parse_imitation_calls(text)
         if imit:
             return imit
         return text, []
     idx = text.find("<longcat_tool_call>")
     normal = text[:idx].strip()
     calls = []
-    rejected = []
-    _resolve = _tool_name_resolver(tools)
-
-    def _emit(name, args, block):
-        """Emit a call only if the client offered this tool; otherwise keep it visible."""
-        canon = _resolve(name)
-        if canon is None:
-            rejected.append(block)
-            return
-        calls.append(_one_call(canon, args))
-
     for block in _TC.findall(text):
         block = block.strip()
         pairs = _PAIR.findall(block)
@@ -279,7 +228,7 @@ def parse_tool_calls(text, tools):
                         pass
                 args[k] = v
             if name:
-                _emit(name, args, block)
+                calls.append(_one_call(name, args))
             continue
         m = _TS_CALL.match(block)  # syntax 2: TS-style call with object-literal args
         if not m:
@@ -290,7 +239,7 @@ def parse_tool_calls(text, tools):
                 name = _strip_ns(nm.group(1).strip())
                 args = _parse_object_prefix(mo.group(1))
                 if name and args is not None:
-                    _emit(name, args, block)
+                    calls.append(_one_call(name, args))
             continue
         name, args = _strip_ns(m.group(1).strip()), _parse_object_literal(m.group(2))
         if args is None or not name:
@@ -300,13 +249,9 @@ def parse_tool_calls(text, tools):
             for tu in args["tool_uses"]:
                 tn = _strip_ns(str(tu.get("recipient_name", "")).strip())
                 if tn:
-                    _emit(tn, tu.get("parameters") or {}, block)
+                    calls.append(_one_call(tn, tu.get("parameters") or {}))
         else:
-            _emit(name, args, block)
-    if rejected:
-        # Surfaced, not swallowed: the user sees the model tried to call something the
-        # client never offered, instead of an empty reply with no explanation.
-        normal = (normal + "\n" + "\n".join(rejected)).strip()
+            calls.append(_one_call(name, args))
     return normal, calls
 
 
