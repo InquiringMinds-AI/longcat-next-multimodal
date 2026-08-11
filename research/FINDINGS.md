@@ -2414,3 +2414,42 @@ this branch already shipped once this session.
 Owner reviewed the paired output: **"these are both up to the standard."** Ships default-on,
 `LCN_REFINER_FAST=0` to opt out. First lever in the campaign that improves SINGLE-image latency;
 it stacks with head batching, which only helped n≥2.
+
+### Operational polish: prewarm, /status, bounded restart (2026-08-11)
+
+**`LCN_PREWARM=1`** — the generation heads allocate ~25 GB lazily on FIRST USE and the visual
+decoder + refiner lazy-load on the first decode, so whoever sent the first request paid ~140 s
+with no signal anything unusual was happening. Prewarm issues one real image generation and one
+short TTS at startup, so the cost lands during load.
+
+| | |
+|---|---|
+| prewarm at startup | image **310.2 s** + audio **44.4 s** |
+| first real user request after | **212.7 s** — warm range (196–246 s), vs ~338 s cold |
+
+Note the proportion changed today: before the refiner fix a warm image was ~246 s and the lazy
+tax was ~92 s; now a warm image is ~196 s and the tax is ~140 s of a smaller total. **Making the
+warm path faster made the cold-start surprise proportionally worse**, which is why this moved up
+the queue rather than staying a nicety.
+
+Skipped under `LCN_AGENT=1` — that profile 403s the generation endpoints precisely so the heads
+never allocate, and prewarming would spend the memory the profile exists to protect. Failure is
+non-fatal; the audio half failing does not fail the whole prewarm, because the image half is the
+expensive one and is already done.
+
+The TTS prompt is SHARED with the endpoint via `_tts_prompt()` rather than copied. A copy would
+silently stop matching the moment either side is edited, and **a warmup that exercises a path
+nobody uses is worse than no warmup, because it looks warm.**
+
+**`GET /status`** reports build id + the EFFECTIVE config read from the live process (not from
+what a launcher intended to set) + prewarm state. This exists because "which build is running,
+with which flags?" was answered all session by reading scripts and inferring — the same habit
+that left a two-day-resolved DO-NOT-SHIP rail standing in ROADMAP §4 while the configs it warned
+about were in the shipping image.
+
+**`restart: on-failure:3`** — bounded, not `always`. The entrypoint exits 1 when a managed
+process dies, so a transient failure recovers unattended while a genuine misconfiguration stops
+after 3 attempts instead of crash-looping a ~90 GB load against a 128 GB box.
+
+Battery green on the shipping build (`da750fb`): codebook batching 7/7, head batching 40/40, tool
+parsing, audio-chat 8/8, stream util 5/5, selftest 7/7, anthropic 6/6, degeneracy 6/6.

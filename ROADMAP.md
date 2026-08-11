@@ -789,9 +789,25 @@ optimizations that trade modalities for speed:
 
 ## 6. Operational polish
 
-- [ ] **`LCN_PREWARM=1`**: opt-in startup warmup of the image/audio generation heads —
-      moves the ~25 GB lazy allocation and the 4–5 min first-image surprise to load
-      time, where the operator expects cost.
+- [x] **`LCN_PREWARM=1` — DONE 2026-08-11.** Opt-in startup warmup of BOTH generation
+      paths; moves the ~25 GB lazy allocation and the first-image surprise to load time.
+      Measured: prewarm pays **310.2 s (image) + 44.4 s (audio)** at startup, and the
+      first real user request afterwards took **212.7 s — warm range (196–246 s), not the
+      ~338 s it would otherwise have cost.** Skipped under `LCN_AGENT=1`, which 403s those
+      endpoints precisely so the heads never allocate. Non-fatal on failure. The TTS
+      prompt is SHARED with the endpoint (`_tts_prompt`), not copied — prewarm must
+      exercise the same path a real request takes, or it warms something nobody uses and
+      merely looks warm.
+- [x] **`GET /status` — DONE 2026-08-11.** Build id (`--build-arg LCN_BUILD`) plus the
+      EFFECTIVE config read from the live process, plus prewarm state. Exists because
+      "which build is running, with which flags?" was repeatedly answered by reading
+      launcher scripts and inferring — the same habit that left a resolved DO-NOT-SHIP
+      rail standing in section 4 for two days.
+- [x] **`restart: on-failure:3` — DONE 2026-08-11** in compose and the Spark launcher
+      (verified on the live container). Bounded rather than `always`: the entrypoint
+      exits 1 when a managed process dies, so a transient failure recovers unattended
+      while a genuine misconfiguration stops after 3 tries instead of crash-looping a
+      ~90 GB model load against a 128 GB box.
 - [x] **Multimodal prefix-cache collision** (FIXED 2026-08-10, validated) — image/video/
       audio understanding could return ANOTHER request's media, because the processor
       pre-assigned a constant `pad_value` and thereby suppressed sglang's per-item content
