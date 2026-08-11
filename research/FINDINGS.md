@@ -1873,3 +1873,53 @@ above "usable" here than a clean baseline would give. This raises the value of t
 variant — quantize only the transformer layers (81–87% of the bytes) and keep the per-level
 output projections at BF16 — and makes the paired A/B on identical prompts mandatory rather
 than nice to have. A ~15% latency gain is not worth dropping below usable.
+
+### CUDA graphs are worth 6% on this box — the eager hypothesis is refuted
+
+Prediction stated before the run: graphs_off near 15–20 tok/s would support the hypothesis that
+the unexplained ~120ms/frame is eager-mode overhead; above ~30 would kill it. Matched arms, warm
+medians, 3 warmup samples discarded on each:
+
+| arm | warm median text throughput |
+|---|---|
+| graphs ON (default) | 40.29 tok/s |
+| graphs OFF (`LCN_CUDAGRAPH=0`) | 37.75 tok/s |
+
+**6%. Refuted.** And the reason follows from the owner's ground truth: CUDA graphs remove kernel
+LAUNCH overhead, which pays off when kernels finish fast and the GPU idles waiting for the next
+launch. When every kernel is stalled on memory, launch overhead hides in the shadow of the
+memory wait. Graphs buy little here *because* the box is bandwidth-bound.
+
+**Retroactive consequences, both useful:**
+
+* The generation CUDA-graph veto was never important. It disables graphs for generation batches,
+  and graphs are worth 6%. The earlier entry refuting the batch-aware veto reached the right
+  conclusion (structural, not a bug) — but the magnitude was never there either way.
+* It explains why overturning the old "CUDA graphs are broken" verdict and making them a default
+  produced no visible speedup.
+
+**A mechanism I asserted earlier is withdrawn.** The 20.18 → 8.29 tok/s text penalty during
+generation is real, but I implied it was graph loss. It cannot be — graphs are 6%. The most
+likely remaining contributor is that generation also disables NGRAM speculative decode, which is
+worth far more on this box. UNVERIFIED and labelled as such; a second unverified mechanism is not
+an explanation.
+
+**The frame budget stays open.** Head 54ms + backbone ~27ms = 81ms of the measured 174ms/frame.
+Candidates for the rest include CFG running a second backbone path, per-level sampling, and the
+refiner. Two hypotheses about this budget have now been refuted in a row, so the next step is an
+actual profile, not a third theory.
+
+### Perf list after a day of measurement — what survived
+
+| item | status | measured value |
+|---|---|---|
+| cross-request head batching | **live, best lever** | bs=8 = 1.22× bs=1; n=4 should approach n=1 vs 3.76% today |
+| int8 heads (transformer layers only) | live, gated | ~15% single-image; spends quality that is already thin |
+| KV-cache head across levels | DEAD | removes recompute; recompute is free here |
+| batch-aware generation veto | DEAD | one merged decode batch; and graphs are 6% anyway |
+| eager-mode overhead | DEAD | 6% |
+| removing ~800 host syncs/frame | DEAD (earlier) | no measurable change; forward-pass bound |
+
+Every dead item was killed by a measurement that cost minutes. Cross-request batching is the
+only survivor that costs no output quality, which after the owner's verdict on the four images
+is the property that matters most.
