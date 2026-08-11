@@ -798,6 +798,13 @@ optimizations that trade modalities for speed:
       prompt is SHARED with the endpoint (`_tts_prompt`), not copied — prewarm must
       exercise the same path a real request takes, or it warms something nobody uses and
       merely looks warm.
+      ⚠ **Memory note (measured 2026-08-11):** with BOTH heads warmed the box settles at
+      ~3.96 GB MemAvailable (~123.6 GB in use of 128), against ~6.7–8.5 GB when only the
+      image head had allocated. This is NOT extra memory — it is the true all-modality
+      footprint, which any deployment that generates both an image and audio reaches
+      anyway; prewarm just arrives there at startup instead of on first use. Margin is
+      thin on a box that hard-powers-off near its ceiling, so do not stack prewarm with a
+      raised mem-fraction, and re-measure before co-running anything else.
 - [x] **`GET /status` — DONE 2026-08-11.** Build id (`--build-arg LCN_BUILD`) plus the
       EFFECTIVE config read from the live process, plus prewarm state. Exists because
       "which build is running, with which flags?" was repeatedly answered by reading
