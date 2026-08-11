@@ -2351,3 +2351,66 @@ anthropic route **6/6**, degeneracy **6/6**.
 **So the optimisation is real and worth having: −16.4% wall on two concurrent images, no quality
 cost, nothing at n=1.** It cost a correctness bug and roughly three hours to get there, and the
 bug was caught by a human looking at pictures rather than by any of the eight suites.
+
+---
+
+## The refiner: 98% of post-generation cost, never profiled, −41% for identical math
+
+With head batching done, the refiner was the largest remaining cost. **It had never been
+profiled, and the profile cost nothing** — the split fell straight out of `docker logs -t`,
+because the code already prints "Decoded image saved" BETWEEN the two stages, and the pipeline
+already runs tqdm with the progress bar enabled:
+
+| stage | time | share |
+|---|---|---|
+| VQ codes → pixel decoder (under `autocast(float32)`) | ~1.75 s | 1.8% |
+| **refiner, 10 denoising steps** | **~95.7 s** | **98.2%** |
+
+Per step: **9.46–9.50 s/it, flat across all 10 steps and identical across four runs.** The
+uniformity matters — no warm-up step, no first-iteration compile cost, so the whole span is ten
+identical forwards, and any fix has to attack the steady state.
+
+**Two of my own claims died here, both cheaply, both by looking:**
+* "It runs a 28-step default nobody chose" — WRONG. `longcat_next_visual.py` already sets
+  `REFINER_STEPS` defaulting to **10**, with a recorded note that 10 is visually on par with the
+  canonical 28. That lever was already taken.
+* "The fp32 autocast on the decoder is the suspect" — WRONG. That stage is 1.75 s, 1.8%.
+
+**The arithmetic that located it.** ~3B params ≈ 6 GB bf16 → ~27 ms/step of weight traffic at the
+measured 220 GB/s, against an actual 9480 ms: **350×**. Implied ~3.3 TFLOPS, low single-digit
+percent of the GPU. So neither bandwidth- nor compute-bound — pathological. Fleet memory holds the
+matching precedent: *"MOVA 720p DiT ~12 min/step on GB10 (no sm_121 kernels)"* — same model class,
+same box.
+
+**Root cause.** `flash_attn` is absent from the image (verified in-container, not inferred), so the
+refiner's attention always took the SDPA fallback, which still ran `_upad_input` per layer per step
+(flash-only work, discarded here, with a `.item()` sync) and handed SDPA an explicit **float mask**.
+A float mask disqualifies the flash and mem-efficient backends and forces the **math** backend to
+materialise the full `[B, heads, S, S]` score matrix.
+
+The runtime diagnostic also corrected the sequence length I had estimated from config: the refiner
+attends at **1369 / 4225 / 5594 / 9819** tokens, not one length — and at 9819 with 21 heads the
+score matrix is ~4 GB per layer per step, 32 layers, 10 steps. It further confirmed **every one of
+those masks is all-true**, which is what makes dropping it identical math rather than an
+approximation.
+
+| | slow path | fast path | delta |
+|---|---|---|---|
+| refiner per step | 9.46 s/it | **5.58 s/it** | **−41%** |
+| refiner span | 95.4 s | **56.5 s** | −41% |
+| single image, end to end | 246.5 s | **196.5 s** | **−20.3%** |
+
+**Instrument note, third occurrence of the same trap today:** the first A/B read 344 s → 196 s
+because arm A was the container's FIRST image and paid the ~25 GB lazy-allocation tax. Discarded
+and re-measured warm. A cold arm against a warm arm is not an A/B, and this campaign has now been
+bitten by it three times.
+
+**Why the all-true check stays on the hot path despite costing a host sync:** every refiner mask is
+all-true *today* because one unpadded image is refined at a time. Batching concurrent refines — the
+obvious next step — produces ragged batches whose masks genuinely are not. Hard-coding today's
+observation would convert that future change into a silent correctness bug of precisely the kind
+this branch already shipped once this session.
+
+Owner reviewed the paired output: **"these are both up to the standard."** Ships default-on,
+`LCN_REFINER_FAST=0` to opt out. First lever in the campaign that improves SINGLE-image latency;
+it stacks with head batching, which only helped n≥2.
