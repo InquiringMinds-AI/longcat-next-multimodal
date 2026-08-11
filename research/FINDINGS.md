@@ -1923,3 +1923,50 @@ actual profile, not a third theory.
 Every dead item was killed by a measurement that cost minutes. Cross-request batching is the
 only survivor that costs no output quality, which after the owner's verdict on the four images
 is the property that matters most.
+
+### The missing frame budget: CFG runs a SEPARATE batch-1 backbone forward per request
+
+Two hypotheses about the unexplained ~120ms/frame were refuted (eager overhead, then head
+cost), and I said the next step was a profiler rather than a third theory. This is not a third
+theory — it is what the code does.
+
+`IMAGE_GEN_CFG_SCALE` defaults to **3.0**, so classifier-free guidance is always active, and
+`_run_uncond_decode` is not a cheap fusion: it constructs its own `ForwardBatch` with
+`batch_size = 1` and runs a COMPLETE backbone forward of the 75B-A3B model, per generating
+request, per step. Each image frame therefore pays:
+
+    conditional backbone (batched, shared with the main decode batch)
+  + unconditional backbone (SEPARATE, batch-1, per request)      <-- the missing term
+  + ~54ms of depth head
+
+**Why this is the best lever available.** The uncond forward is standalone and batch-1. On a
+bandwidth-bound box a forward's cost is dominated by reading weights, not by how many rows ride
+along — so merging the uncond path into the main decode batch makes it nearly free. Unlike
+cross-request head batching it helps at N=1, and unlike int8 heads it costs NO output quality,
+because the math is identical and only the batching changes.
+
+**Premise verified before designing anything** — and it needed verifying, because this is an
+MoE, where two tokens can route to disjoint experts and batching can cost full price unlike a
+dense model:
+
+| n concurrent text streams | per-stream | aggregate |
+|---|---|---|
+| 1 | 26.62 tok/s | 26.61 |
+| 2 | 32.45 (1.22×) | 64.65 (**2.43×**) |
+| 4 | 21.20 (0.80×) | 82.29 (3.09×) |
+
+Batch 1 → 2 costs essentially nothing (the second stream rode along free; aggregate more than
+doubled). That is exactly the 1→2 increase the CFG merge needs. Sublinear but real cost appears
+by n=4, so this supports merging cond+uncond, not unbounded batching.
+
+**Revised perf ranking:**
+
+| lever | gain | quality cost |
+|---|---|---|
+| merge CFG uncond into the main decode batch | ~15–23% at N=1; N forwards saved at N concurrent | none |
+| cross-request head batching | ~3× at n=4; nothing at n=1 | none |
+| int8 heads (transformer layers only) | ~15% at N=1 | real, and headroom is thin |
+
+Note the method: reading `_image_gen_token_step` to size a DIFFERENT optimization (head batching)
+is what surfaced this. The frame budget was closed by reading the call path, not by profiling —
+after two theories about it had already failed.
