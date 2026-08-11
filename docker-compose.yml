@@ -28,4 +28,9 @@ services:
       # - MAX_TOTAL_TOKENS=131072
       # - IMAGE_GEN_CFG_SCALE=3.0
       # - LCN_VERBOSE=0
-    restart: "no"
+      # - LCN_PREWARM=1       # warm the generation heads at startup (~4 min) instead of
+      #                       # making the first real request pay ~140s of lazy allocation
+    # Bounded restart, not "always": the entrypoint exits 1 when a managed process dies,
+    # so a transient failure recovers unattended, while a genuine misconfiguration stops
+    # after 3 attempts instead of crash-looping a ~90GB model load against a 128GB box.
+    restart: on-failure:3

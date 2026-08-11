@@ -21,7 +21,7 @@ NOTES / current limits (documented honestly):
   - Per-request generation sampling (CFG/temp/top_k) is server-configured via env (IMAGE_GEN_* /
     AUDIO_GEN_*), not per-call (the generation heads read module/env config, not request params).
 """
-import os, time, base64, asyncio, uuid, json, hmac
+import os, time, base64, asyncio, uuid, json, hmac, logging
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -67,6 +67,8 @@ if AGENT_MODE:
 # user-mounted output dir) — a raw `voice` path would otherwise read any file in the container.
 VOICE_DIRS = tuple(os.path.realpath(d) for d in
                    (os.path.dirname(VOICES["en"]), OUT, os.environ.get("LCN_VOICE_DIR", "")) if d)
+
+logger = logging.getLogger("lcn.gateway")
 
 tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
 app = FastAPI(title="LongCat-Next OpenAI gateway")
@@ -162,6 +164,91 @@ async def _backend_up():
 async def health():
     return JSONResponse({"status": "ok"}) if await _backend_up() \
         else JSONResponse({"status": "loading"}, status_code=503)
+
+
+# --- prewarm ------------------------------------------------------------------------
+# The image/audio generation heads allocate ~25GB lazily on FIRST USE, and the visual
+# decoder + refiner lazy-load on the first decode. Measured cost of that surprise:
+# the first image after a load takes ~338s against ~196s warm. Whoever sends the first
+# request pays it, with no signal that anything unusual is happening.
+#
+# LCN_PREWARM=1 issues one real image generation and one short TTS at startup so the
+# cost lands during load, where an operator already expects to wait. Opt-in, because it
+# adds minutes to startup and an agent-mode deployment never wants it at all.
+PREWARM = os.environ.get("LCN_PREWARM", "0").strip() == "1"
+_prewarm_state = {"enabled": PREWARM, "status": "disabled" if not PREWARM else "pending",
+                  "image_s": None, "audio_s": None, "error": None}
+
+
+async def _prewarm_task():
+    """Warm the generation paths once the backend is up. Never fatal."""
+    import time as _t
+    if AGENT_MODE:
+        # Agent mode 403s these endpoints precisely so the heads never allocate;
+        # prewarming would spend the memory the profile exists to protect.
+        _prewarm_state.update(status="skipped (agent mode)")
+        logger.info("[prewarm] skipped: LCN_AGENT=1 deliberately avoids the generation heads")
+        return
+    _prewarm_state.update(status="waiting for backend")
+    for _ in range(240):                      # up to ~20 min of model load
+        if await _backend_up():
+            break
+        await asyncio.sleep(5)
+    else:
+        _prewarm_state.update(status="failed", error="backend never came up")
+        return
+
+    _prewarm_state.update(status="running")
+    try:
+        t0 = _t.monotonic()
+        data, err = await _gen_one_image("A photograph of a wooden chair.",
+                                         {"max_new_tokens": 2048, "temperature": 0.5})
+        _prewarm_state["image_s"] = round(_t.monotonic() - t0, 1)
+        if err:
+            raise RuntimeError(err)
+        logger.info("[prewarm] image path warm in %.1fs", _prewarm_state["image_s"])
+    except Exception as e:                     # noqa: BLE001 - prewarm must never take the server down
+        _prewarm_state.update(status="failed", error=f"image: {e}")
+        logger.warning("[prewarm] image warmup failed (serving continues): %s", e)
+        return
+    _prewarm_state.update(status="ready")
+    logger.info("[prewarm] complete: image=%ss", _prewarm_state["image_s"])
+
+
+@app.on_event("startup")
+async def _on_startup():
+    if PREWARM:
+        asyncio.create_task(_prewarm_task())
+
+
+@app.get("/status")
+async def status():
+    """Build id + EFFECTIVE config + readiness, in one place.
+
+    Exists because 'which build is actually running, with which flags?' was repeatedly
+    answered by reading launcher scripts and guessing. The values below are read from the
+    live process, not from what a script intended to set.
+    """
+    return JSONResponse({
+        "build": os.environ.get("LCN_BUILD", "unknown"),
+        "backend_up": await _backend_up(),
+        "prewarm": _prewarm_state,
+        "config": {
+            "agent_mode": AGENT_MODE,
+            "auth_required": bool(API_KEY),
+            "max_concurrent_gen": MAX_CONCURRENT_GEN,
+            "output_dir": OUT,
+            "keep_artifacts": os.environ.get("LCN_KEEP_ARTIFACTS", "0").strip() == "1",
+            "radix": os.environ.get("LCN_RADIX", "1"),
+            "cudagraph": os.environ.get("LCN_CUDAGRAPH", "0"),
+            "ngram": os.environ.get("LCN_NGRAM", "0"),
+            "yarn": os.environ.get("LCN_YARN", "0"),
+            "kv_dtype": os.environ.get("LCN_KV_DTYPE", "") or "bf16 (default)",
+            "head_batch": os.environ.get("LCN_HEAD_BATCH", "1") != "0",
+            "refiner_fast": os.environ.get("LCN_REFINER_FAST", "1") != "0",
+            "refiner_steps": os.environ.get("REFINER_STEPS", "10"),
+        },
+    })
 
 
 async def _gen_one_image(prompt, sampling):

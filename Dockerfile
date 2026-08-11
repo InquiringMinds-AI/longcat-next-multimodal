@@ -80,6 +80,13 @@ COPY anthropic_route.py /workspace/scripts/anthropic_route.py
 # default output dir for generated PNG/WAV (override + mount via run.sh)
 ENV LCN_OUTPUT_DIR=/tmp
 
+# Build identity, surfaced by GET /status. Pass it at build time:
+#   docker build --build-arg LCN_BUILD=$(git rev-parse --short HEAD) -t longcat-next-gb10 .
+# Defaults to "unknown" rather than failing, because the build context is rsync'd without
+# .git on the serving host and a missing label must not block a rebuild.
+ARG LCN_BUILD=unknown
+ENV LCN_BUILD=${LCN_BUILD}
+
 COPY entrypoint.sh /usr/local/bin/lcn-serve
 RUN chmod +x /usr/local/bin/lcn-serve
 ENTRYPOINT ["/usr/local/bin/lcn-serve"]
