@@ -2197,3 +2197,95 @@ image.** Solo latency is unchanged. This is throughput under concurrent load.
 
 Battery green on the shipped image: head-batching 40/40, tool parsing all passed, audio-chat
 prompt 8/8, stream util 5/5.
+
+### CORRECTION: the batched result above was measured on CONTAMINATED output
+
+**The owner looked at the four images and said: "barn a, barn b, sailboat, barn b duplicate."**
+The head-batched run's SAILBOAT request had returned a BARN. The performance numbers in the
+section above were measured on a run whose two concurrent images were the same picture, and the
+change was reported as good before anyone had looked. The battery was green throughout — 7/7
+modalities, 6/6 anthropic, 6/6 degeneracy, 40/40 on the batching test — because not one of those
+tests varies its inputs across concurrent requests.
+
+**Confirmed, then isolated.** Reproduced first try with unmistakable prompts ("red barn in a
+green field" + "yellow taxi on a city street at night" -> two barns). Localized by adding
+`LCN_HEAD_BATCH=0`, which forces the per-request path in the SAME build, so batching could be
+A/B'd without confounding it with every other difference between two images:
+
+| | batching ON | batching OFF |
+|---|---|---|
+| barn request | barn | barn |
+| taxi request | **barn (WRONG)** | **taxi (correct)** |
+| pair wall | 327 s | 414 s |
+
+One environment variable apart. The optimization owned the defect.
+
+### Root cause: a shape check standing in for intent
+
+```python
+if cfg_scale != 1.0 and logits.shape[0] == 2:      # <- the bug
+    cond_logits, uncond_logits = logits.chunk(2, dim=0)
+    logits = cfg_scale * (cond_logits - uncond_logits) + uncond_logits
+```
+
+`IMAGE_GEN_CFG_SCALE` is **3.0 by default even though CFG never runs** (it is disabled by never
+wiring `_model_runner`, not by setting the scale to 1.0), so the left side is always true. The
+right side asked "is the batch 2?" as a PROXY for "are these rows a cond/uncond guidance pair?"
+— an invariant that held for the entire life of the code because every call was batch-1 or a
+genuine CFG pair, and which was never written down.
+
+Cross-request batching introduced a SECOND legitimate reason for a batch to be 2. Request A
+became "cond", request B became "uncond", the two were fused into one `[1, V]` row, and the
+resulting `[1]` sample was **broadcast** into the `[2]` slot of `next_token_ids` — giving both
+requests A's tokens at every level.
+
+Every observation follows exactly:
+* token 1 DIFFERED between the two requests — it is generated on the batch-1 prefill path, where
+  `shape[0] == 2` is false;
+* every token from the first batched decode step on was identical — hence two identical images;
+* the two decoded PNGs were near-identical but not byte-identical — same visual tokens, two
+  independent refiner passes;
+* **three** concurrent requests were always CORRECT, because `== 2` never fires at bs=3. A defect
+  that appears at exactly two concurrent requests and vanishes at three is a shape-guard bug and
+  nothing else.
+
+**Fix:** decide once, from the only ground truth available, and never re-derive it downstream.
+
+```python
+use_cfg = cfg_scale != 1.0 and uncond_hidden is not None
+...
+if use_cfg:                                        # not logits.shape[0] == 2
+```
+
+Plus two guards, because broadcasting is CORRECT under CFG (cond and uncond must be conditioned
+identically at the next level) and a correctness bug without it, so the two must not share a bare
+assignment: an explicit `next_token.shape[0] != bs` check before the token write, and a
+`visual_ids.shape[0] != len(pending)` check before scattering back to per-request state.
+
+### Why 40/40 passed against broken code
+
+`test_head_batching.py` tests `CasualDepthTransformerHead`. The head is innocent — it was the
+CALLER that mixed the rows. **Testing the component NEXT TO the defect is not evidence about the
+defect**, and this is the same campaign that already recorded "verifying a mechanism is not
+verifying a bug". The suite also ran a synthetic head on CPU through a stand-in embedding
+function, while production runs trained weights on CUDA through `flash_attn_varlen_func`.
+
+`test/test_codebook_batching.py` is the regression test that actually covers it, and it
+discriminates — **5/7 against the broken build, 7/7 against the fixed one**, with row 1 caught
+returning row 0's exact tokens (`got=[0,1,2,3] want=[1,2,3,4]`). It runs offline on CPU in
+seconds, deterministically (top-k 1 over a stub head whose argmax is a function of the row
+index), replacing a symptom that previously took ~12 minutes of GPU generation and a human
+looking at two pictures. It deliberately leaves `IMAGE_GEN_CFG_SCALE` at its real 3.0 default,
+because neutralising it would make the test pass against the broken code.
+
+**The generalisable lesson: a shape check used as a proxy for intent is a tripwire for whoever
+widens the input space next.** It is invisible while the invariant holds and silent when it
+breaks.
+
+**Sibling audit done (2026-08-11), clean.** Grepped `shape[0] ==` and `chunk(2` across
+`longcat_next_mm.py`, `_heads.py`, `_audio.py`, `_visual.py`: the only other occurrences are an
+emptiness check (`raw_ids.shape[0] == 0`) and an assertion in the visual encoder. The audio path
+carries no equivalent shape-as-intent guard — so when `_generate_audio_codebook_step` is
+eventually batched, THIS bug is not waiting there. Its own obstacle is different and already
+recorded in ROADMAP 5b: per-request sampling state (a repetition penalty over the last 50
+frames).

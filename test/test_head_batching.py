@@ -52,7 +52,12 @@ def build():
         transformer_dim=TDIM,
         transformer_ffn_scale=FFN_SCALE,
     ).eval()
-    # A stand-in for the model's _codebook_embed_fn: any callable id -> embedding.
+    # A STAND-IN for the model's _codebook_embed_fn -- note the gap this leaves: the real
+    # function is not exercised here, so a batch-scrambling reshape inside IT would pass
+    # this test. It was checked separately by inspection and is shape-preserving
+    # (`flat_ids = token_ids.reshape(-1)` ... `embeds.view(*orig_shape, hidden_size)`,
+    # row-major, order preserved). Loading the real one needs the full model, which is why
+    # this suite uses a stand-in at all.
     table = torch.randn(max(CODEBOOKS) + 1, HIDDEN)
 
     def emb(ids):

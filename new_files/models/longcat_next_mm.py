@@ -65,6 +65,12 @@ class AudioGenState:
 _envf = lambda k, d: float(os.environ.get(k, d))
 _envi = lambda k, d: int(os.environ.get(k, d))
 _LCN_VERBOSE = os.environ.get("LCN_VERBOSE", "0") == "1"  # gate per-step debug logging
+# Cross-request head batching. LCN_HEAD_BATCH=0 forces the per-request path so the
+# optimisation can be A/B'd inside ONE build (see _image_gen_flush).
+_LCN_HEAD_BATCH = os.environ.get("LCN_HEAD_BATCH", "1").strip() != "0"
+# LCN_DIAG_HS=1: per-row hidden-state fingerprints at the batched head call, for
+# localizing cross-request content bleed. Debug only; costs a host sync per row.
+_LCN_DIAG_HS = os.environ.get("LCN_DIAG_HS", "0").strip() == "1"
 AUDIO_GEN_TEMPERATURE = _envf("AUDIO_GEN_TEMPERATURE", 0.5)
 AUDIO_GEN_TOP_K = _envi("AUDIO_GEN_TOP_K", 5)
 AUDIO_GEN_TOP_P = _envf("AUDIO_GEN_TOP_P", 0.85)
@@ -1127,7 +1133,23 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         num_codebooks = len(self._visual_codebook_sizes)
         cfg_scale = IMAGE_GEN_CFG_SCALE
 
-        if cfg_scale != 1.0 and uncond_hidden is not None:
+        # Whether the rows of `batched_hidden` are a CFG guidance PAIR. Decided ONCE,
+        # here, from the only ground truth there is -- whether an uncond hidden state was
+        # actually supplied -- and never re-derived from the batch size downstream.
+        #
+        # This is the bug that made two concurrent images come out identical: the fusion
+        # below used to trigger on `logits.shape[0] == 2`, i.e. it inferred "these two rows
+        # are cond+uncond" from the batch merely being 2. That was safe only while every
+        # call was batch-1-or-a-CFG-pair. Once cross-request batching put TWO REQUESTS in
+        # one call, request A became "cond" and request B became "uncond", they were fused
+        # into a single row, and the [1] sampled token broadcast into the [2] slot of
+        # next_token_ids -- giving both requests A's tokens for every level from the first
+        # batched decode step on. (Token 1 escaped because it is generated on the batch-1
+        # prefill path.) cfg_scale is 3.0 by DEFAULT while CFG itself is off, so the guard
+        # was live even though CFG never runs -- shape is not a proxy for intent.
+        use_cfg = cfg_scale != 1.0 and uncond_hidden is not None
+
+        if use_cfg:
             batched_hidden = torch.cat([cond_hidden, uncond_hidden], dim=0)
         else:
             batched_hidden = cond_hidden
@@ -1140,8 +1162,8 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 batched_hidden, next_token_ids, self._codebook_embed_fn, level,
             )
 
-            # CFG fusion
-            if cfg_scale != 1.0 and logits.shape[0] == 2:
+            # CFG fusion. Gated on use_cfg, NOT on logits.shape[0] == 2 -- see above.
+            if use_cfg:
                 cond_logits, uncond_logits = logits.chunk(2, dim=0)
                 logits = cfg_scale * (cond_logits - uncond_logits) + uncond_logits
 
@@ -1170,6 +1192,18 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             # and next_token is a GPU tensor, so the add never needed the host at all.
             # The audio path already avoids this via _audio_offset_host; the visual path was
             # simply never given the same treatment.
+            # SHAPE GUARD. Under CFG the fused sample is [1] and is written to BOTH rows on
+            # purpose: cond and uncond must be conditioned on the same tokens at the next
+            # level. Without CFG there must be exactly one sample PER ROW -- a [1] into a
+            # [bs] slot broadcasts silently and hands every request row 0's token, which is
+            # how two concurrent images came out identical. Broadcasting is correct in one
+            # case and a correctness bug in the other, so the two cannot share a bare assign.
+            if not use_cfg and next_token.shape[0] != bs:
+                raise RuntimeError(
+                    f"visual codebook sampling produced {next_token.shape[0]} tokens for "
+                    f"{bs} rows at level {level} (use_cfg={use_cfg}). Refusing to broadcast: "
+                    f"this would give every concurrent request the first row's token."
+                )
             next_token_ids[:, level] = next_token + self.visual_offset_vals[level]
 
         return next_token_ids if return_all else next_token_ids[0]
@@ -2062,7 +2096,12 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         if not pending:
             return
 
-        if IMAGE_GEN_CFG_SCALE != 1.0 and self._model_runner is not None:
+        # LCN_HEAD_BATCH=0 forces the per-request path in the SAME build. Exists so
+        # batching can be A/B'd without changing anything else: a cross-request defect
+        # observed on a batched build is otherwise confounded with every other
+        # difference between two images, and swapping builds costs ~8 min of load each
+        # way. Default on.
+        if not _LCN_HEAD_BATCH or (IMAGE_GEN_CFG_SCALE != 1.0 and self._model_runner is not None):
             for (i, req_idx, state, position, cond_seq_len) in pending:
                 overrides[i] = self._image_gen_token_step(
                     i, req_idx, state, hidden_states[i:i+1],
@@ -2071,9 +2110,43 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             return
 
         rows = torch.cat([hidden_states[i:i+1] for (i, _r, _s, _p, _l) in pending], dim=0)
+
+        # LCN_DIAG_HS=1: fingerprint each row's INPUT hidden state. This localizes a
+        # cross-request content bleed to one side of the head: if two concurrent
+        # requests arrive here with the SAME fingerprint, their contexts were already
+        # identical upstream (backbone/KV/prefix cache) and the head is innocent; if
+        # they arrive different and the images still converge, the head path owns it.
+        # Off by default -- it costs a host sync per row.
+        if _LCN_DIAG_HS and len(pending) > 1:
+            # Sample DEEP, not just at the start: the early tokens are near-deterministic
+            # and were identical across rows even in a run whose images came out correct,
+            # so tokens 1-3 cannot discriminate. Divergence has to be looked for where the
+            # images actually differ.
+            _t = pending[0][2].current_image_token_num
+            if _t in (1, 2, 3, 50, 200, 500, 900, 1300):
+                fps = []
+                for k, (_i, req_idx, state, _p, _l) in enumerate(pending):
+                    r = rows[k].float()
+                    fps.append(f"req={req_idx} norm={r.norm().item():.6f} "
+                               f"sum={r.sum().item():.6f}")
+                same = torch.equal(rows[0], rows[1]) if len(pending) >= 2 else False
+                logger.info(f"[ImageGen] HS-DIAG tok={_t} rows_identical={same} :: "
+                            + " | ".join(fps))
+
         visual_ids = self._generate_image_codebook_step(
             rows, None, return_all=True,
         )  # [n, num_codebooks]
+
+        # Paired with HS-DIAG above: same checkpoints, the head's OUTPUT. Together they
+        # localize a cross-request bleed to one side of the head call -- identical inputs
+        # means the contamination arrived from upstream; different inputs with identical
+        # outputs means this call is mixing rows.
+        if _LCN_DIAG_HS and len(pending) > 1:
+            _t = pending[0][2].current_image_token_num
+            if _t in (1, 2, 3, 50, 200, 500, 900, 1300):
+                logger.info("[ImageGen] ID-DIAG tok=%d rows=%s identical=%s", _t,
+                            visual_ids.tolist(),
+                            torch.equal(visual_ids[0], visual_ids[1]))
 
         # Positive control for the optimization itself, not just for the feature.
         # A batched call and N serial calls produce IDENTICAL logs otherwise, so a
@@ -2086,6 +2159,12 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             if self._lcn_batched_head_calls == 1 or self._lcn_batched_head_calls % 500 == 0:
                 logger.info(f"[ImageGen] BATCHED head call: {len(pending)} requests in one "
                             f"call (grouped calls so far: {self._lcn_batched_head_calls})")
+
+        if visual_ids.shape[0] != len(pending):
+            raise RuntimeError(
+                f"batched head returned {visual_ids.shape[0]} rows for {len(pending)} "
+                f"requests — refusing to scatter a mismatched result back to per-request state."
+            )
 
         for k, (i, req_idx, state, _position, _cond_seq_len) in enumerate(pending):
             # clone(): the per-request state outlives this step's batch tensor and
