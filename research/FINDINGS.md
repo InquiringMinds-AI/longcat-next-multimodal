@@ -2325,3 +2325,9 @@ Note what survived and what did not. The PREMISE (concurrent requests are co-res
 is called per-request per level) was correct and remains measured. The MECHANISM (batching the
 head amortises its weight traffic) was correct. Only the IMPLEMENTATION was broken, and only the
 numbers taken from it are void.
+
+**Owner's verdict on the fixed paired output (2026-08-11): "looks good."** That clears the
+human gate for this generation-path change — the barn and the taxi, generated concurrently with
+batching on, each matching its own prompt. Worth stating what that verdict does and does not
+cover: it confirms the two images are correct and acceptable, not that the speed numbers are
+final (the clean shipping-config measurement was still running when he said it).
