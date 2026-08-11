@@ -571,8 +571,20 @@ reason #1 settles first).
       cached_tokens is printed to make a hit visible; (2) the warmup must be
       FULL SIZE — a short warmup leaves the large-M kernels cold and the first
       real run lands ~2.7x slow (974 vs 2684 tok/s), wrecking the median.
-- [ ] *** BLOCKER 2026-08-09: THE TUNED CONFIGS BREAK THE AUDIO PATH. DO NOT
-      SHIP / DO NOT PUSH new_files/moe_configs UNTIL RESOLVED. ***
+- [x] *** RESOLVED 2026-08-09 (commit d489578) — the forensics below are kept as the
+      record of how it was found; the DO-NOT-SHIP rail no longer applies. ***
+      ROOT CAUSE: `USE_TMA` on the DOWN projection produces NaN at M=1, found with an
+      env-gated NaN check on both sides of every MoE call (`LCN_NAN_CHECK=1`) reporting
+      `input_bad=False output_bad=True -> CREATED HERE` at tokens=1, i.e. a DECODE step.
+      Every earlier hypothesis chased the 170–193 token audio prefills that preceded each
+      assert; those were bystanders. FIX: ship 16 of 18 entries, dropping M=1/M=2 — better
+      than disabling their TMA flag, because M=1 decode then resolves by nearest-M to the
+      tuned M=4 config, which has TMA off natively. Validated over 4 batteries, 7/7 each,
+      zero NaN-check hits; decode 21.37 → 21.57 tok/s. The configs ARE in the shipping
+      image (Dockerfile COPY, verified present 2026-08-11) and this is correct.
+      ⚠ Re-verified 2026-08-11 because the stale rail below contradicted the shipping
+      image — a future session reading only the old header would have ripped out working
+      configs. Historical forensics follow:
       Symptom: `_assert_async_cuda_kernel: Assertion 'probability tensor
       contains either inf, nan or element < 0' failed` -> `torch.AcceleratorError:
       device-side assert triggered` -> scheduler dies, launch_server SIGKILLed,
@@ -854,10 +866,20 @@ Baseline for the A/B, same box, same build (`v0516-syncfix`):
 | generation steady state, solo | ~36.5 s / 10 raster rows |
 | => n=2 costs | **1.59x** solo for 2x the work |
 
-- [ ] **NEW, possibly bigger than everything below: the REFINER is serial and is ~47% of n=2 wall
-      time.** Generation of both images finished at 08:04:38; the two refiner passes then ran ONE
-      AT A TIME (~98 s each; req=25 saved 08:06:16, req=26 only after). 214 s generating vs ~196 s
-      refining. Nothing has ever profiled or batched `image_refiner.py`. Measure before assuming.
+- [x] **PROFILED + PARTLY FIXED 2026-08-11.** The refiner was 98% of post-generation cost
+      (~95.7 s of ~98 s; the pixel decoder is 1.75 s) at a flat 9.46 s/denoising step. Cause:
+      no `flash_attn` in the image, so its attention fell back to SDPA while still running
+      flash-only unpad work per layer AND passing an explicit FLOAT mask, which forces SDPA's
+      MATH backend to materialise the full score matrix (it attends at 1369/4225/5594/**9819**
+      tokens; at 9819 × 21 heads that is ~4 GB per layer per step, 32 layers, 10 steps).
+      Fixed for IDENTICAL MATH (all masks measured all-true): **9.46 → 5.58 s/step (−41%)**,
+      single image **246.5 → 196.5 s (−20.3%)**. Ships default-on, `LCN_REFINER_FAST=0` opts out.
+      Owner on the paired output: "these are both up to the standard."
+- [ ] **STILL OPEN: the refiner is SERIAL across concurrent requests.** Two images refine one
+      at a time (req=3's "generation ended" is stamped 2 ms after req=2's refined image was
+      saved). Now ~56.5 s each rather than ~95.7 s, so the prize shrank, but at n=2 it is still
+      the largest single block. The `all()` guard added with the fast path is already in place
+      for the ragged masks that batching WILL create — do not remove it.
 
 - [ ] **int8 the generation heads — HIGHEST VALUE, and the only item that touches single-image
       latency.** They are 71/71 BF16 (audio 2.86GB, visual 1.76GB) while the backbone is int8;
