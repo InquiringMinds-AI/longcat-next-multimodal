@@ -44,6 +44,22 @@ try:
 except Exception as e:
     rec("tool_call", False, str(e))
 
+# 2b. tool_choice: none must SUPPRESS tool use. The route read `tools` but never
+# `tool_choice`, so a client forbidding tools could still be handed a tool_use block.
+# Same prompt as the check above, which DOES produce a tool call -- that is what makes
+# this discriminating rather than a prompt that would never call a tool anyway.
+try:
+    r = requests.post(BASE + "/v1/messages", headers=HEADERS, json={
+        "model": "longcat-next", "max_tokens": 200, "temperature": 0,
+        "tools": TOOLS, "tool_choice": {"type": "none"},
+        "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}]}, timeout=300)
+    j = r.json()
+    blocks = [b.get("type") for b in j.get("content", [])]
+    ok = r.status_code == 200 and "tool_use" not in blocks and j.get("stop_reason") != "tool_use"
+    rec("tool_choice_none", bool(ok), f"blocks={blocks} stop={j.get('stop_reason')}")
+except Exception as e:
+    rec("tool_choice_none", False, str(e))
+
 # 3. tool result -> final answer (turn 2)
 try:
     assert tool_use

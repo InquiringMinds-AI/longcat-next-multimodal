@@ -224,10 +224,25 @@ async def _stream_live(body, upstream, oai_tools):
 async def messages(req: Request):
     body = await req.json()
     tools = body.get("tools") or []
+    # tool_choice was previously read on the OpenAI route but not here, so an Anthropic
+    # client asking for {"type": "none"} still had tools offered and could still receive a
+    # tool call it had explicitly forbidden.
+    tc = body.get("tool_choice")
+    tc_type = (tc.get("type") if isinstance(tc, dict) else tc) or "auto"
+    if tc_type == "none":
+        tools = []
     oai_tools = _tools_to_openai(tools)
     msgs = _to_openai_messages(body.get("system"), body.get("messages"))
     if oai_tools:
         block = build_tools_system_block(oai_tools)
+        # "any"/"tool" are honoured by INSTRUCTION, not by constrained decoding: this model
+        # emits tool calls as free-form XML that is parsed afterwards, so there is no grammar
+        # to force. Stated plainly because a caller that needs a hard guarantee does not have
+        # one here -- silently accepting the field would imply otherwise.
+        if tc_type == "any":
+            block += "\n\nYou MUST call one of the available tools in your reply."
+        elif tc_type == "tool" and isinstance(tc, dict) and tc.get("name"):
+            block += ("\n\nYou MUST call the tool `%s` in your reply." % tc["name"])
         if msgs and msgs[0]["role"] == "system":
             msgs[0]["content"] = block + "\n\n" + msgs[0]["content"]
         else:
