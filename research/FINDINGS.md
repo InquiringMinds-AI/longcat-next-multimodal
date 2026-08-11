@@ -2091,3 +2091,67 @@ copy its reshaped weight per call. The reshape is a genuine view (identical `dat
 einsum at 0.556 ms/call vs a precomputed-layout `bmm` at 0.547 ms is a 2% difference. 0.556 ms
 is 134 MB of FFN weight at the measured 220 GB/s — the head already runs at memory-bandwidth
 speed, so only FEWER BYTES (int8) or AMORTISATION (cross-request batching) can make it cheaper.
+
+
+---
+
+## Cross-request head batching: premise confirmed, but only on the third instrument
+
+The last surviving perf lever was the claim that N concurrent images each pay full price for a
+head call that costs barely more at bs=8 than bs=1. Before writing code the premise was
+positive-controlled -- specifically because the previous build in this campaign optimized a code
+path that never executes. The control took three attempts, and the first two both produced
+clean, confident, WRONG answers.
+
+**Attempt 1 -- "generation requests are strictly serialized."** Two image requests launched with
+`ssh spark 'curl ... &'`. The log showed three generations running strictly back to back, each
+starting the exact second the previous one's PNG was written. Perfect serialization, and it would
+have killed the lever outright. It was an artifact: the backgrounded curls took SIGHUP when the
+ssh shell exited. Both output files existed and were 0 bytes -- the redirection happens before
+the process dies, so a killed client looks exactly like a client that ran and returned nothing.
+The same empty-output-under-a-header signature as the `docker exec` heredoc failures earlier in
+this campaign. The tell was in the log and I read past it: `#queue-req: 0`. A request that was
+genuinely serialized or rejected still appears in the scheduler's accounting somewhere. Nothing
+anywhere means nothing ARRIVED.
+
+**Attempt 2 -- "two requests are co-resident."** Re-run from Voyager, so the client's lifetime was
+mine. `#running-req: 2`, both HTTP 200. But both returned in **12-13 seconds**, and an image takes
+~231 s: the model answered "generate an image of..." in chat with TEXT and never entered visual
+mode. The measurement was real and the conclusion was about the wrong thing -- two TEXT requests
+batching, which was already known. Chat prompts do not reliably trigger generation; the dedicated
+`/v1/images/generations` endpoint does.
+
+**Attempt 3 -- the actual measurement.** Two concurrent `/v1/images/generations`:
+
+| signal | result |
+|---|---|
+| eager decode batches (`cuda graph: False`) | **22/22 at `#running-req: 2`** |
+| `[ImageGen]` per-request progress | req=25 and req=26 interleaved on the SAME timestamps (both token 2 at 08:01:04, both row 10 at 08:02:02, both row 20 at 08:03:00) |
+
+Two requests are genuinely co-resident in one forward batch while BOTH are generating images, and
+the head is called once per request, per level, inside a Python loop over the batch. The premise
+holds.
+
+**Sizing, from the same run.** Solo image generation ran ~10.5 tok/s; two concurrent ran **13.16
+tok/s aggregate** -- 1.25x for twice the work. Per 10 raster rows: **58 s at n=2 vs 37 s solo**, so
+two images cost 1.57x one image. That 1.57x is what a serial second head call predicts: a ~95 ms
+solo step plus a second ~54 ms head call is ~149 ms, i.e. 1.57x. The backbone is already batched
+(that is the 1.25x); the heads are not (that is the missing part).
+
+### Equivalence: verified at the logits, because it CANNOT be verified at the images
+
+Batching changes the order `torch.multinomial` consumes the RNG, so the batched run produces
+different -- equally valid -- samples. Comparing output images would therefore prove nothing. The
+invariant that has to hold is upstream of sampling: a row's LOGITS must not depend on its
+batch-mates. `test/test_head_batching.py` asserts exactly that against the shipped head class.
+
+| check | result |
+|---|---|
+| row logits, batch-4 vs batch-1, 8 levels x 4 rows | 32/32 pass, max abs delta ~4e-7, argmax matches every time |
+| same row in batch-4 vs batch-2 (composition independence) | 8/8 pass, max abs delta **0.00e+00** |
+
+The exact zero on composition independence is the property that makes it safe for requests to
+join and leave the batch mid-image, which they do constantly.
+
+**Scope of the win, stated honestly: this does NOTHING at n=1.** It is a concurrency optimization.
+Single-image latency is unchanged; only multi-user/agentic load benefits.

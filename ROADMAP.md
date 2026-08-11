@@ -837,7 +837,27 @@ session does not "discover" them and ship the shallow version.
   machinery to buy nothing measurable. Revisit if long-audio input is ever supported, where the
   decode grows with clip length.
 
-## 5b. Generation concurrency (measured 2026-08-10; NEXT perf item, premise unverified)
+## 5b. Generation concurrency (measured 2026-08-10; premise VERIFIED 2026-08-11)
+
+**Premise confirmed 2026-08-11** (it took three instruments; the first two gave clean wrong
+answers — see FINDINGS "Cross-request head batching"). Two concurrent
+`/v1/images/generations` are genuinely co-resident in one eager decode batch: 22/22 decode
+batches at `#running-req: 2`, and the two requests' `[ImageGen]` progress lines land on the
+SAME timestamps. So the head really is called once per request, per level, per step.
+
+Baseline for the A/B, same box, same build (`v0516-syncfix`):
+
+| measure | value |
+|---|---|
+| 2 concurrent images, wall | **410.8 s** |
+| generation steady state, n=2 | 58 s / 10 raster rows |
+| generation steady state, solo | ~36.5 s / 10 raster rows |
+| => n=2 costs | **1.59x** solo for 2x the work |
+
+- [ ] **NEW, possibly bigger than everything below: the REFINER is serial and is ~47% of n=2 wall
+      time.** Generation of both images finished at 08:04:38; the two refiner passes then ran ONE
+      AT A TIME (~98 s each; req=25 saved 08:06:16, req=26 only after). 214 s generating vs ~196 s
+      refining. Nothing has ever profiled or batched `image_refiner.py`. Measure before assuming.
 
 - [ ] **int8 the generation heads — HIGHEST VALUE, and the only item that touches single-image
       latency.** They are 71/71 BF16 (audio 2.86GB, visual 1.76GB) while the backbone is int8;
@@ -847,9 +867,17 @@ session does not "discover" them and ship the shallow version.
 - [ ] **Micro-benchmark the depth head, sweeping BOTH batch (1/2/4/8) AND dtype (bf16/int8),
       WITH THE MODEL UNLOADED.** Sizes both items above before either is built. Needs
       1.2-2.4GB, so never against a live server at ~117GB in use.
-- [ ] If it pays: batch `CasualDepthTransformerHead` across concurrent generating requests
-      (today: one batch-1 call per request per level per step). Touches the code that produces
-      the actual image/voice, so it needs owner eyes/ears on n=4 output, not a green battery.
+- [x] **BUILT 2026-08-11 — batch `CasualDepthTransformerHead` across concurrent generating
+      requests** (was: one batch-1 call per request per level per step). `_image_gen_decode_step`
+      now collects the requests needing a visual token into `pending` and `_image_gen_flush`
+      issues ONE head call for the group; falls back to the per-request path when CFG is active
+      (CFG fuses its rows pairwise, so the batch axis is already spoken for). Image path only —
+      audio deferred.
+      Equivalence verified where it CAN be, at the logits (`test/test_head_batching.py`, 40/40):
+      batching changes RNG order so output images are legitimately different and cannot be
+      diffed; row logits vs batch-1 agree to ~4e-7 with matching argmax, and batch-COMPOSITION
+      independence is exactly 0.00e+00. Still needs owner eyes on output, per the standing rule.
+      Does NOTHING at n=1 — it is a concurrency optimization.
 - [ ] Lower priority than it looks: KV-cache the head across levels. Saves O(depth^2) recompute
       but not weight reads; if the head is bandwidth-bound this is nearly free of benefit.
 - Measured baseline: n=1 238.8s, n=2 422.9s (1.77x), n=4 796.9s (3.34x) — ~84% serial.

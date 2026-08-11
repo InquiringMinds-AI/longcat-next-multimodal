@@ -1097,16 +1097,31 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
     @torch.no_grad()
     def _generate_image_codebook_step(
         self, cond_hidden: torch.Tensor, uncond_hidden: Optional[torch.Tensor],
-        state: ImageGenState,
+        return_all: bool = False,
     ) -> torch.Tensor:
         """Run one step of image codebook generation via the depth transformer.
 
         Uses Classifier-Free Guidance (CFG) when uncond_hidden is available:
           fused = cfg_scale * (cond - uncond) + uncond
 
-        cond_hidden: [1, hidden_size] — conditional hidden state from backbone
-        uncond_hidden: [1, hidden_size] or None — unconditional hidden state
-        Returns: [num_codebooks] tensor of codebook token IDs (with offsets applied)
+        cond_hidden: [n, hidden_size] — conditional hidden state(s) from backbone
+        uncond_hidden: [n, hidden_size] or None — unconditional hidden state
+        Returns: [num_codebooks] for the first row, or [n, num_codebooks] when
+        return_all (cross-request batching: one head call serves n requests).
+
+        The body is already batch-general — it was written to run cond+uncond as
+        a bs=2 CFG pair, and every step (sampling, top-k row slicing, the offset
+        write) is per-row. Cross-request batching reuses that generality with
+        the rows being DIFFERENT REQUESTS rather than a guidance pair. The two
+        cannot be combined in one call: CFG's rows must be fused pairwise, so a
+        CFG-active batch still goes one request at a time.
+
+        Takes NO per-request state on purpose. It used to accept an ImageGenState
+        that the body never read, which was harmless while every call was batch-1
+        and a silent wrong-request bug waiting to happen once one call serves many
+        requests (the batched caller would have had to pass SOME row's state, and
+        whichever it picked would be wrong for the others). Anything per-request
+        belongs to the caller, which has the row->request mapping.
         """
         device = cond_hidden.device
         num_codebooks = len(self._visual_codebook_sizes)
@@ -1157,7 +1172,7 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             # simply never given the same treatment.
             next_token_ids[:, level] = next_token + self.visual_offset_vals[level]
 
-        return next_token_ids[0]
+        return next_token_ids if return_all else next_token_ids[0]
 
     @torch.no_grad()
     def _decode_image_to_png(self, state: ImageGenState) -> Optional[str]:
@@ -1956,6 +1971,12 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         """Handle image generation state machine during decode."""
         overrides = {}
         batch_size = forward_batch.batch_size
+        # Requests needing a visual codebook token THIS step. Collected rather
+        # than served inline so the depth-transformer head runs once for all of
+        # them instead of once per request: the head re-reads ~1.5GB of weights
+        # per call and costs only 1.22x at bs=8, so N concurrent images were
+        # paying N times for traffic that batches almost for free.
+        pending = []
 
         for i in range(batch_size):
             req_idx = forward_batch.req_pool_indices[i].item()
@@ -1974,11 +1995,9 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 # Original semantics: visual token 1 is generated from THIS
                 # step's hidden state (the image_start position); the forced
                 # image_pad then carries token-1 feedback into the next step.
-                overrides[i] = self._image_gen_token_step(
-                    i, req_idx, state, hidden_states[i:i+1],
-                    forward_batch, forward_batch.positions[i].item(),
-                    forward_batch.seq_lens[i].item(),
-                )
+                pending.append((i, req_idx, state,
+                                forward_batch.positions[i].item(),
+                                forward_batch.seq_lens[i].item()))
                 continue
 
             # Detect image_end → clean up and decode
@@ -2019,13 +2038,65 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                     continue
 
                 # Generate codebook tokens for this position
+                pending.append((i, req_idx, state,
+                                forward_batch.positions[i].item(),
+                                forward_batch.seq_lens[i].item()))
+
+        self._image_gen_flush(pending, hidden_states, forward_batch, overrides)
+        return overrides
+
+    def _image_gen_flush(self, pending, hidden_states, forward_batch, overrides):
+        """Generate one visual token for every request in `pending`, batched.
+
+        One head call serves the whole group. The depth transformer's LEVEL loop
+        stays sequential (level L consumes the tokens sampled at 0..L-1), but that
+        dependency is entirely within a request — level L for request A never reads
+        request B — so the request axis batches at each level while the level axis
+        cannot.
+
+        Falls back to the per-request path when CFG is active: CFG needs each
+        request's own uncond backbone forward and fuses its rows pairwise, so the
+        batch axis is already spoken for. (CFG is off by default — see
+        lcn_setup_model_kv_pool_refs — so the batched path is the normal one.)
+        """
+        if not pending:
+            return
+
+        if IMAGE_GEN_CFG_SCALE != 1.0 and self._model_runner is not None:
+            for (i, req_idx, state, position, cond_seq_len) in pending:
                 overrides[i] = self._image_gen_token_step(
                     i, req_idx, state, hidden_states[i:i+1],
-                    forward_batch, forward_batch.positions[i].item(),
-                    forward_batch.seq_lens[i].item(),
+                    forward_batch, position, cond_seq_len,
                 )
+            return
 
-        return overrides
+        rows = torch.cat([hidden_states[i:i+1] for (i, _r, _s, _p, _l) in pending], dim=0)
+        visual_ids = self._generate_image_codebook_step(
+            rows, None, return_all=True,
+        )  # [n, num_codebooks]
+
+        # Positive control for the optimization itself, not just for the feature.
+        # A batched call and N serial calls produce IDENTICAL logs otherwise, so a
+        # silently-unreached flush would look exactly like "batching didn't help" --
+        # which is how a previous change in this campaign got measured as a 2% win
+        # for a code path that never executed at all. Logged on the first grouped
+        # call and every 500th after, so it proves engagement without flooding.
+        if len(pending) > 1:
+            self._lcn_batched_head_calls = getattr(self, "_lcn_batched_head_calls", 0) + 1
+            if self._lcn_batched_head_calls == 1 or self._lcn_batched_head_calls % 500 == 0:
+                logger.info(f"[ImageGen] BATCHED head call: {len(pending)} requests in one "
+                            f"call (grouped calls so far: {self._lcn_batched_head_calls})")
+
+        for k, (i, req_idx, state, _position, _cond_seq_len) in enumerate(pending):
+            # clone(): the per-request state outlives this step's batch tensor and
+            # is later torch.stack'ed, so a row VIEW would pin the whole [n, 8]
+            # allocation for the life of the image.
+            state.accumulated_ids.append(visual_ids[k].clone())
+            state.current_image_token_num += 1
+            overrides[i] = self._image_pad_id
+            if state.current_image_token_num <= 3:
+                logger.info(f"[ImageGen] req={req_idx}: token {state.current_image_token_num}, "
+                            f"level0_raw={visual_ids[k][0].item() - self.visual_offset_vals[0].item()}")
 
     def _image_gen_token_step(self, i, req_idx, state, cond_hs, forward_batch,
                               position, cond_seq_len) -> int:
@@ -2073,7 +2144,7 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 else:
                     uncond_hs = self._run_uncond_decode(state, position, forward_batch)
 
-        visual_ids = self._generate_image_codebook_step(cond_hs, uncond_hs, state)
+        visual_ids = self._generate_image_codebook_step(cond_hs, uncond_hs)
         state.accumulated_ids.append(visual_ids)
         state.current_image_token_num += 1
 
