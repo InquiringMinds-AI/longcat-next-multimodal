@@ -112,6 +112,13 @@ def _anthropic_content(normal, calls):
 
 
 _STOP_MAP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+# Finish reasons meaning the generation did NOT complete. Anthropic's stop_reason vocabulary
+# has no value for this, so _STOP_MAP's default silently rendered them as "end_turn" -- a
+# truncated reply arriving as a normal, complete one. Measured: aborting a stream mid-flight
+# produced 181 tokens with stop_reason "end_turn" and no error event, which a client has no
+# way to distinguish from a finished answer. Reported as an explicit error instead.
+_ABNORMAL_FINISH = {"abort", "abort_request", "error", "cancelled"}
+_ABNORMAL_MSG = "generation did not complete: the backend aborted it (finish_reason=%s)"
 
 
 def _sse(event, data):
@@ -210,6 +217,12 @@ async def _stream_live(body, upstream, oai_tools):
                              "partial_json": json.dumps(args, ensure_ascii=False)}})
         yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
         idx += 1
+    if finish_reason in _ABNORMAL_FINISH:
+        # The 200 is long since committed, so this cannot become an error STATUS -- but the
+        # stream must still say the reply is incomplete rather than terminate as if it
+        # finished. Emitted before the terminators so the stream still ends well-formed.
+        yield _sse("error", {"type": "error", "error": {
+            "type": "api_error", "message": _ABNORMAL_MSG % finish_reason}})
     stop = "tool_use" if calls else _STOP_MAP.get(finish_reason, "end_turn")
     yield _sse("message_delta", {"type": "message_delta",
                "delta": {"stop_reason": stop, "stop_sequence": None},
@@ -283,6 +296,11 @@ async def messages(req: Request):
     raw = choice["message"].get("content") or ""
     normal, calls = parse_tool_calls(raw, oai_tools) if oai_tools else (raw, [])
     fr = "tool_calls" if calls else (choice.get("finish_reason") or "stop")
+    if fr in _ABNORMAL_FINISH:
+        # Non-streaming has the luxury of a real status code, so use it rather than
+        # returning a partial message that claims to have ended normally.
+        return JSONResponse({"type": "error", "error": {
+            "type": "api_error", "message": _ABNORMAL_MSG % fr}}, status_code=500)
     usage = j.get("usage", {}) or {}
     msg = {"id": "msg_" + uuid.uuid4().hex[:24], "type": "message", "role": "assistant",
            "model": body.get("model", "longcat-next"),
