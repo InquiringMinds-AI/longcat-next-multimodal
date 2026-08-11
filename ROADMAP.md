@@ -898,11 +898,30 @@ Baseline for the A/B, same box, same build (`v0516-syncfix`):
       Fixed for IDENTICAL MATH (all masks measured all-true): **9.46 → 5.58 s/step (−41%)**,
       single image **246.5 → 196.5 s (−20.3%)**. Ships default-on, `LCN_REFINER_FAST=0` opts out.
       Owner on the paired output: "these are both up to the standard."
-- [ ] **STILL OPEN: the refiner is SERIAL across concurrent requests.** Two images refine one
-      at a time (req=3's "generation ended" is stamped 2 ms after req=2's refined image was
-      saved). Now ~56.5 s each rather than ~95.7 s, so the prize shrank, but at n=2 it is still
-      the largest single block. The `all()` guard added with the fast path is already in place
-      for the ragged masks that batching WILL create — do not remove it.
+- [~] **CANCELLED 2026-08-11 — the refiner is serial across concurrent requests, and that is
+      NOT worth fixing.** It is still serial (req=3's "generation ended" is stamped 2 ms after
+      req=2's refined image was saved), and at n=2 it is still the largest single block — but
+      seriality was never the *cause* of the cost, so removing it changes nothing. The refiner
+      transformer is **compute-bound, not bandwidth-bound**: a 9819-token forward is ~63 TFLOP
+      against only ~6.4 GB of weights, i.e. ~64x the ~29 ms weight-read floor at this box's
+      ~220 GB/s. Batching shares weight traffic, not arithmetic — two images batched cost 2x the
+      FLOPs for 2x the work. This is precisely why batching the depth head won (~1 token per
+      request, bandwidth-bound) and batching here cannot: **batching only helps when the batched
+      dimension is not what you are bottlenecked on.** Refuted on arithmetic before a build was
+      spent; full derivation in FINDINGS. (`RefinerPipeline.__call__` is also a plain Python loop
+      over chunks, so the "already batch-shaped" read was wrong twice over.)
+      The `all()` mask guard from the fast path stays regardless — it is cheap and correct.
+
+- [ ] **NEW, needs owner eyes: ~2/3 of refiner compute is classifier-free guidance.**
+      `lazy_decode_and_save` passes no guidance scales, so `text_guidance_scale=1.5` /
+      `image_guidance_scale=1.5` apply with `cfg_range=(0.0, 1.0)` covering every step — each CFG
+      step runs THREE transformer forwards (text, ref, uncond), 30 per image at 10 steps. That
+      compute cannot be batched away, but it can be **not spent**: `LCN_REFINER_CFG_RANGE`
+      (default `0.0,1.0` = today's output exactly) narrows guidance to early steps, where it
+      shapes composition. `0.0,0.5` → 20 forwards (~19 s of a ~196 s image); off → 10.
+      The non-CFG branch still gets `ref_image_hidden_states`, so the decoded reference conditions
+      every step either way — this drops the guidance term, not the refinement.
+      CHANGES THE OUTPUT IMAGE → human gate, not a green test. A/B in flight.
 
 - [ ] **int8 the generation heads — HIGHEST VALUE, and the only item that touches single-image
       latency.** They are 71/71 BF16 (audio 2.86GB, visual 1.76GB) while the backbone is int8;

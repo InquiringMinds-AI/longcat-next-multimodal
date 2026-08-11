@@ -2453,3 +2453,83 @@ after 3 attempts instead of crash-looping a ~90 GB load against a 128 GB box.
 
 Battery green on the shipping build (`da750fb`): codebook batching 7/7, head batching 40/40, tool
 parsing, audio-chat 8/8, stream util 5/5, selftest 7/7, anthropic 6/6, degeneracy 6/6.
+
+---
+
+## Refiner batching: refuted before it was built (2026-08-11)
+
+The item carried into this session was "batch the concurrent refines" — refines are strictly
+serial and were the largest single block at n=2 (~113 s of two 56.5 s refines). It was deferred
+for a clean start because it is the same batching shape that produced the concurrent-image
+correctness bug.
+
+**It was cancelled instead, on arithmetic, before a build was spent.** Reading
+`RefinerPipeline.__call__` first showed it is a Python `for` loop over token chunks calling
+`_denoise_once` — so threading a longer `grid_thw_list` through would have bought correctness and
+*zero* speedup. `_denoise_once` itself is genuinely batched (`latents` is `(B, C, H, W)`,
+`timestep` expands to `latents.shape[0]`, per-row generator lists are validated), so a real B=n
+call was expressible. The question was whether it would pay.
+
+It cannot. The refiner transformer is **compute-bound, not bandwidth-bound**:
+
+| quantity | value |
+|---|---|
+| params (hidden 2520, 32 layers, 4x MLP) | ~3.2 B |
+| weight bytes per forward (bf16) | ~6.4 GB |
+| weight-read floor @ ~220 GB/s | ~29 ms |
+| measured time per forward (5.58 s/step / 3) | ~1.86 s |
+| FLOPs per 9819-token forward (2*N*T) | ~63 TFLOP |
+
+A forward takes **~64x longer than reading its own weights**. Batching shares weight traffic; it
+does not share arithmetic. Two images batched cost 2x the FLOPs for 2x the work — nothing is
+saved. The ratio is robust: even if the parameter count is off by 3x, it is still 20x+.
+
+**This is exactly why the same instinct won on the depth head and loses here**, and the contrast
+is the durable lesson:
+
+| | depth head (batching won, -16.4%) | refiner (batching cannot win) |
+|---|---|---|
+| work per call | 1 token per request | ~9819 tokens |
+| weights re-read per call | ~1.5 GB | ~6.4 GB |
+| compute per forward | negligible | ~63 TFLOP |
+| time vs weight-read floor | ~1x (bandwidth-bound) | ~64x (compute-bound) |
+| batching 2 requests | ~1.2x cost, 2x work -> **wins** | 2x cost, 2x work -> **nothing** |
+
+**Batching only helps when the batched dimension is not what you are bottlenecked on.** "It is
+serial and it is the biggest block" is not evidence that making it parallel will help; seriality
+was never the cause of the cost. The same arithmetic also killed a B=3 CFG-batching idea that
+looked, for about two minutes, like a bigger prize because it would fire at n=1.
+
+### What the investigation did find: two thirds of refiner compute is guidance
+
+`lazy_decode_and_save` passes neither guidance scale, so `text_guidance_scale=1.5` and
+`image_guidance_scale=1.5` both apply and `cfg_range=(0.0, 1.0)` covers every step. On a CFG step
+the pipeline runs **three** transformer forwards (text, ref, uncond) instead of one — 30 forwards
+per image at the shipped 10 steps.
+
+The 3x was first *derived*, from the four attention lengths measured during the fast-path work,
+which decompose exactly:
+
+- **1369** = 74*74/4 — cond/text tokens (37x37 merged grid, `splits = h*w//4`)
+- **4225** = 65^2 — latent tokens
+- **5594** = 4225 + 1369 — latents + text, no ref -> the uncond forward
+- **9819** = 4225 + 4225 + 1369 — latents + text + ref -> the two ref-bearing forwards
+
+Striking, but **a derivation is not a measurement** — the same class of static read that produced
+two wrong claims about this very file (the "unchosen 28-step default" that was already a
+deliberate 10, and the fp32 decoder "suspect" that was 1.8% of cost). So `_denoise_once` now
+prints its actual forward count per denoise, and the A/B run verifies its own premise.
+
+This compute cannot be batched away, but it can be **not spent**. `LCN_REFINER_CFG_RANGE`
+(default `0.0,1.0` = current output exactly) narrows guidance to the early steps, where it shapes
+composition; later steps become bare denoises. `0.0,0.5` -> 20 forwards instead of 30 (~19 s of a
+~196 s image); guidance off entirely -> 10.
+
+Important: the non-CFG branch **still receives `ref_image_hidden_states`**, so the decoded
+reference conditions every step either way. Only the guidance term is dropped — this is not
+"skip the refinement," it is "refine with less guidance."
+
+Unlike the head batching and the attention fast path, **this changes the output image**, so it is
+gated on human review, not on a green test. The A/B prompt set deliberately includes a close-up
+portrait: faces are where reduced guidance degrades most visibly, so the failure mode, if any,
+shows there first.
