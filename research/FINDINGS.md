@@ -2533,3 +2533,37 @@ Unlike the head batching and the attention fast path, **this changes the output 
 gated on human review, not on a green test. The A/B prompt set deliberately includes a close-up
 portrait: faces are where reduced guidance degrades most visibly, so the failure mode, if any,
 shows there first.
+
+### CFG-range A/B measured (2026-08-11)
+
+Same build (`11e9ce8`), same warm state (prewarm absorbs the cold first image in both arms),
+three prompts including a close-up portrait as the sensitive case.
+
+| prompt | A: guidance all 10 steps | B: guidance first 5 | delta |
+|---|---|---|---|
+| barn | 193.5 s | 176.7 s | -16.8 s |
+| fisherman | 191.5 s | 175.1 s | -16.4 s |
+| street | 190.6 s | 174.6 s | -16.0 s |
+| **total** | **575.6 s** | **526.4 s** | **-49.2 s (-8.5%)** |
+
+Forward counts logged per denoise, not assumed — the premise verified itself:
+- A: `10 CFG steps (3 forwards each) + 0 plain = 30 transformer forwards`
+- B: `5 CFG steps (3 forwards each) + 5 plain (1 each) = 20 transformer forwards`
+
+**The FLOP model predicted this within 1 s.** A CFG step is 9819 + 9819 + 5594 tokens, a plain
+step only 9819, so each converted step drops ~99 of 162 TFLOP; five of them is ~30.6% of refiner
+compute, and the refiner is ~56.5 s -> predicted -17.3 s, measured -16.4 s. The model is now
+trustworthy enough to *predict* the remaining lever rather than test it blind.
+
+**Owner verdict on the paired output: "very similar images."** That clears B on quality — the
+gate that no green test and no self-assessment can substitute for.
+
+CAVEAT recorded honestly: the arms are NOT pixel-paired. Image generation is stochastic
+(temp 0.5), so A and B started from different VQ codes and each pair differs by generation noise
+as well as by the refiner change. The question the comparison answers is "are both up to the
+standard", not "which rendered this exact scene better". A strictly isolated refiner comparison
+would need the VQ codes captured and re-refined.
+
+Objective, non-judgmental signal: B's PNGs are consistently larger (+3% barn, +7% fisherman,
++45% street) at identical 1040x1040. File size tracks high-frequency content, so it describes the
+character of the difference, not its quality.
