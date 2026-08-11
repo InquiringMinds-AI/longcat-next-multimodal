@@ -1696,3 +1696,28 @@ own tally (#5, dead code whose silence looks like success) is a status to state,
 Warmup moved the number 63% in the direction that would mask the effect being tested. Nearly
 reported as "recovery". *Check: is the control measured under the same cache/graph state as
 the treatment? If the system warms up, discard the first N.*
+
+### The "global generation veto" is not an optimization opportunity — it is structural
+
+The audit flagged the generation veto as overly broad: `lcn_gen_watch_active()` consults
+model-global state (`_audio_gen_states or _image_gen_states`) rather than asking whether THIS
+batch contains a generating request, and text measurably drops 20.18 → 8.29 tok/s per stream
+during image generation. A batch-aware veto looked like a clean win.
+
+**Checked the premise before writing it, and the premise fails.** `Scheduler.get_next_batch_to_run`
+maintains a SINGLE `running_batch` and merges new prefill batches into it
+(`running_batch.merge_batch(new_batch)`), returning one `batch_to_run`. So a text stream running
+concurrently with an image generation is *in the same batch as the generating request*. That
+batch must run eager regardless — a CUDA graph cannot cover half a batch — so the global answer
+and the batch-aware answer are THE SAME ANSWER in exactly the case the measurement describes.
+
+Batch-awareness would differ only when generation state exists while its request is absent from
+the batch, i.e. the orphan window, which decay already bounds to 64 decode steps.
+
+**Conclusion: the 20.18 → 8.29 penalty is the real cost of running Python state machines for
+generation inside a shared decode batch, not a bug.** Reducing it would require splitting
+generation into its own batch — a scheduler change, not a veto change. Not attempted; recorded
+so the veto is not "fixed" again by someone reading it the way the audit did.
+
+Note this is the third hypothesis refuted today, and the first one refuted BEFORE the code was
+written rather than after. The check cost one grep of the scheduler.
