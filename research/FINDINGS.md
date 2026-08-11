@@ -1660,3 +1660,39 @@ state for whoever picks it up:
   is validated for, so a matched pair can be screened by metric with ears only on the finalist.
 - A FOURTH phenomenon exists and has no metric: prosody oddity (clip 06). Whether it is a
   defect at all is an owner judgment, not a measurable one.
+
+### The veto-latch hypothesis is REFUTED; the eviction stays as defence, not as a fix
+
+Claimed in the previous commit: an aborted generation whose pool slot is promptly recycled
+would keep `_image_gen_states` non-empty forever, latching the CUDA-graph / spec-decode veto
+on for every request until restart. Matched A/B, same protocol, abort induced reliably via
+SGLang `/abort_request {"abort_all": true}` mid-image-generation:
+
+| arm | baseline | after orphan | ratio | verdict |
+|---|---|---|---|---|
+| `fixes7` — no identity eviction (control) | 25.03 tok/s | 40.75 | 1.63 | recovered |
+| `fixes8` — identity eviction | 27.30 tok/s | 43.95 | 1.61 | recovered |
+
+**No latch.** Text recovered fully on the build that structurally *cannot* evict a live slot.
+The logs say why, and it is the premise that was wrong: both arms show the DECAY line firing
+(`absent from the batch for 64 decode steps`). The aborted slot went idle instead of being
+promptly recycled, so the pre-existing decay handled it. The new identity line never fired in
+either arm.
+
+**A confound in my own control, stated because it bounds the conclusion.** Baseline was taken
+on a cold server, so both arms measure ~60% *faster* after the generation than at "baseline" —
+that is CUDA-graph capture and cache warmup, not a speedup. A large latch would still have been
+visible (throughput would have collapsed, not risen), but a modest one could hide inside a
++63% warmup swing. This rules out the strong claim and cannot rule out a weak one. Baseline
+should have been taken after warmup.
+
+**Disposition:** the identity eviction is KEPT, relabelled from fix to defence-in-depth. It
+closes a gap decay provably cannot cover — a slot that stays live never decays — it fails safe
+(skipped entirely when `_rid_for` returns ""), and selftest 7/7 + anthropic 6/6 confirm it
+breaks nothing. But it is a guard that has never been observed firing, which by this campaign's
+own tally (#5, dead code whose silence looks like success) is a status to state, not to hide.
+
+**Instrument failure #10 for the day: a baseline measured on a cold server is not a baseline.**
+Warmup moved the number 63% in the direction that would mask the effect being tested. Nearly
+reported as "recovery". *Check: is the control measured under the same cache/graph state as
+the treatment? If the system warms up, discard the first N.*
