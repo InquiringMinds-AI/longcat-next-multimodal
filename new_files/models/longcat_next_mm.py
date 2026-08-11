@@ -830,17 +830,26 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         text_vocab = word_embed.num_embeddings
         hidden_size = word_embed.embedding_dim
 
-        embeds = torch.zeros(len(flat_ids), hidden_size,
-                            dtype=word_embed.weight.dtype, device=flat_ids.device)
-
-        in_text = flat_ids < text_vocab
-        in_cb = flat_ids >= codebook_base
-
-        if in_text.any():
-            embeds[in_text] = word_embed(flat_ids[in_text])
-        if in_cb.any() and self._codebook_embed is not None:
-            cb_idx = (flat_ids[in_cb] - codebook_base).clamp(max=self._codebook_embed.shape[0] - 1)
-            embeds[in_cb] = self._codebook_embed[cb_idx].to(embeds.dtype)
+        # BRANCHLESS. `if mask.any()` forces a GPU->host sync just to evaluate a Python `if`,
+        # and the masked assignments below it generated nonzero + index_put_ pairs. The heads
+        # call this 56x per generated token (7 codebook levels x 8 head levels), and the
+        # profiler attributed ~10ms/step plus 168 nonzero and 112 item calls per step to this
+        # function alone -- on a loop where 36ms of every 115ms step is ALREADY GPU idle
+        # waiting on the host. Computing both lookups and selecting costs one extra gather;
+        # gathers are cheap on this box and host syncs are not.
+        #
+        # Three cases preserved exactly, including the gap: ids below text_vocab embed from
+        # the word table, ids at/above codebook_base from the codebook table, and ids BETWEEN
+        # them stay zero (which the previous zeros-then-fill form produced implicitly).
+        in_text = (flat_ids < text_vocab).unsqueeze(-1)
+        emb_text = word_embed(flat_ids.clamp(max=text_vocab - 1))
+        if self._codebook_embed is not None:
+            in_cb = (flat_ids >= codebook_base).unsqueeze(-1)
+            cb_idx = (flat_ids - codebook_base).clamp(min=0, max=self._codebook_embed.shape[0] - 1)
+            emb_cb = self._codebook_embed[cb_idx].to(emb_text.dtype)
+            embeds = torch.where(in_text, emb_text, torch.where(in_cb, emb_cb, torch.zeros((), dtype=emb_text.dtype, device=emb_text.device)))
+        else:
+            embeds = torch.where(in_text, emb_text, torch.zeros((), dtype=emb_text.dtype, device=emb_text.device))
 
         return embeds.view(*orig_shape, hidden_size)
 

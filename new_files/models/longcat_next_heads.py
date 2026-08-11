@@ -13,10 +13,15 @@ from transformers.models.t5.modeling_t5 import T5LayerNorm as RMSNorm
 def _sdpa_varlen_fallback(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=False, window_size=(-1, -1)):
     """SDPA fallback for flash_attn_varlen_func when FlashAttention is unavailable."""
     batch_size = len(cu_seqlens_q) - 1
+    # One transfer instead of 4 per batch element. Per-element .item() cost 128 blocking
+    # host syncs per generation step here (profiled), each stalling a loop that is already
+    # host-bound. tolist() moves the whole boundary vector once.
+    _cq = cu_seqlens_q.tolist() if torch.is_tensor(cu_seqlens_q) else list(cu_seqlens_q)
+    _ck = cu_seqlens_k.tolist() if torch.is_tensor(cu_seqlens_k) else list(cu_seqlens_k)
     outputs = []
     for i in range(batch_size):
-        sq, eq = cu_seqlens_q[i].item(), cu_seqlens_q[i + 1].item()
-        sk, ek = cu_seqlens_k[i].item(), cu_seqlens_k[i + 1].item()
+        sq, eq = _cq[i], _cq[i + 1]
+        sk, ek = _ck[i], _ck[i + 1]
         qi = q[sq:eq].unsqueeze(0).transpose(1, 2)  # [1, heads, seq_q, dim]
         ki = k[sk:ek].unsqueeze(0).transpose(1, 2)
         vi = v[sk:ek].unsqueeze(0).transpose(1, 2)
