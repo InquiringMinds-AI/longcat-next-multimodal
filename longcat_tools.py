@@ -164,7 +164,9 @@ def _one_call(name, args):
 _FC_BLOCK = re.compile(r"<function_calls>\s*(\[.*?)(?:</function_calls>|$)", re.DOTALL)
 
 
-def _parse_imitation_calls(text):
+def _parse_imitation_calls(text, resolve=None):
+    """`resolve` repairs case variants; passed in because this dialect returns EARLY from
+    parse_tool_calls and would otherwise be the one path that skips the repair."""
     m = _FC_BLOCK.search(text)
     if not m:
         return None
@@ -182,33 +184,62 @@ def _parse_imitation_calls(text):
     for e in arr:
         if isinstance(e, dict) and e.get("name"):
             args = e.get("parameters") if isinstance(e.get("parameters"), dict) else e.get("input", {})
-            calls.append(_one_call(_strip_ns(str(e["name"])), args or {}))
+            _nm = _strip_ns(str(e["name"]))
+            calls.append(_one_call(resolve(_nm) if resolve else _nm, args or {}))
     return (text[:m.start()].strip(), calls) if calls else None
+
+
+def _tool_name_resolver(tools):
+    """name -> the offered spelling when it differs only by case; otherwise unchanged.
+
+    Never returns None and never blocks: the model emits real case variants of real tools
+    ("Get_Weather" for an offered "get_weather"), and a client matching its own registry
+    exactly would drop those for no reason. Repair maps only onto names the client offered,
+    so it cannot fabricate a target. Ambiguous folds pass through rather than being guessed.
+    """
+    exact, folded = set(), {}
+    for t in tools or []:
+        n = ((t.get("function") or {}).get("name") if isinstance(t, dict) else None)
+        if not n:
+            continue
+        exact.add(n)
+        folded.setdefault(n.lower(), []).append(n)
+
+    def resolve(name):
+        if name in exact:
+            return name
+        cands = folded.get(name.lower(), [])
+        return cands[0] if len(cands) == 1 else name   # unknown/ambiguous -> verbatim
+    return resolve
 
 
 def parse_tool_calls(text, tools):
     """Return (normal_text, tool_calls[]). tool_calls in OpenAI shape (arguments = JSON string).
 
-    Names are reported AS THE MODEL EMITTED THEM. `tools` is consulted only to coerce
-    argument types -- deliberately not to validate the name.
+    Names are NEVER rejected. `tools` is consulted to coerce argument types, and to repair
+    a name that differs from an offered tool only by case.
 
-    This is a standing decision, not an oversight, and it has already been made twice: an
-    audit flagged unvalidated names as a defect, name validation was implemented, and the
-    owner reversed it -- "let the client decide what the model's string is allowed to do."
-    The parser's job is to report faithfully what the model produced; whether a given name
-    is permissible belongs to the client, which owns the handler registry and the policy.
-    Nothing is executed here, so a name we do not recognise is information, not a hazard.
+    Standing decision, made explicitly: an audit flagged unvalidated names as a defect and
+    rejection was implemented; the owner reversed it -- "let the client decide what the
+    model's string is allowed to do." Whether a name is permissible belongs to the client,
+    which owns the handler registry and the policy. Nothing is executed here, so an
+    unrecognised name is information, not a hazard.
 
-    Do not re-add validation, name repair, or normalisation without the owner reversing
-    this. test/test_tool_parsing.py pins the behaviour."""
+    Case repair is sanctioned separately (owner: "case repair is fine") and is deliberately
+    narrow: it only ever maps onto a name the client ITSELF offered, so it cannot invent a
+    target. An ambiguous fold (two offered tools differing only in case) and an unknown
+    name both pass through UNCHANGED -- the repair never becomes a gate.
+
+    Do not re-add rejection. test/test_tool_parsing.py pins both behaviours."""
     if "<longcat_tool_call>" not in text:
-        imit = _parse_imitation_calls(text)
+        imit = _parse_imitation_calls(text, _tool_name_resolver(tools))
         if imit:
             return imit
         return text, []
     idx = text.find("<longcat_tool_call>")
     normal = text[:idx].strip()
     calls = []
+    _resolve = _tool_name_resolver(tools)
     for block in _TC.findall(text):
         block = block.strip()
         pairs = _PAIR.findall(block)
@@ -228,7 +259,7 @@ def parse_tool_calls(text, tools):
                         pass
                 args[k] = v
             if name:
-                calls.append(_one_call(name, args))
+                calls.append(_one_call(_resolve(name), args))
             continue
         m = _TS_CALL.match(block)  # syntax 2: TS-style call with object-literal args
         if not m:
@@ -239,7 +270,7 @@ def parse_tool_calls(text, tools):
                 name = _strip_ns(nm.group(1).strip())
                 args = _parse_object_prefix(mo.group(1))
                 if name and args is not None:
-                    calls.append(_one_call(name, args))
+                    calls.append(_one_call(_resolve(name), args))
             continue
         name, args = _strip_ns(m.group(1).strip()), _parse_object_literal(m.group(2))
         if args is None or not name:
@@ -249,9 +280,9 @@ def parse_tool_calls(text, tools):
             for tu in args["tool_uses"]:
                 tn = _strip_ns(str(tu.get("recipient_name", "")).strip())
                 if tn:
-                    calls.append(_one_call(tn, tu.get("parameters") or {}))
+                    calls.append(_one_call(_resolve(tn), tu.get("parameters") or {}))
         else:
-            calls.append(_one_call(name, args))
+            calls.append(_one_call(_resolve(name), args))
     return normal, calls
 
 
