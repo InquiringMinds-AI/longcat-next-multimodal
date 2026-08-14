@@ -2691,3 +2691,56 @@ qualitative gain. **Verdict: 6 comfortable beats 7 tight; recipe recorded in the
 entrypoint comment, deliberately opt-in** (MAX_TOTAL_TOKENS=917504 MEM_FRACTION=0.88
 LCN_AGENT=1). The natural consumer is a multi-session / deep-radix Claude Code
 deployment where long conversations currently evict each other from the 1-context pool.
+
+---
+
+## Streaming TTS shipped (2026-08-11 → 2026-08-14)
+
+The largest usability gap closed: TTS clients waited for the ENTIRE generation
+(~2.6 s of compute per second of audio) before hearing anything. Now
+`POST /v1/audio/speech {"stream": true}` delivers first audio at ~6.5 s for a 12 s clip
+instead of ~32 s.
+
+**The profile made the design.** Timestamped logs on one capture split TTS latency:
+frame generation 17.5 s for 99 frames (~177 ms/frame — 98%), vocode+save 0.35 s (~2%).
+Consequences: (a) inline windowed vocoding is affordable (~0.3 s per 2 s chunk, ~7%
+amortized — measured offline first, then live); (b) generation runs ~2.2-2.4x slower
+than realtime, so a client that plays immediately WILL starve mid-clip — documented in
+the endpoint, the buy is time-to-first-audio, pacing is the client's problem.
+
+**Quality gate, run before any serving code was written.** Windowed vocoding changes the
+math — the flow-matching decoder sees a window, not the utterance. Unlike the image A/B
+(stochastic, unpaired), this gate was EXACTLY paired: LCN_TTS_DUMP_IDS captured one real
+generation's codebook ids, and an offline harness vocoded the SAME ids three ways (full /
+growing-prefix / sliding-window; tokenizer reconstruction verified faithful — 1740
+weights, 0 missing). Owner verdict on the triple: **"to my ears, all of these are the
+same."** Sliding-window (cheapest, bounded) shipped.
+
+**Mechanism**: every 25 frames (2 s at the measured 12.5 fps) the model vocodes
+[emit−50 : emit+12] and appends int16 PCM to `<rid>.pcm.part`; seams are healed by
+withholding a 1200-sample fade tail per piece (already-emitted bytes cannot be revised).
+First-chunk lead-silence trim mirrors _trim_wav_lead on the tensor. The final .wav is
+assembled FROM the streamed chunks — streaming and non-streaming clients get identical
+bytes. Gateway supplies its own rid to /generate (SGLang accepts a client rid — this
+solves the tail-a-file-you-can't-name problem), fires the backend call as a task, tails
+the .part; the finalized .wav is the completion signal and the gateway deletes both.
+
+**Live numbers** (12.0 s clip, 156 frames, 7 chunks): headers at 0.04 s, first audio
+6.5 s carrying 1.7 s of audio, ~4.8 s cadence per 2 s chunk, warm chunk vocode
+0.26-0.30 s, total 31.85 s (~2.65 s/s — streaming added nothing to total cost), byte
+accounting exact (44-byte header + finalize's 576,058 PCM bytes).
+
+Discipline carried from the head-batching postmortem: kill switch (`LCN_TTS_STREAM=0`
+restores the single full decode) and positive control (`STREAM chunk N` log lines) were
+in from the first line; failed emits fall back to the full decode; evicted mid-stream
+states unlink their .part.
+
+Harness lesson recorded against self: the offline harness's first two failures were the
+SAME wrong file — an invented fallback glob matched `cosy24k_vocoder.py` and loaded
+Python source as weights. Mirror the shipping resolution; never improvise it.
+
+Battery on the streaming build: audio-chat 8/8, stream-util 5/5, selftest 7/7 (TTS now
+through the streamed finalize), degeneracy 6/6. **Final gate PENDING: owner listening to
+the live streamed clip (7 chunks, 6 held-tail crossfade seams — the one thing no test
+can hear).** Known knob if TTFA needs to shrink: a ramped schedule (small first chunk,
+~12 frames → ~3.5 s) — not built, awaiting need.
