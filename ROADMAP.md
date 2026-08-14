@@ -790,7 +790,7 @@ optimizations that trade modalities for speed:
       investigation) — SGLANG_ENABLE_JIT_DEEPGEMM=0 vs on is bit-identical on v0.5.16
       (greedy tokens + teacher-forced logprobs): DeepGemm is inert for this w8a8_int8
       checkpoint and the `scale_fmt is not ue8m0` warning is noise. Nothing to tune.
-- [ ] **Prefill tuning**: cold prefill measured ~2.6k tok/s; try larger
+- [x] **Prefill tuning DONE 2026-08-14 — default 8192 is optimal: flat ~3.0k tok/s from 6.8k to 36k-token prompts; chunk=32768 was 3.3x SLOWER (910 tok/s). See FINDINGS.** (was: cold prefill measured ~2.6k tok/s; try larger
       `chunked_prefill_size` / `max_prefill_tokens` on the 128 GB box.
 - [x] **fp8 KV re-bench DONE 2026-08-14 — DEAD, −43% (22.48→12.74 tok/s), penalty fully intact post-tuning; see FINDINGS.** (was: owner-validated for quality; −41% decode pre-tuning —
       the gap may narrow once MoE kernels stop dominating)

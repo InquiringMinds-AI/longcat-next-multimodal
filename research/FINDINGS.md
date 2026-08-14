@@ -3019,6 +3019,19 @@ batch-stride defect in the shipped kernel dimensions.
 Perf candidates surfaced by the same review: fp8 KV re-bench, prefill chunk
 tuning (~2.6k tok/s cold), and the known backbone graph-veto surgery.
 
+**Prefill chunk size: default 8192 is at the optimum; larger is CATASTROPHIC
+(2026-08-14 sweep).** First sweep was a null instrument — its ~6.8k-token prompts
+fit ONE chunk at every setting (three identical ~2.9k tok/s numbers meant
+"chunking never ran", not "chunk size doesn't matter"). Re-run with ~36k-token
+prompts: default-8192 **2,993 tok/s** (flat vs the 6.8k-token rate — chunked
+prefill costs NOTHING at default), chunk-32768 (+max-prefill-tokens raised to
+match) **910 tok/s** — 3.3× slower. Whatever regime the long forward batch
+falls out of (flashinfer ragged-prefill tiling being the suspect), don't chase
+it: the knob (LCN_CHUNKED_PREFILL) stays exposed for future stacks but is
+documented leave-alone. Also refuted: the idea that the agent-recipe needle
+test's ~1.8k tok/s reflected chunking overhead — that was the big-pool config,
+a different regime.
+
 **fp8 KV: DEAD, definitively (2026-08-14 re-bench).** bench_decode, matched arms
 on v0516-rev2, warm, 3 runs/prompt: bf16 KV **22.48** tok/s median-of-medians vs
 fp8_e4m3 **12.74** — **−43 %**, the same penalty as the pre-tuning −41 %. The MoE
