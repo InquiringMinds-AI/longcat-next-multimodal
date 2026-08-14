@@ -41,7 +41,8 @@ for a sample generated image and voice clip before you download anything.
 | single image, warm (1040×1040 + refine) | ~4–5 min | **~2.4 min** | refiner guidance-off default, per-level head CUDA graphs, dense-SDPA head attention |
 | TTS generation rate | ~2.2–2.4× slower than realtime | **~1.4×** | int8 audio-head FFN (−34–36 %/frame) |
 | TTS first audio (streaming) | ~32 s (whole clip) | **~6.5 s** | sliding-window chunk vocoding, streamed PCM |
-| text decode | — | +6 % (single), **+13.6 % aggregate @16 concurrent** | CUDA graphs default-on, max-bs 32 |
+| text decode | — | **22.4 tok/s single; 187 tok/s aggregate @16 concurrent (8.4×), 297 tok/s @32 (13.4×)** | CUDA graphs default-on, max-bs 32; continuous batching |
+| agentic verbatim re-emission | — | **~74 tok/s** (100 % fidelity) | `LCN_NGRAM=1` speculative decode; novel prose unaffected (±3 %) |
 | warm agent prefix (15.6k tokens) | ~5.9 s | **~0.36 s** | radix cache default-on |
 
 What ships **on by default** because it measured faster with no quality cost: CUDA graphs
@@ -107,7 +108,7 @@ by default artifacts are served to the client and deleted.
 |---|---|---|
 | everything (default) | *(nothing)* | all modalities; full native 128k context; generation heads lazily allocate ~22 GB on first use (or at startup with `LCN_PREWARM=1`) |
 | an agentic / text client (Claude Code, tool loops) | `LCN_AGENT=1` | generation endpoints 403 so their ~22 GB is never allocated; understanding still works; radix cache makes resent system prompts ~free |
-| many long sessions at once | `LCN_AGENT=1 MAX_TOTAL_TOKENS=917504 MEM_FRACTION=0.88` | **~6 full 128k contexts** of KV pool (measured: 800 557 tokens, 7.5 GB headroom steady, 36k-token prompt prefilled at ~1.8k tok/s with exact recall) |
+| many long sessions at once | `LCN_AGENT=1 MAX_TOTAL_TOKENS=917504 MEM_FRACTION=0.88` | **~6 full 128k contexts** of KV pool (measured: 819 020 tokens, ~7.2 GB headroom steady, 36k-token prompt prefilled at ~3.0k tok/s with exact recall) |
 | 256k context | `LCN_YARN=1` | RoPE-YaRN ×2; opt-in because YaRN can slightly affect short-context / generation quality |
 
 KV is MLA-compressed at **~31.5 KB/token** — one full 128k context is 3.94 GB, which is why the

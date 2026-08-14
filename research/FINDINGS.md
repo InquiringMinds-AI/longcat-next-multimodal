@@ -3052,3 +3052,54 @@ generation's last segment, present in both variants) — model delivery, unreach
 by any join treatment. (c) Reference includes the end-flag row inside each vocoded
 chunk (end = pos+1); we drop it — audibly indistinguishable in every clip to date,
 parked.
+
+---
+
+## 2026-08-14 — fresh re-bench of every published number, one new bug found and fixed
+
+The owner suspected staleness in the published benchmark set; every number was re-measured
+against the deployed build (all defaults unless stated). Verdicts:
+
+| claim | fresh measurement | verdict |
+|---|---|---|
+| text decode 22.4 tok/s single | 22.43 tok/s (median of 9, spread ≤1.3 %) | holds |
+| "+13.6 % aggregate @16" | 187 tok/s @16 (8.4× single), 297 tok/s @32 (13.4×), 0 failures | **stale framing** — that figure was a graphs-on/off A/B, not batching scaling; replaced in README with the measured curve |
+| prefill ~3.0k tok/s | 3083 tok/s (6.7k prompt), 2975 tok/s (36k prompt) | holds |
+| warm 15.6k prefix ~0.36 s | 0.32 s (radix; cold 1.2–4.3 s) | holds |
+| TTS ~1.4× realtime | frame-level 1.31–1.39×; end-to-end wall 1.6–2.1× clip length (fixed ~2 s prompt/transcript/finalize overhead dominates short clips) | holds at the level claimed; end-to-end decomposition now recorded |
+| streaming first audio ~6.5 s | 3.86 s | better than published |
+| warm single image ~2.4 min | 148 s | holds |
+| 2-concurrent images 1.25× aggregate | 1.62× (183 s for the pair vs 148 s solo; per-image 176 s) | **stale** — predates head batching, which was specifically a concurrency optimization |
+| ngram agent verbatim ~76 tok/s | 74.4 tok/s median, 100 % fidelity (cold first run 25.7) | holds |
+| ngram overhead on novel prose 7–9 % | overall −0 % (23.9 vs 22.4); worst prompt −3 % | **stale** — current defaults absorb it |
+| agent big-pool ~800k tokens / 7.5 GB headroom / 1.8k tok/s | 819 020 tokens, ~7.2 GB steady, 2975 tok/s at 36k | pool + headroom hold; **prefill figure was stale** (older build), README updated |
+
+### Bug: identical repeated TTS request → HTTP 500 (found by the re-bench, fixed)
+
+Repro: send the same `/v1/audio/speech` input twice. The second request's prompt is
+radix-cached down to a single-token extend region. The transcript coverage stop's prompt
+capture reads ONLY the extend region ("TTS prompts are single-chunk, so the extend region
+IS the whole prompt" — true under chunked prefill, false under the radix cache), so
+`prompt_norm` collapsed to the decoded `<audiogen_start>` token, honest recitation was
+judged "not in the remaining request text", the round closed with 0 segments, stream
+finalize threw FileNotFoundError on the never-created `.pcm.part`, the full-decode
+fallback had nothing to decode, and the gateway returned 500. Same failure family as the
+chunked-prefill recitation escape: deriving request-level truth from a scheduler-sized
+window.
+
+Fix (both sides of the same rid-keyed channel the `.pcm.part` flow already uses):
+- gateway writes the authoritative recitation text to `longcat_tts_<rid>.reqtext` before
+  POST (both TTS paths; discarded on every exit path, belt-and-braces),
+- the model prefers the sidecar over the extend-derived text when the rid is `lcntts`-
+  prefixed, reads it once and deletes it,
+- `_finalize_audio` early-outs on a 0-segment close instead of entering stream finalize.
+
+Residual (accepted): raw `/generate` callers without the gateway get no sidecar; an
+identical repeated raw TTS prompt still has its recitation instruction and text swallowed
+by the cache — but then `recitation` itself is not detected, so the request runs under
+free-speech semantics (no content stops, budget/frame-bound) rather than failing.
+
+Validation on v0516-rev4: the exact repro ×3 → 200 with real audio each time, transcripts
+end `natural (audiotext_pad)` (coverage stop passing via sidecar, not bypassed), zero
+`.reqtext` files left behind. rev4 retagged `longcat-next-gb10:latest` and deployed as
+the production serve (defaults + prewarm).

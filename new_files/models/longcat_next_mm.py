@@ -1219,6 +1219,8 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
 
     def _finalize_audio(self, state, req_idx) -> Optional[str]:
         """Decode everything the request produced (all rounds) and write the wav."""
+        if not state.accumulated_ids and not state.done_segments:
+            return None  # 0-segment close: nothing to assemble, and no .pcm.part exists
         if _LCN_TTS_STREAM and state.rid and not state.stream_failed:
             try:
                 return self._stream_finalize(state)
@@ -2597,6 +2599,21 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                             or "用这个声音合成以下内容" in _raw_prompt)
                     except Exception:
                         state.prompt_norm = ""  # coverage stop disabled; budget/frames still bound
+                    # Radix-cache escape: the extend region holds only what the cache
+                    # did NOT already cover — on a repeated prompt that can be one
+                    # token, and the coverage stop would read honest recitation as
+                    # invention and close with no audio. The gateway writes the
+                    # authoritative recitation text to a rid-keyed sidecar for
+                    # exactly this; prefer it when present (read once, then delete).
+                    if (state.rid or "").startswith("lcntts"):
+                        _sc = (f"{os.environ.get('LCN_OUTPUT_DIR', '/tmp')}"
+                               f"/longcat_tts_{state.rid}.reqtext")
+                        try:
+                            with open(_sc, "r") as f:
+                                state.prompt_norm = self._norm_tts_text(f.read())
+                            os.unlink(_sc)
+                        except OSError:
+                            pass  # no sidecar (raw /generate caller): extend text stands
                     self._audio_gen_states[req_idx] = state
                     # Let lm_head's transcript token pass through — the scheduler
                     # writes it to the N-gram token table for correct hash context.

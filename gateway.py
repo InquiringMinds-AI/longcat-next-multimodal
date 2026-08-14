@@ -373,11 +373,14 @@ async def audio_speech(req: Request):
                                    "top_k": 5, "top_p": 0.85}}
     if body.get("stream"):
         return await _audio_speech_stream(sg_body, body)
+    _reqtext = _write_reqtext_sidecar(sg_body["rid"], text)
     try:
         async with _gen_slots:
             r = await _client.post(SGLANG + "/generate", json=sg_body)
     except httpx.ConnectError:
+        _discard_artifact(_reqtext)
         return JSONResponse({"error": {"message": "backend unavailable (model may still be loading)"}}, status_code=503)
+    _discard_artifact(_reqtext)  # the model consumed it at prefill; this covers paths that never did
     rj, raw = _json_or_text(r)
     if rj is None:
         return JSONResponse({"error": {"message": "backend error: " + raw[:200]}}, status_code=502)
@@ -392,6 +395,23 @@ async def audio_speech(req: Request):
     # non-streaming TTS request leaked one PCM file into the output dir.
     _discard_artifact(path[:-len(".wav")] + ".pcm.part")
     return Response(content=data, media_type="audio/wav")
+
+
+def _write_reqtext_sidecar(rid, text):
+    """Authoritative recitation text for the model's transcript coverage stop.
+
+    The model's in-prompt capture reads only the prefill EXTEND region, and the radix
+    cache can shrink that to a single token on a repeated prompt — the coverage stop
+    then mis-reads honest recitation as invention and closes the request with no audio.
+    The sidecar survives any cache split; the model reads and deletes it when it opens
+    the audio-generation state. Returns the path (for belt-and-braces cleanup)."""
+    path = "%s/longcat_tts_%s.reqtext" % (OUT, rid)
+    try:
+        with open(path, "w") as f:
+            f.write(text)
+    except OSError:
+        pass  # coverage stop falls back to the extend-derived text
+    return path
 
 
 def _wav_stream_header(sample_rate=24000, bits=16, channels=1):
@@ -425,6 +445,7 @@ async def _audio_speech_stream(sg_body, body):
     sg_body["rid"] = rid
     part = "%s/longcat_tts_%s.pcm.part" % (OUT, rid)
     wav = "%s/longcat_tts_%s.wav" % (OUT, rid)
+    reqtext = _write_reqtext_sidecar(rid, str(body.get("input", "")))
     fmt = str(body.get("response_format", "wav")).lower()
 
     # Fire the backend BEFORE committing the response: a dead backend errors within
@@ -444,6 +465,7 @@ async def _audio_speech_stream(sg_body, body):
         if err:
             _gen_slots.release()
             _discard_artifact(part)
+            _discard_artifact(reqtext)
             return JSONResponse({"error": {"message": err}}, status_code=502)
 
     # Slot/artifact ownership: normally gen()'s finally releases. But a client
@@ -458,6 +480,7 @@ async def _audio_speech_stream(sg_body, body):
             _gen_slots.release()
             _discard_artifact(part)
             _discard_artifact(wav)
+            _discard_artifact(reqtext)
 
     task.add_done_callback(lambda _t: None if _state["owned"] else _release_once())
 
