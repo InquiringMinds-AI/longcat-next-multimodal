@@ -122,6 +122,138 @@ class Int8SlotFFN:
         return out.to(res.dtype)
 
 
+_INT4_CONFIGS = [
+    triton.Config({'BLOCK_M': 64}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 128}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 128}, num_warps=8, num_stages=2),
+    triton.Config({'BLOCK_M': 256}, num_warps=8, num_stages=2),
+]
+
+
+@triton.autotune(configs=_INT4_CONFIGS, key=['M', 'K', 'NUM_BATCH'])
+@triton.jit
+def _int4_gemv(out_ptr, w_ptr, x_ptr, s_ptr, M, K, stride_ob, stride_xb,
+               NUM_BATCH: tl.constexpr, GROUP: tl.constexpr, BLOCK_M: tl.constexpr):
+    """Group-wise int4 GEMV. w_ptr: uint8 [M, K//2], byte j holds k=2j (low
+    nibble) and k=2j+1 (high nibble), each stored BIASED (q+8, 0..15).
+    s_ptr: fp16 [M, K//GROUP], one scale per (row, group). The K loop steps by
+    GROUP so each block sees exactly one scale per row."""
+    pid_m = tl.program_id(0)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rmask = rows < M
+    acc0 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc3 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    n_groups = K // GROUP
+    for g in range(0, n_groups):
+        ks = g * GROUP
+        cb = ks // 2 + tl.arange(0, GROUP // 2)
+        w8 = tl.load(w_ptr + rows[:, None] * (K // 2) + cb[None, :],
+                     mask=rmask[:, None], other=136).to(tl.int32)  # 136 = (8|8<<4) -> zeros
+        lo = (w8 & 15) - 8
+        hi = (w8 >> 4) - 8
+        s = tl.load(s_ptr + rows * n_groups + g, mask=rmask, other=0.0).to(tl.float32)
+        xlo0 = tl.load(x_ptr + 0 * stride_xb + ks + 2 * tl.arange(0, GROUP // 2)).to(tl.float32)
+        xhi0 = tl.load(x_ptr + 0 * stride_xb + ks + 2 * tl.arange(0, GROUP // 2) + 1).to(tl.float32)
+        acc0 += s * tl.sum(lo * xlo0[None, :] + hi * xhi0[None, :], axis=1)
+        if NUM_BATCH > 1:
+            xlo = tl.load(x_ptr + 1 * stride_xb + ks + 2 * tl.arange(0, GROUP // 2)).to(tl.float32)
+            xhi = tl.load(x_ptr + 1 * stride_xb + ks + 2 * tl.arange(0, GROUP // 2) + 1).to(tl.float32)
+            acc1 += s * tl.sum(lo * xlo[None, :] + hi * xhi[None, :], axis=1)
+        if NUM_BATCH > 2:
+            xlo = tl.load(x_ptr + 2 * stride_xb + ks + 2 * tl.arange(0, GROUP // 2)).to(tl.float32)
+            xhi = tl.load(x_ptr + 2 * stride_xb + ks + 2 * tl.arange(0, GROUP // 2) + 1).to(tl.float32)
+            acc2 += s * tl.sum(lo * xlo[None, :] + hi * xhi[None, :], axis=1)
+        if NUM_BATCH > 3:
+            xlo = tl.load(x_ptr + 3 * stride_xb + ks + 2 * tl.arange(0, GROUP // 2)).to(tl.float32)
+            xhi = tl.load(x_ptr + 3 * stride_xb + ks + 2 * tl.arange(0, GROUP // 2) + 1).to(tl.float32)
+            acc3 += s * tl.sum(lo * xlo[None, :] + hi * xhi[None, :], axis=1)
+    tl.store(out_ptr + 0 * stride_ob + rows, acc0.to(tl.float32), mask=rmask)
+    if NUM_BATCH > 1:
+        tl.store(out_ptr + 1 * stride_ob + rows, acc1.to(tl.float32), mask=rmask)
+    if NUM_BATCH > 2:
+        tl.store(out_ptr + 2 * stride_ob + rows, acc2.to(tl.float32), mask=rmask)
+    if NUM_BATCH > 3:
+        tl.store(out_ptr + 3 * stride_ob + rows, acc3.to(tl.float32), mask=rmask)
+
+
+def _quantize_int4_grouped(w, group=128):
+    """w [M,K] -> packed uint8 [M,K//2] (biased nibbles), scales fp16 [M,K//group]."""
+    M, K = w.shape
+    wf = w.float().reshape(M, K // group, group)
+    scales = wf.abs().amax(dim=2).clamp(min=1e-12) / 7.0
+    q = (wf / scales.unsqueeze(2)).round().clamp(-8, 7).to(torch.int16) + 8
+    q = q.reshape(M, K)
+    packed = (q[:, 0::2] | (q[:, 1::2] << 4)).to(torch.uint8).contiguous()
+    return packed, scales.to(torch.float16).contiguous()
+
+
+class Int4SlotFFN:
+    """Group-wise int4 twin of Int8SlotFFN (audio-head sub-realtime push).
+
+    Same slot decomposition and forward contract; per-(row, 128-group) scales
+    instead of per-row — plain per-channel int4 rounding audibly degrades
+    generation heads, group-wise is the standard mitigation."""
+
+    GROUP = 128
+
+    def __init__(self, w1, w2, depth, ffn_scale, dim):
+        t = ffn_scale * dim // depth
+        w1r = w1.reshape(t, depth, dim)
+        w2r = w2.reshape(dim, depth, t)
+        self.depth, self.t, self.dim = depth, t, dim
+        self.w1_q, self.s1, self.w2_q, self.s2 = [], [], [], []
+        for l in range(depth):
+            for (src, wl, sl) in ((w1r[:, l, :], self.w1_q, self.s1),
+                                  (w2r[:, l, :], self.w2_q, self.s2)):
+                p, s = _quantize_int4_grouped(src.contiguous(), self.GROUP)
+                wl.append(p)
+                sl.append(s)
+
+    def _gemv(self, w_q, scales, x):
+        M = w_q.shape[0]
+        K = w_q.shape[1] * 2
+        B = x.shape[0]
+        x16 = x.to(torch.float16).contiguous()
+        out = torch.empty(B, M, dtype=torch.float32, device=x.device)
+        grid = lambda meta: ((M + meta['BLOCK_M'] - 1) // meta['BLOCK_M'],)
+        for b0 in range(0, B, 4):
+            nb = min(4, B - b0)
+            _int4_gemv[grid](out[b0:], w_q, x16[b0:], scales, M, K,
+                             out.stride(0), x16.stride(0),
+                             NUM_BATCH=nb, GROUP=self.GROUP)
+        return out
+
+    def forward(self, res):
+        B = res.shape[0]
+        out = torch.empty(B, self.depth, self.dim,
+                          dtype=torch.float32, device=res.device)
+        resf = res.to(torch.float32)
+        for l in range(self.depth):
+            h = self._gemv(self.w1_q[l], self.s1[l], resf[:, l, :])
+            h = torch.nn.functional.gelu(h)
+            out[:, l, :] = self._gemv(self.w2_q[l], self.s2[l], h)
+        return out.to(res.dtype)
+
+
+def attach_int4_ffn(head, depth):
+    """Int4 twin of attach_int8_ffn — same _int8_ffn attach point (the layer
+    forward only checks presence, not class), same bf16 freeing."""
+    freed = 0
+    for layer in head.transformer_layers:
+        if getattr(layer, "_int8_ffn", None) is not None:
+            continue
+        w1, w2 = layer.linear1.weight.data, layer.linear2.weight.data
+        layer._int8_ffn = Int4SlotFFN(w1, w2, depth,
+                                      layer.transformer_ffn_scale,
+                                      layer.transformer_dim)
+        freed += w1.numel() * w1.element_size() + w2.numel() * w2.element_size()
+        layer.linear1.weight.data = torch.empty(0, device=w1.device, dtype=w1.dtype)
+        layer.linear2.weight.data = torch.empty(0, device=w2.device, dtype=w2.dtype)
+    return freed
+
+
 def attach_int8_ffn(head, depth):
     """Quantize every transformer layer's FFN in-place and FREE the bf16 weights.
 
