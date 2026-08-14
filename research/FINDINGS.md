@@ -539,7 +539,7 @@ Same build, same sentence, NGRAM off, n=13:
 The long tail appears in BOTH arms, and the control has MORE samples over 5s with a
 slightly longer median. There is no signal that speculation or the plain-decode
 fallback causes it. The owner's own hedge ("could just be a normal variation for the
-voice gen") was correct and the Claude-side suspicion was wrong — recorded that way
+voice gen") was correct and the first-pass suspicion was wrong — recorded that way
 deliberately, because the suspicion was reasonable (a late end-of-audio detection
 produces exactly this shape) and the only thing that separated it from the truth was
 running the control.
@@ -2603,9 +2603,9 @@ decoded reference every step.
 The owner asked for a review of everything landed since the MoE-tuning campaign
 (d489578..HEAD, 105 commits, ~3,570 insertions of code). Two passes: a deep manual read of
 the serving-path diffs, and an independent adversarial pass by a second model family
-(the owner's standing posture: a different model's eye on Claude-written code is the
-bias check). The second pass earned its seat — of its six findings, five were real and
-none had survived my own read.
+(the standing posture: a second model family's eye on the code is the bias check).
+The second pass earned its seat — of its six findings, five were real and none had
+been caught by the first pass.
 
 **Fixed (commit 5decacb):**
 
