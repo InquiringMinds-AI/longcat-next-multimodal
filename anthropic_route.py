@@ -179,8 +179,12 @@ async def _stream_live(body, upstream, oai_tools):
                    "message": "stream failed: " + str(e)[:200]}})
         if text_open:
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+        # stop_reason stays NULL, same rule as the abnormal-finish path below: this
+        # stream just said it failed, and "end_turn" would simultaneously claim it
+        # completed. A client keying off message_delta.stop_reason — the field that
+        # exists to answer exactly this — must not be told a partial reply finished.
         yield _sse("message_delta", {"type": "message_delta",
-                   "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                   "delta": {"stop_reason": None, "stop_sequence": None},
                    "usage": {"output_tokens": 0}})
         yield _sse("message_stop", {"type": "message_stop"})
         return

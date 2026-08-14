@@ -1441,6 +1441,77 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         max_token_id = getattr(self.config, 'text_vocab_plus_multimodal_special_token_size', self.config.vocab_size) - 1
         input_ids = input_ids.clamp(min=0, max=max_token_id)
 
+        # Prune generation state orphaned by aborted or evicted requests — FIRST,
+        # before anything below consumes it. This block originally ran AFTER the
+        # state machines, which left a one-step window: on the first decode forward
+        # after sglang recycled a dead generation's pool slot to an ordinary text
+        # request, the embedding-feedback pass and _image/_audio_gen_decode_step
+        # looked the stale state up by req_pool_idx and acted on it — forcing
+        # image_pad/image_end overrides into an innocent request's output — and only
+        # THEN did the eviction run. The janitor must sweep before the machines eat.
+        #
+        # _audio_gen_states/_image_gen_states are keyed by req_pool_idx, and sglang
+        # REUSES pool slots. Entries are deleted on normal completion only, so a request
+        # that dies mid-generation — routine, since image generation runs for minutes and
+        # clients time out — pins its state to a slot that will later be handed to someone
+        # else.
+        # Decay-based, mirroring the trigger latch below: a slot absent from the batch for
+        # 64 consecutive decode steps is not coming back. The tolist() is a host sync, but
+        # this runs only while generation state exists, and that path is already eager.
+        # Decay alone is NOT sufficient, and the gap is what matters most here: it clears a
+        # slot only while that slot is ABSENT from the batch. If the aborted request's slot is
+        # promptly recycled to ordinary traffic, the slot is present on every step, the absent
+        # counter resets every step, and the entry is never cleared. `lcn_gen_watch_active()`
+        # reads exactly these dicts, so a single aborted generation whose slot gets reused
+        # LATCHES the CUDA-graph and spec-decode veto ON for every request, permanently, until
+        # the server restarts — presenting only as "it got slow and stayed slow".
+        # So evict on IDENTITY as well: the state records the rid that created it, and a slot
+        # now serving a different rid is holding a corpse. rid-based eviction is immediate and
+        # needs no absence; the decay below remains for the case where the slot simply goes
+        # idle, and for when rids are unavailable (then `_rid_for` returns "" and this is
+        # skipped — failing back to the pre-existing behaviour rather than evicting live state).
+        if is_decode and (self._audio_gen_states or self._image_gen_states):
+            _live = set(forward_batch.req_pool_indices.tolist())
+            for _store, _kind in ((self._audio_gen_states, "audio"),
+                                  (self._image_gen_states, "image")):
+                for _k in list(_store.keys()):
+                    _key = (_kind, _k)
+                    if _k in _live:
+                        _st = _store.get(_k)
+                        _now = self._rid_for(_k, forward_batch)
+                        if _st is not None and _st.rid and _now and _st.rid != _now:
+                            logger.warning(
+                                "[GenState] %s generation state for pool slot %d belongs to "
+                                "request %s but the slot now serves %s — evicting. The "
+                                "original request died mid-generation; keeping this would "
+                                "pin the CUDA-graph veto on for every request.",
+                                _kind, _k, _st.rid, _now)
+                            # Under LCN_CFG=1 an image state may own a shadow request slot
+                            # + KV pages for the uncond path, released only on normal
+                            # completion. Eviction must release them too or every aborted
+                            # CFG image leaks its shadow allocation until restart.
+                            # (_free_uncond_kv self-guards: no-op without uncond state.)
+                            if _kind == "image":
+                                self._free_uncond_kv(_st)
+                            _store.pop(_k, None)
+                            self._gen_state_absent.pop(_key, None)
+                            continue
+                        self._gen_state_absent.pop(_key, None)
+                        continue
+                    _n = self._gen_state_absent.get(_key, 0) + 1
+                    self._gen_state_absent[_key] = _n
+                    if _n >= 64:
+                        logger.warning(
+                            "[GenState] %s generation state for pool slot %d absent from "
+                            "the batch for 64 decode steps — clearing (request aborted or "
+                            "evicted). A later request reusing this slot would otherwise "
+                            "inherit it.", _kind, _k)
+                        _st = _store.get(_k)
+                        if _kind == "image" and _st is not None:
+                            self._free_uncond_kv(_st)  # see rid-eviction note above
+                        _store.pop(_k, None)
+                        self._gen_state_absent.pop(_key, None)
+
         # --- Step 1: Compute embeddings ---
         if has_mm and input_embeds is None:
             input_embeds = self._compute_mm_embeddings(input_ids, forward_batch)
@@ -1533,61 +1604,6 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             image_logit_overrides = self._image_gen_decode_step(
                 input_ids, hidden_states, forward_batch
             )
-        # Prune generation state orphaned by aborted or evicted requests.
-        # _audio_gen_states/_image_gen_states are keyed by req_pool_idx, and sglang
-        # REUSES pool slots. Entries are deleted on normal completion only, so a request
-        # that dies mid-generation — routine, since image generation runs for minutes and
-        # clients time out — pins its state to a slot that will later be handed to someone
-        # else. The next occupant then hits `.get(req_idx)` in the decode path and is
-        # treated as mid-generation: its input_ids get zeroed at pad positions and it is
-        # fed the dead request's codebook feedback.
-        # Decay-based, mirroring the trigger latch below: a slot absent from the batch for
-        # 64 consecutive decode steps is not coming back. The tolist() is a host sync, but
-        # this runs only while generation state exists, and that path is already eager.
-        # Decay alone is NOT sufficient, and the gap is what matters most here: it clears a
-        # slot only while that slot is ABSENT from the batch. If the aborted request's slot is
-        # promptly recycled to ordinary traffic, the slot is present on every step, the absent
-        # counter resets every step, and the entry is never cleared. `lcn_gen_watch_active()`
-        # reads exactly these dicts, so a single aborted generation whose slot gets reused
-        # LATCHES the CUDA-graph and spec-decode veto ON for every request, permanently, until
-        # the server restarts — presenting only as "it got slow and stayed slow".
-        # So evict on IDENTITY as well: the state records the rid that created it, and a slot
-        # now serving a different rid is holding a corpse. rid-based eviction is immediate and
-        # needs no absence; the decay below remains for the case where the slot simply goes
-        # idle, and for when rids are unavailable (then `_rid_for` returns "" and this is
-        # skipped — failing back to the pre-existing behaviour rather than evicting live state).
-        if is_decode and (self._audio_gen_states or self._image_gen_states):
-            _live = set(forward_batch.req_pool_indices.tolist())
-            for _store, _kind in ((self._audio_gen_states, "audio"),
-                                  (self._image_gen_states, "image")):
-                for _k in list(_store.keys()):
-                    _key = (_kind, _k)
-                    if _k in _live:
-                        _st = _store.get(_k)
-                        _now = self._rid_for(_k, forward_batch)
-                        if _st is not None and _st.rid and _now and _st.rid != _now:
-                            logger.warning(
-                                "[GenState] %s generation state for pool slot %d belongs to "
-                                "request %s but the slot now serves %s — evicting. The "
-                                "original request died mid-generation; keeping this would "
-                                "pin the CUDA-graph veto on for every request.",
-                                _kind, _k, _st.rid, _now)
-                            _store.pop(_k, None)
-                            self._gen_state_absent.pop(_key, None)
-                            continue
-                        self._gen_state_absent.pop(_key, None)
-                        continue
-                    _n = self._gen_state_absent.get(_key, 0) + 1
-                    self._gen_state_absent[_key] = _n
-                    if _n >= 64:
-                        logger.warning(
-                            "[GenState] %s generation state for pool slot %d absent from "
-                            "the batch for 64 decode steps — clearing (request aborted or "
-                            "evicted). A later request reusing this slot would otherwise "
-                            "inherit it.", _kind, _k)
-                        _store.pop(_k, None)
-                        self._gen_state_absent.pop(_key, None)
-
         if (
             _run_sm
             and self._trigger_sticky

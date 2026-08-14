@@ -229,8 +229,11 @@ async def _prewarm_task():
         if rj is None:
             raise RuntimeError("backend error: " + raw[:200])
         path = "%s/longcat_tts_%s.wav" % (OUT, _san(rj.get("meta_info", {}).get("id", "")))
-        if await _read_when_ready(path) is not None:
-            _discard_artifact(path)
+        # A missing artifact is the FAILURE the endpoint 500s on — prewarm must not
+        # swallow it and report "ready" over a broken TTS path.
+        if await _read_when_ready(path) is None:
+            raise RuntimeError("audio generation produced no output")
+        _discard_artifact(path)
         _prewarm_state["audio_s"] = round(_t.monotonic() - t0, 1)
         logger.info("[prewarm] audio path warm in %.1fs", _prewarm_state["audio_s"])
     except Exception as e:                     # noqa: BLE001
@@ -238,9 +241,13 @@ async def _prewarm_task():
         _prewarm_state.update(error=f"audio: {e}")
         logger.warning("[prewarm] audio warmup failed (serving continues): %s", e)
 
-    _prewarm_state.update(status="ready")
-    logger.info("[prewarm] complete: image=%ss audio=%ss",
-                _prewarm_state["image_s"], _prewarm_state["audio_s"])
+    # "ready" must mean BOTH paths verified. A recorded audio error downgrades to
+    # "degraded" rather than being readable only by someone who checks the error
+    # field — a status that says ready while a path is broken is the same shape as
+    # a warmup that looks warm without being exercised.
+    _prewarm_state.update(status="degraded" if _prewarm_state["error"] else "ready")
+    logger.info("[prewarm] complete (%s): image=%ss audio=%ss",
+                _prewarm_state["status"], _prewarm_state["image_s"], _prewarm_state["audio_s"])
 
 
 @app.on_event("startup")
@@ -268,7 +275,9 @@ async def status():
             "output_dir": OUT,
             "keep_artifacts": os.environ.get("LCN_KEEP_ARTIFACTS", "0").strip() == "1",
             "radix": os.environ.get("LCN_RADIX", "1"),
-            "cudagraph": os.environ.get("LCN_CUDAGRAPH", "0"),
+            # Default mirrors the entrypoint's (which also exports the effective value,
+            # so this fallback only fires when the gateway runs outside the entrypoint).
+            "cudagraph": os.environ.get("LCN_CUDAGRAPH", "1"),
             "ngram": os.environ.get("LCN_NGRAM", "0"),
             "yarn": os.environ.get("LCN_YARN", "0"),
             "kv_dtype": os.environ.get("LCN_KV_DTYPE", "") or "bf16 (default)",
@@ -524,10 +533,22 @@ async def chat_completions(req: Request):
                             media_type=r.headers.get("content-type", "text/plain"))
         return JSONResponse(j, status_code=r.status_code)
     # audio understanding: SGLang's chat schema rejects input_audio -> native /generate
-    prompt, blobs = extract_audio_chat(msgs)
+    prompt, blobs, dropped = extract_audio_chat(msgs)
     if not blobs:
         return JSONResponse({"error": {"message": "no decodable audio in request; "
                             "input_audio.data must be base64"}}, status_code=400)
+    if dropped and os.environ.get("LCN_LENIENT_MEDIA", "0").strip() != "1":
+        # Same fail-loud policy as the processor's audio/video decode: a request that
+        # attached media the server cannot read gets an ERROR, not a fluent answer
+        # quietly generated from the readable subset. Previously only the all-clips-bad
+        # case 400'd, so one good clip + one corrupt clip sailed through on the good
+        # clip alone with nothing telling the caller. LCN_LENIENT_MEDIA=1 restores the
+        # drop-and-continue behaviour, gateway and processor together.
+        return JSONResponse({"error": {"message":
+                            "%d audio clip(s) could not be decoded (input_audio.data must "
+                            "be base64); refusing to answer from partial media. Set "
+                            "LCN_LENIENT_MEDIA=1 server-side to allow." % dropped}},
+                            status_code=400)
     paths = []
     for blob in blobs:
         p = "%s/_in_%s.wav" % (OUT, uuid.uuid4().hex)

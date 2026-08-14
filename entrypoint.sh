@@ -73,8 +73,13 @@ fi
 # LCN_CUDAGRAPH=0 restores the old always-eager behavior.
 # (--cuda-graph-max-bs-decode, not --cuda-graph-max-bs: the latter is deprecated
 # upstream and warns on every start.)
+# Exported so GET /status reports the EFFECTIVE state. Before this export, a
+# deployment that left the var unset ran with graphs ON (this default) while the
+# gateway — reading the raw env — reported cudagraph "0": exactly the
+# script-vs-live-process mismatch /status exists to prevent.
+export LCN_CUDAGRAPH="${LCN_CUDAGRAPH:-1}"
 GRAPH_FLAG="--cuda-graph-max-bs-decode ${LCN_CUDAGRAPH_BS:-32} --disable-prefill-cuda-graph"
-[ "${LCN_CUDAGRAPH:-1}" = "0" ] && GRAPH_FLAG="--disable-cuda-graph"
+[ "$LCN_CUDAGRAPH" = "0" ] && GRAPH_FLAG="--disable-cuda-graph"
 
 # NGRAM lookup speculative decoding: reworked 2026-07 — verify batches now get
 # correct hash-table geometry (patches/ngram_spec_verify.patch: TARGET_VERIFY

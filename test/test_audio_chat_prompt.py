@@ -43,7 +43,7 @@ def case(name):
 
 @case("single turn keeps the proven text-then-clip layout")
 def _():
-    p, b = _extract_audio_chat([audio_msg("user", "What is said here?", A1)])
+    p, b, _d = _extract_audio_chat([audio_msg("user", "What is said here?", A1)])
     assert b == [b"CLIP-ONE"], b
     assert p == "<longcat_user>What is said here?" + PAIR + "<longcat_assistant>", p
     return p
@@ -51,7 +51,7 @@ def _():
 
 @case("multi-turn preserves role boundaries and BOTH clips")
 def _():
-    p, b = _extract_audio_chat([
+    p, b, _d = _extract_audio_chat([
         audio_msg("user", "Who is speaking?", A1),
         {"role": "assistant", "content": "A man with a low voice."},
         audio_msg("user", "And in this one?", A2),
@@ -68,7 +68,7 @@ def _():
 
 @case("system turn is marked as system")
 def _():
-    p, b = _extract_audio_chat([
+    p, b, _d = _extract_audio_chat([
         {"role": "system", "content": "You are terse."},
         audio_msg("user", "", A1),
     ])
@@ -78,14 +78,14 @@ def _():
 
 @case("audio with no text anywhere gets the transcribe instruction")
 def _():
-    p, b = _extract_audio_chat([audio_msg("user", "", A1)])
+    p, b, _d = _extract_audio_chat([audio_msg("user", "", A1)])
     assert "Transcribe this audio." in p, p
     return p
 
 
 @case("string-content turns are marked, not concatenated")
 def _():
-    p, b = _extract_audio_chat([
+    p, b, _d = _extract_audio_chat([
         {"role": "user", "content": "Context sentence."},
         audio_msg("user", "Now this clip.", A1),
     ])
@@ -95,18 +95,23 @@ def _():
 
 @case("no decodable audio returns (None, []) rather than crashing the caller")
 def _():
-    p, b = _extract_audio_chat([{"role": "user", "content": "just text"}])
+    p, b, _d = _extract_audio_chat([{"role": "user", "content": "just text"}])
     assert p is None and b == [], (p, b)
     return "(None, [])"
 
 
-@case("an undecodable clip is skipped without sinking the conversation")
+@case("an undecodable clip is skipped AND counted, so the gateway can refuse")
 def _():
+    # This module stays lenient by construction (pure function, no env): it returns
+    # the surviving clips plus a DROP COUNT. The fail-loud decision — 400 unless
+    # LCN_LENIENT_MEDIA=1, matching the processor's media policy — lives in the
+    # gateway, which is why the count must be exact: it is the policy's only input.
     msgs = [audio_msg("user", "first", A1),
             {"role": "user", "content": [{"type": "input_audio",
                                           "input_audio": {"data": "!!!not base64!!!"}}]}]
-    p, b = _extract_audio_chat(msgs)
+    p, b, d = _extract_audio_chat(msgs)
     assert b == [b"CLIP-ONE"], b
+    assert d == 1, d
     # Placeholder count must match the clips that actually survived, or the processor
     # would leave an empty pair for a clip that was never sent.
     assert p.count(PAIR) == 1, p
@@ -115,7 +120,7 @@ def _():
 
 @case("trailing assistant turn is not given a second marker")
 def _():
-    p, b = _extract_audio_chat([audio_msg("user", "q", A1),
+    p, b, _d = _extract_audio_chat([audio_msg("user", "q", A1),
                                 {"role": "assistant", "content": "partial"}])
     assert not p.endswith("<longcat_assistant>"), p
     return p

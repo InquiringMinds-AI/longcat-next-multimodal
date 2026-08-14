@@ -15,8 +15,13 @@ AUDIO_PAIR = "<longcat_audio_start><longcat_audio_end>"
 def extract_audio_chat(messages):
     """Render an audio chat into LongCat's native turn markers, keeping EVERY clip.
 
-    Returns (prompt, [clip_bytes, ...]) with the clips in prompt order, or (None, [])
-    when the request carries no decodable audio.
+    Returns (prompt, [clip_bytes, ...], n_dropped) with the clips in prompt order, or
+    (None, [], n_dropped) when the request carries no decodable audio. n_dropped counts
+    clips that failed base64 decode; the CALLER decides what a nonzero count means
+    (the gateway 400s unless LCN_LENIENT_MEDIA=1, matching the processor's fail-loud
+    media policy — this module stays env-free so it is testable offline). A dropped
+    clip emits no AUDIO_PAIR, so the placeholder count always matches the clips that
+    actually survived.
 
     What this replaces: the previous version concatenated every message's text into one
     string with no role markers and overwrote the clip on each pass, then the caller
@@ -33,7 +38,7 @@ def extract_audio_chat(messages):
     that is the shape known to work against this checkpoint, so the multi-turn case
     extends it rather than inventing a new layout.
     """
-    turns, blobs = [], []
+    turns, blobs, dropped = [], [], 0
     for m in messages:
         mark = ROLE_MARK.get(m.get("role", "user"), "<longcat_user>")
         c = m.get("content")
@@ -51,12 +56,12 @@ def extract_audio_chat(messages):
                         blobs.append(base64.b64decode(p["input_audio"]["data"], validate=True))
                         n_audio += 1
                     except Exception:
-                        pass  # one unreadable clip must not sink the whole conversation
+                        dropped += 1  # counted, not swallowed — the caller owns the policy
         text = text.strip()
         if text or n_audio:
             turns.append((mark, text, n_audio))
     if not blobs:
-        return None, []
+        return None, [], dropped
     if not any(t for _, t, _ in turns):
         # Audio with no text anywhere: supply the instruction the single-turn path used,
         # attached to the last turn that actually carries a clip.
@@ -67,4 +72,4 @@ def extract_audio_chat(messages):
     prompt = "".join(mk + tx + AUDIO_PAIR * na for mk, tx, na in turns)
     if turns[-1][0] != "<longcat_assistant>":
         prompt += "<longcat_assistant>"
-    return prompt, blobs
+    return prompt, blobs, dropped
