@@ -46,9 +46,14 @@ DEFAULT_TOKENS=131072
 # image/audio GENERATION heads lazily allocate ~25GB on first use OUTSIDE
 # --mem-fraction-static, and with both heads warm the box settles at ~3-4GB MemAvailable
 # — one context is all that fits, by ~0.6GB. LCN_AGENT=1 disables generation at the
-# gateway so the heads never allocate; that ~25GB could fund ~6 MORE full contexts
-# (MAX_TOTAL_TOKENS≈917504) for multi-session/radix-depth workloads — capacity measured
-# but NOT yet defaulted; raise MAX_TOTAL_TOKENS explicitly if you want it.
+# gateway so the heads never allocate, and that ~25GB funds ~5 MORE full contexts.
+# MEASURED RECIPE (2026-08-11): MAX_TOTAL_TOKENS=917504 MEM_FRACTION=0.88 ->
+# pool 800557 tokens (24.05GB, 6.1 contexts), 7.5GB MemAvailable steady, and a 36k-token
+# needle prompt prefilled at ~1.8k tok/s with exact retrieval. BOTH knobs are needed:
+# the fraction applies to SGLang's DETECTED budget (~114GB at load start), not the
+# physical 128GB, so 0.82 only bought 4.2 contexts. 0.91 would reach the full 7 but
+# lands ~4GB free — the thin regime — for no qualitative gain. Not the default;
+# deliberately opt-in for multi-session/radix-depth workloads.
 DEFAULT_MEMFRAC=0.72
 [ "${LCN_AGENT:-0}" = "1" ] && DEFAULT_MEMFRAC=0.75
 if [ "${LCN_YARN:-0}" = "1" ]; then

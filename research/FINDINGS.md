@@ -2670,3 +2670,24 @@ said ~88), and the FULL 131072 pool allocates at 0.72 in every profile — the
 Agent-mode 7-context test (owner: "we should test that"): MAX_TOTAL_TOKENS=917504,
 MEM_FRACTION=0.82 (weights+KV = 103.9 GB = 0.814 of the box, so 0.75 would refuse the
 pool). Predicted ~5 GB free steady. Result recorded below when measured.
+
+### Agent-mode big-pool test: 6 full contexts, measured end to end (2026-08-11)
+
+Owner: "we should test that." Two launches, because the first prediction was WRONG in an
+instructive way: MEM_FRACTION applies to SGLang's DETECTED budget (114.42 GB avail at
+load start), not the physical 128 GB — so 0.82, derived from physical arithmetic, bought
+only 4.2 contexts (555184 tokens, 16.68 GB) with 16.6 GB left free. The measured slope
+(~1.2 GB pool per 0.01 fraction) put the corrected launch at 0.88:
+
+- pool **800557 tokens = 24.05 GB = 6.1 full 128k contexts** (cap 917504 not reached;
+  the fraction still binds)
+- **7.47 GB MemAvailable** steady, dipping to 5.36 GB during a long prefill
+- sanity: chat clean, image generation 403s (agent mode doing its job), graphs on
+- capacity proof, not just allocation: a **36,039-token needle prompt** prefilled in
+  19.9 s (~1,810 tok/s) and retrieved the buried code exactly
+
+The full 7 contexts would need 0.91 and land ~4 GB free — the thin regime — for no
+qualitative gain. **Verdict: 6 comfortable beats 7 tight; recipe recorded in the
+entrypoint comment, deliberately opt-in** (MAX_TOTAL_TOKENS=917504 MEM_FRACTION=0.88
+LCN_AGENT=1). The natural consumer is a multi-session / deep-radix Claude Code
+deployment where long conversations currently evict each other from the 1-context pool.
