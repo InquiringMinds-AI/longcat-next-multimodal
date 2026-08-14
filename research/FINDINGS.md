@@ -2979,6 +2979,21 @@ which the generation graph-veto forces; relaxing that veto (backbone replay
 while the mm state machines run) is the one big lever left, and it is deep
 surgery into the 2026-07 spec/graph machinery. Not started.
 
+**int4-g128 audio FFN: DEAD by owner's ear (2026-08-14, "nope").** Built and
+gated in one pass toward the sub-realtime TTS question: group-wise int4 GEMV
+(biased-nibble packing, one scale per row×128-group; kernel in
+int8_head_ffn.py, trial value LCN_INT8_HEADS=audio4). Offline gate: head
+64.3→52.4 ms/frame (−18%), weight relerr 1.9e-1 = 15× int8's — consistent
+with pure 16-level arithmetic, not a kernel bug. In-loop: −15%/frame real
+(storm 0.0319 vs 0.0375 s/KB). Owner listened to paired clips vs approved
+int8: rejected. The kernel and trial value stay in the repo as the recorded
+dead-end; audio stays int8. CONSEQUENCE for the sub-realtime question: with
+int4 dead, TTS faster-than-listening (80 ms/frame vs current ~115) rests
+ENTIRELY on the backbone graph-veto relaxation (~10–15 ms) — which alone
+lands ~100 ms, still short. Sub-realtime TTS on this box is therefore OUT OF
+REACH of serving work alone at int8 quality; parked as a known ceiling
+unless a new lever appears.
+
 Residuals, recorded not actioned: (a) the original awkward clip's ~0 ms slammed
 join was not reproduced; if slams recur, the shelf fix is a MINIMUM-pause floor
 (insert silence only under ~200 ms, leaving the model's longer choices alone) —
