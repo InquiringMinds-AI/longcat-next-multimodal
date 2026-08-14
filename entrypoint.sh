@@ -130,6 +130,14 @@ export LCN_TTS_TRIM_TAIL_MS="${LCN_TTS_TRIM_TAIL_MS:-250}"
 # to pre-feature behavior. Exported so GET /status reports the EFFECTIVE state.
 export LCN_INT8_HEADS="${LCN_INT8_HEADS:-1}"
 
+# Per-level CUDA-graph replay of the depth-head forward: ON by default since
+# 2026-08-14 — the generation loop was launch-latency-bound; graphs are
+# math-identical by construction (capture-time replay-vs-eager torch.equal
+# proof in lcn_head_graph.py) and measured −5.6% single image on top of the
+# int8/SDPA wins. Any capture failure falls back to eager permanently for
+# that head. LCN_HEAD_GRAPH=0 disables.
+export LCN_HEAD_GRAPH="${LCN_HEAD_GRAPH:-1}"
+
 # Radix (prefix) cache: ON by default — warm-prefix reuse is what makes agentic clients
 # (Claude Code re-sends a ~15k-token system prompt every turn) responsive. Viable only
 # WITH the expandable_segments allocator above (radix keeps KV resident, which amplified
