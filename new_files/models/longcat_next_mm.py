@@ -64,6 +64,14 @@ class AudioGenState:
     # after first_end_flag_step is the silent-tail mechanism, measured not assumed.
     end_flag_resamples: int = 0  # isolated end flags converted to acoustic frames
     first_end_flag_step: int = -1  # frame index of the FIRST end flag seen
+    # --- multi-round TTS (LCN_TTS_MULTI): transcript→audio rounds, one per sentence ---
+    done_segments: list = field(default_factory=list)  # completed segments ([n,cb] tensors)
+    rounds: int = 1  # round counter (positive control + runaway bound)
+    between_steps: int = 0  # decode steps spent in "between" mode awaiting the next round
+    wants_eos: bool = False  # between-mode: the model's masked pick was EOS — close next step
+    prev_segment_tail: Optional[torch.Tensor] = None  # last frame of the banked segment:
+    # round N+1's first frame conditions on it (the reference's audio_ids grow globally,
+    # so its round N+1 feedback is round N's last frame; ours reset per segment)
     rid: str = ""  # per-request id → unique output filename (concurrency-safe retrieval)
     # --- streaming vocode (LCN_TTS_STREAM) ---
     streamed_frames: int = 0  # frames whose PCM has been emitted to the .part file
@@ -91,6 +99,19 @@ _LCN_HEAD_BATCH = os.environ.get("LCN_HEAD_BATCH", "1").strip() != "0"
 # knobs: 12.5 frames/s output, ~177 ms/frame generation (98% of latency), ~0.3 s vocode
 # per 2 s chunk (~7% amortized). LCN_TTS_STREAM=0 restores the single full decode.
 _LCN_TTS_STREAM = os.environ.get("LCN_TTS_STREAM", "1").strip() != "0"
+# Multi-round TTS: the model plans sentence-by-sentence — transcript one sentence,
+# render its audio, emit audiogen_end, then (per the reference implementation in the
+# model dir, modeling_longcat_next.py ~line 753) generation CONTINUES and the model may
+# open the next round with another audiogen_start. This serving loop used to force EOS
+# at the first confirmed end-of-audio, decapitating every round after the first: a
+# 4-sentence input deterministically rendered only sentence 1 (measured 6/6, transcript
+# stopping at sentence 1's token count exactly). With this ON, confirmed end forces
+# audiogen_end instead, the segment is banked, and the model decides whether to start
+# round N+1; segments are cross-faded into one wav by the SAME multi-segment machinery
+# lazy_decode_and_save always had. LCN_TTS_MULTI=0 restores the old single-round stop.
+_LCN_TTS_MULTI = os.environ.get("LCN_TTS_MULTI", "1").strip() != "0"
+TTS_BETWEEN_BUDGET = int(os.environ.get("LCN_TTS_BETWEEN_BUDGET", "10"))  # tokens to await next round
+TTS_MAX_ROUNDS = int(os.environ.get("LCN_TTS_MAX_ROUNDS", "32"))          # runaway bound; frames cap binds first
 TTS_STREAM_CHUNK = int(os.environ.get("LCN_TTS_CHUNK_FRAMES", "25"))      # 2 s @ 12.5 fps
 TTS_STREAM_LOOKAHEAD = int(os.environ.get("LCN_TTS_LOOKAHEAD", "12"))     # ~1 s right context
 TTS_STREAM_LEFT_CTX = int(os.environ.get("LCN_TTS_LEFT_CTX", "50"))       # ~4 s left context
@@ -1075,27 +1096,18 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
 
         Returns the path to the saved WAV file, or None on failure.
         """
-        if not state.accumulated_ids or self.audio_tokenizer is None:
+        if (not state.accumulated_ids and not state.done_segments) or self.audio_tokenizer is None:
             return None
 
         try:
-            # Stack accumulated IDs: [num_frames, num_codebooks]
-            audio_ids = torch.stack(state.accumulated_ids, dim=0)
-
-            # Remove offsets to get raw codebook indices
-            offsets = self.audio_offset_vals.to(audio_ids.device)
-            raw_ids = audio_ids - offsets.unsqueeze(0)
-
-            # NOTE: no end-token truncation here — the gen loop never stores the end-flag frame
-            # (see _generate_audio_codebook_step, which returns None on confirmed end), so
-            # accumulated_ids can't contain a level-0 end token. The marker is appended below.
-            if raw_ids.shape[0] == 0:
+            # All rounds' segments, offsets removed, clamped, with end-flag markers
+            # between segments so lazy_decode_and_save splits and cross-fades them —
+            # its multi-segment machinery, fed at last. Single-round requests produce
+            # one segment with no markers: byte-identical to the old path.
+            raw_ids = self._assemble_raw_segments(state)
+            if raw_ids is None or raw_ids.shape[0] == 0:
                 logger.warning("No valid audio frames to decode")
                 return None
-
-            # Clamp each level's IDs to valid codebook range [0, codebook_size-1]
-            for lvl in range(raw_ids.shape[1]):
-                raw_ids[:, lvl] = raw_ids[:, lvl].clamp(min=0, max=self._audio_codebook_sizes[lvl] - 1)
 
             # No manual end-of-audio marker: lazy_decode_and_save pads a codebook_sizes[0] row
             # itself when the last frame isn't one, and decode_wave_vocoder2 slices it off before
@@ -1141,6 +1153,41 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
 
     def _stream_part_path(self, state) -> str:
         return f"{os.environ.get('LCN_OUTPUT_DIR', '/tmp')}/longcat_tts_{state.rid}.pcm.part"
+
+    def _assemble_raw_segments(self, state) -> Optional[torch.Tensor]:
+        """All of a request's segments as ONE raw-ids tensor with end-flag marker rows
+        between them — the exact input shape lazy_decode_and_save's multi-segment split
+        (audio_end_pos) was built for. Offsets subtracted and levels clamped per
+        segment; the marker rows (level0 = codebook_sizes[0], rest 0) are inserted
+        AFTER clamping so the clamp cannot destroy them."""
+        segments = list(state.done_segments)
+        if state.accumulated_ids:
+            segments.append(torch.stack(state.accumulated_ids, dim=0))
+        if not segments:
+            return None
+        offsets = self.audio_offset_vals.to(segments[0].device)
+        marker = torch.zeros(1, segments[0].shape[1], dtype=torch.long,
+                             device=segments[0].device)
+        marker[0, 0] = self._audio_codebook_sizes[0]
+        parts = []
+        for k, seg in enumerate(segments):
+            raw = seg - offsets.unsqueeze(0)
+            for lvl in range(raw.shape[1]):
+                raw[:, lvl] = raw[:, lvl].clamp(min=0, max=self._audio_codebook_sizes[lvl] - 1)
+            parts.append(raw)
+            if k < len(segments) - 1:
+                parts.append(marker)  # lazy_decode pads the final one itself
+        return torch.cat(parts, dim=0)
+
+    def _finalize_audio(self, state, req_idx) -> Optional[str]:
+        """Decode everything the request produced (all rounds) and write the wav."""
+        if _LCN_TTS_STREAM and state.rid and not state.stream_failed:
+            try:
+                return self._stream_finalize(state)
+            except Exception:
+                logger.warning(f"[AudioGen] req={req_idx}: stream finalize failed; "
+                               f"full decode fallback", exc_info=True)
+        return self._decode_audio_to_wav(state)
 
     @torch.no_grad()
     def _vocode_frames(self, raw_ids: torch.Tensor) -> torch.Tensor:
@@ -1225,16 +1272,20 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         except Exception:
             return wave  # a failed trim must never fail the stream
 
-    def _stream_emit(self, state, final: bool):
-        """Emit any complete chunk (or, when final, everything left) to the .part file."""
+    def _stream_emit(self, state, final: bool, drain: bool = False):
+        """Emit any complete chunk (or, when final/drain, everything left) to .part.
+
+        drain: emit ALL pending frames but keep withholding the fade tail — used at a
+        segment boundary in multi-round TTS, so the next round's first piece cross-fades
+        against this segment's tail exactly like the offline path's segment joins."""
         n = len(state.accumulated_ids)
         while True:
             pending = n - state.streamed_frames
             if pending <= 0:
                 break
-            if not final and pending < TTS_STREAM_CHUNK:
+            if not (final or drain) and pending < TTS_STREAM_CHUNK:
                 break
-            emit_end = n if final and pending < TTS_STREAM_CHUNK else \
+            emit_end = n if (final or drain) and pending < TTS_STREAM_CHUNK else \
                 min(state.streamed_frames + TTS_STREAM_CHUNK, n)
             win_start = max(0, state.streamed_frames - TTS_STREAM_LEFT_CTX)
             win_end = min(emit_end + TTS_STREAM_LOOKAHEAD, n)
@@ -1294,10 +1345,10 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             state.stream_tail = None
         part = self._stream_part_path(state)
         wav_path = part[: -len(".pcm.part")] + ".wav"
-        if os.environ.get("LCN_TTS_DUMP_IDS", "0").strip() == "1" and state.accumulated_ids:
-            _ids = torch.stack(state.accumulated_ids, dim=0)
-            _off = self.audio_offset_vals.to(_ids.device)
-            torch.save((_ids - _off.unsqueeze(0)).cpu(), wav_path.replace(".wav", ".ids.pt"))
+        if os.environ.get("LCN_TTS_DUMP_IDS", "0").strip() == "1":
+            _raw = self._assemble_raw_segments(state)
+            if _raw is not None:
+                torch.save(_raw.cpu(), wav_path.replace(".wav", ".ids.pt"))
         import wave as _wave
         with open(part, "rb") as f:
             pcm = f.read()
@@ -1796,6 +1847,10 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                     _gen_zero_mask[i] = True
                     if len(a_state.accumulated_ids) > 0:
                         _aud_feedback[i] = a_state.accumulated_ids[-1]
+                    elif a_state.prev_segment_tail is not None:
+                        # Round N+1's first frame: condition on round N's last frame,
+                        # mirroring the reference where audio_ids grow globally.
+                        _aud_feedback[i] = a_state.prev_segment_tail
 
                 # Image gen: zero embedding at image_pad positions
                 v_state = self._image_gen_states.get(req_idx)
@@ -1976,6 +2031,18 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                                            f"emit={picked} ('{self._decode_token(picked)}')")
                             nl[:] = float('-inf')
                             nl[picked] = 0.0
+                elif forced_token == -3:
+                    # Between rounds (multi-round TTS): the model may open the next
+                    # round (audiogen_start) or wind down — but a sampled EOS would
+                    # finish the request before the wav is written, so EOS is masked
+                    # and the INTENT recorded; the between watcher closes the request
+                    # itself next step, after finalizing.
+                    req_idx = forward_batch.req_pool_indices[batch_idx].item()
+                    state = self._audio_gen_states.get(req_idx)
+                    nl = logits_output.next_token_logits[batch_idx]
+                    if state is not None and int(nl.argmax().item()) == 2:
+                        state.wants_eos = True
+                    nl[2] = float('-inf')
                 elif forced_token >= 0:
                     logits_output.next_token_logits[batch_idx, :] = float('-inf')
                     logits_output.next_token_logits[batch_idx, forced_token] = 0.0
@@ -2137,9 +2204,29 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
 
             # --- State transitions based on current input token ---
             if token == self._audiogen_start_id:
+                self._trigger_sticky = False  # latch consumed (see __init__)
+                if state is not None and state.mode == "between":
+                    # Round N+1: the model chose to keep going after audiogen_end.
+                    # REUSE the state — done_segments and the held stream tail are the
+                    # request's accumulated audio; a fresh state would orphan them.
+                    state.mode = "transcript"
+                    state.rounds += 1
+                    state.between_steps = 0
+                    state.transcript_done = False
+                    state.transcript_steps = 0
+                    state.transcript_tokens = []
+                    state.end_run = 0
+                    state.ended = False
+                    state.first_end_flag_step = -1
+                    state.end_flag_resamples = 0
+                    # Positive control: single-round and multi-round generations are
+                    # otherwise indistinguishable until the wav is played.
+                    logger.info(f"[AudioGen] req={req_idx}: ROUND {state.rounds} — model "
+                                f"opened another transcript after {len(state.done_segments)} "
+                                f"banked segment(s)")
+                    continue
                 # Enter audio mode — start transcript phase
                 # Let lm_head generate text normally (transcript of what to speak)
-                self._trigger_sticky = False  # latch consumed (see __init__)
                 state = AudioGenState(mode="transcript")
                 # Stamp the owning request AT CREATION. rid was previously only set at
                 # completion (for the output filename), so stale-state eviction had nothing
@@ -2151,20 +2238,60 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 # No override — let lm_head generate transcript text
                 continue
 
-            if token == self._audiotext_start_id and state is not None:
-                # audiotext_start received → now start actual audio codebook generation
+            if token == self._audiotext_start_id and state is not None \
+                    and state.mode == "transcript":
+                # audiotext_start received → now start actual audio codebook generation.
+                # Gated on transcript mode: in "between" (multi-round) a stray
+                # audiotext_start must not skip the next round's transcript phase.
                 state.mode = "generating"
                 logger.info(f"[AudioGen] req={req_idx}: transcript done, audio generation started")
 
             if token == self._audiogen_end_id and state is not None:
-                # Audio generation complete — decode and clean up
+                if state.mode == "between":
+                    # Our own forced audiogen_end echoing back as input. The model now
+                    # picks its next move — and this is exactly the step where it most
+                    # wants EOS, so the -3 sentinel must mask it HERE too, not just on
+                    # later between steps (see the between watcher below).
+                    state.between_steps += 1
+                    overrides[i] = -3
+                    continue
+                # Organic audiogen_end (model ended audio without our end-flag path) —
+                # decode everything and clean up.
                 logger.info(f"[AudioGen] req={req_idx}: audio generation ended, "
-                           f"{len(state.accumulated_ids)} frames accumulated")
-                wav_path = self._decode_audio_to_wav(state)
+                           f"{len(state.accumulated_ids)} frames accumulated, "
+                           f"{len(state.done_segments)} banked segment(s)")
+                wav_path = self._finalize_audio(state, req_idx)
                 if wav_path:
                     logger.info(f"[AudioGen] req={req_idx}: WAV saved to {wav_path}")
                 del self._audio_gen_states[req_idx]
                 continue  # back to text mode, no override needed
+
+            # --- Between rounds: audiogen_end is on the wire; the model decides ---
+            # what comes next. audiogen_start re-enters above; anything else counts
+            # against a small budget. EOS or budget exhaustion closes the request:
+            # decode ALL banked segments into one wav (the file must exist BEFORE the
+            # request completes — the gateway is polling for it).
+            if state is not None and state.mode == "between":
+                state.between_steps += 1
+                # A sampled EOS would finish the request BEFORE this state machine runs
+                # again — no wav would ever be written. So the -3 sentinel masks EOS at
+                # the logits and records the model's intent instead; closure is always
+                # ours, always after the wav exists.
+                if state.wants_eos or state.between_steps > TTS_BETWEEN_BUDGET:
+                    why = "model chose EOS" if state.wants_eos \
+                        else f"budget ({TTS_BETWEEN_BUDGET} tokens)"
+                    logger.info(f"[AudioGen] req={req_idx}: no further round ({why}) — "
+                                f"finalizing {len(state.done_segments)} segment(s), "
+                                f"{state.rounds} round(s)")
+                    state.rid = self._rid_for(req_idx, forward_batch) or state.rid
+                    wav_path = self._finalize_audio(state, req_idx)
+                    if wav_path:
+                        logger.info(f"[AudioGen] req={req_idx}: WAV saved to {wav_path}")
+                    del self._audio_gen_states[req_idx]
+                    overrides[i] = 2  # close the request; the wav is on disk
+                else:
+                    overrides[i] = -3  # sentinel: mask EOS, record intent, let it pick
+                continue
 
             # --- Transcript phase ---
             # The original model's backbone replaces audiotext_pad positions
@@ -2217,31 +2344,52 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                                            f"falling back to full decode at end", exc_info=True)
                             state.stream_failed = True
 
-                # Terminate on confirmed end, or on the safety backstop (NOT a task-length
-                # cutoff — just a runaway guard). On end: decode to WAV + EOS.
+                # Confirmed end of THIS SEGMENT, or the safety backstop (NOT a
+                # task-length cutoff — just a runaway guard).
                 if state.ended or state.step_count >= state.max_audio_steps:
-                    if state.step_count >= state.max_audio_steps:
+                    _capped = state.step_count >= state.max_audio_steps
+                    if _capped:
                         logger.warning(f"[AudioGen] req={req_idx}: hit safety cap ({state.max_audio_steps} frames)")
                     else:
                         logger.info(f"[AudioGen] req={req_idx}: confirmed end-of-audio, "
+                                    f"round {state.rounds}, "
                                     f"{len(state.accumulated_ids)} frames "
                                     f"(first end flag at frame {state.first_end_flag_step}, "
                                     f"{state.end_flag_resamples} isolated flags resampled)")
                     state.rid = self._rid_for(req_idx, forward_batch) or state.rid
-                    if _LCN_TTS_STREAM and state.rid and not state.stream_failed:
-                        try:
-                            wav_path = self._stream_finalize(state)
-                        except Exception:
-                            logger.warning(f"[AudioGen] req={req_idx}: stream finalize failed; "
-                                           f"full decode fallback", exc_info=True)
-                            wav_path = self._decode_audio_to_wav(state)
+                    if _LCN_TTS_MULTI and not _capped and state.rounds < TTS_MAX_ROUNDS:
+                        # Reference semantics (modeling_longcat_next.py ~753): force
+                        # audiogen_end and KEEP GENERATING — the model decides whether
+                        # the next sentence's round begins. Bank this segment; the
+                        # "between" watcher below handles what the model does next.
+                        if _LCN_TTS_STREAM and state.rid and not state.stream_failed:
+                            try:
+                                # Drain the segment's remaining frames to the stream but
+                                # HOLD the fade tail: if round N+1 comes, its first piece
+                                # cross-fades against it — the same seam treatment the
+                                # offline path gives segment joins.
+                                self._stream_emit(state, final=False, drain=True)
+                            except Exception:
+                                logger.warning(f"[AudioGen] req={req_idx}: stream drain failed; "
+                                               f"falling back to full decode at end", exc_info=True)
+                                state.stream_failed = True
+                        if state.accumulated_ids:
+                            state.done_segments.append(torch.stack(state.accumulated_ids, dim=0))
+                            state.prev_segment_tail = state.accumulated_ids[-1]
+                        state.accumulated_ids = []
+                        state.streamed_frames = 0
+                        state.ended = False
+                        state.end_run = 0
+                        state.mode = "between"
+                        state.between_steps = 0
+                        overrides[i] = self._audiogen_end_id
                     else:
-                        wav_path = self._decode_audio_to_wav(state)
-                    if wav_path:
-                        logger.info(f"[AudioGen] req={req_idx}: WAV saved to {wav_path}")
-                    if req_idx in self._audio_gen_states:
-                        del self._audio_gen_states[req_idx]
-                    overrides[i] = 2  # force EOS to terminate the request cleanly
+                        wav_path = self._finalize_audio(state, req_idx)
+                        if wav_path:
+                            logger.info(f"[AudioGen] req={req_idx}: WAV saved to {wav_path}")
+                        if req_idx in self._audio_gen_states:
+                            del self._audio_gen_states[req_idx]
+                        overrides[i] = 2  # force EOS to terminate the request cleanly
                 else:
                     # Continue generating — feed audio_pad_token_id to backbone
                     overrides[i] = self._audio_pad_id
