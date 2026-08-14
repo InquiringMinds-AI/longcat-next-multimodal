@@ -152,6 +152,10 @@ def main():
     spf = wave_full.shape[1] / n  # samples per frame, measured not assumed
     print(f"samples/frame: {spf:.1f} ({SR/spf:.1f} frames/s)", flush=True)
 
+    if __import__("os").environ.get("FULL_ONLY", "0") == "1":
+        return  # pair-member production for prosody-vs-mechanism listening; the
+                # prefix/window variants were already owner-cleared 2026-08-11
+
     # --- growing prefix ---
     pieces, emitted, times = [], 0, []
     while emitted < n:
