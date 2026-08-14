@@ -58,6 +58,11 @@ class AudioGenState:
     end_run: int = 0  # consecutive level-0 end-flags seen (for END_CONFIRM)
     ended: bool = False  # set when a confirmed end-of-audio cluster is reached
     rid: str = ""  # per-request id → unique output filename (concurrency-safe retrieval)
+    # --- streaming vocode (LCN_TTS_STREAM) ---
+    streamed_frames: int = 0  # frames whose PCM has been emitted to the .part file
+    stream_tail: Optional[torch.Tensor] = None  # withheld fade tail [1, FADE] awaiting the next piece
+    stream_chunks: int = 0  # emitted chunk count (positive control)
+    stream_failed: bool = False  # a chunk emit raised → fall back to the full decode at end
 
 
 # Audio generation sampling config (from generation_config.json). Operator-tunable via env
@@ -68,6 +73,20 @@ _LCN_VERBOSE = os.environ.get("LCN_VERBOSE", "0") == "1"  # gate per-step debug 
 # Cross-request head batching. LCN_HEAD_BATCH=0 forces the per-request path so the
 # optimisation can be A/B'd inside ONE build (see _image_gen_flush).
 _LCN_HEAD_BATCH = os.environ.get("LCN_HEAD_BATCH", "1").strip() != "0"
+# Streaming TTS: vocode sliding windows of the codebook stream DURING generation and
+# append PCM to <rid>.pcm.part, so a client can start hearing audio ~2s in instead of
+# after the full ~2.6s-per-second-of-audio generation. The final .wav is assembled from
+# the SAME streamed chunks, so streaming and non-streaming clients get identical bytes.
+# Windowed vocoding is a real math change vs one full-utterance decode (the flow-matching
+# decoder sees a window, not the utterance): it was gated on an exactly-paired listening
+# test — same generation's ids vocoded full vs prefix vs sliding-window — and the owner's
+# verdict was "to my ears, all of these are the same" (2026-08-11). Profile that sized the
+# knobs: 12.5 frames/s output, ~177 ms/frame generation (98% of latency), ~0.3 s vocode
+# per 2 s chunk (~7% amortized). LCN_TTS_STREAM=0 restores the single full decode.
+_LCN_TTS_STREAM = os.environ.get("LCN_TTS_STREAM", "1").strip() != "0"
+TTS_STREAM_CHUNK = int(os.environ.get("LCN_TTS_CHUNK_FRAMES", "25"))      # 2 s @ 12.5 fps
+TTS_STREAM_LOOKAHEAD = int(os.environ.get("LCN_TTS_LOOKAHEAD", "12"))     # ~1 s right context
+TTS_STREAM_LEFT_CTX = int(os.environ.get("LCN_TTS_LEFT_CTX", "50"))       # ~4 s left context
 # LCN_DIAG_HS=1: per-row hidden-state fingerprints at the batched head call, for
 # localizing cross-request content bleed. Debug only; costs a host sync per row.
 _LCN_DIAG_HS = os.environ.get("LCN_DIAG_HS", "0").strip() == "1"
@@ -1082,6 +1101,154 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             logger.error(f"Audio decode failed: {e}", exc_info=True)
             return None
 
+    # ------------------------------------------------------------------
+    # Streaming TTS (LCN_TTS_STREAM) — sliding-window vocode during generation
+    # ------------------------------------------------------------------
+
+    def _stream_part_path(self, state) -> str:
+        return f"{os.environ.get('LCN_OUTPUT_DIR', '/tmp')}/longcat_tts_{state.rid}.pcm.part"
+
+    @torch.no_grad()
+    def _vocode_frames(self, raw_ids: torch.Tensor) -> torch.Tensor:
+        """Vocode raw (offset-free, clamped) codebook ids -> wave [1, samples], cpu float.
+
+        The same chain decode_wave_vocoder2 runs, minus its batch handling: bridge decode
+        -> audio decoder -> flow matching -> cosy24k vocoder."""
+        tok = self.audio_tokenizer
+        if tok.cosy24kvocoder is None:
+            self._ensure_vocoder_path()
+            from sglang.srt.models.cosy24k_vocoder import Cosy24kVocoder
+            tok.cosy24kvocoder = Cosy24kVocoder.from_pretrained(
+                tok.config.audio_config.cosy24kvocoder_config.weight_path
+            ).to(next(tok.parameters()).device)
+        device = next(tok.parameters()).device
+        ids = raw_ids.to(device)
+        ret = tok.decode(ids, bridge_length=torch.tensor([ids.shape[0]], device=device))
+        mel = ret.flow_matching_mel[0][: ret.flow_matching_mel_lengths[0], :]
+        wave = tok.cosy24kvocoder.decode(
+            mel.transpose(0, 1).to(torch.float32).unsqueeze(0))
+        return wave.cpu()
+
+    def _stream_raw_window(self, state, start: int, end: int) -> torch.Tensor:
+        ids = torch.stack(state.accumulated_ids[start:end], dim=0)
+        offsets = self.audio_offset_vals.to(ids.device)
+        raw = ids - offsets.unsqueeze(0)
+        for lvl in range(raw.shape[1]):
+            raw[:, lvl] = raw[:, lvl].clamp(min=0, max=self._audio_codebook_sizes[lvl] - 1)
+        return raw
+
+    def _stream_append_pcm(self, state, piece: torch.Tensor, final: bool):
+        """Crossfade `piece` against the withheld tail and append int16 PCM to .part.
+
+        Already-emitted bytes cannot be revised, so seams are healed by WITHHOLDING the
+        last AUDIO_GEN_WAVE_OVERLAP samples of every piece: the next piece's head is
+        faded against the held tail before either is written. `final` flushes the tail."""
+        fade = AUDIO_GEN_WAVE_OVERLAP
+        out = []
+        if state.stream_tail is not None and piece.shape[1] >= fade:
+            ramp_d = torch.linspace(1.0, 0.0, fade)[None, :]
+            ramp_u = torch.linspace(0.0, 1.0, fade)[None, :]
+            out.append(state.stream_tail * ramp_d + piece[:, :fade] * ramp_u)
+            piece = piece[:, fade:]
+            state.stream_tail = None
+        elif state.stream_tail is not None:
+            out.append(state.stream_tail)  # piece too short to fade against
+            state.stream_tail = None
+        if state.stream_chunks == 0 and TTS_TRIM_LEAD_MS > 0 and piece.shape[1] > 0:
+            piece = self._trim_lead_tensor(piece)
+        if not final and piece.shape[1] > fade:
+            state.stream_tail = piece[:, -fade:].clone()
+            piece = piece[:, :-fade]
+        out.append(piece)
+        wave = torch.cat(out, dim=1) if len(out) > 1 else out[0]
+        pcm = (wave.squeeze(0).clamp(-1.0, 1.0) * 32767).to(torch.int16).numpy().tobytes()
+        with open(self._stream_part_path(state), "ab") as f:
+            f.write(pcm)
+        return len(pcm)
+
+    def _trim_lead_tensor(self, wave: torch.Tensor) -> torch.Tensor:
+        """First-chunk lead-silence trim, mirroring _trim_wav_lead's thresholds
+        (10 ms windows, onset = first window above 2% of peak RMS, keep
+        TTS_TRIM_LEAD_MS of lead). Streaming cannot trim after the fact, so the
+        trim runs on the first emitted piece with peak measured locally."""
+        try:
+            x = wave.squeeze(0).float()
+            sr = AUDIO_GEN_SAMPLING_RATE
+            win = max(1, int(sr * 0.010))
+            n_win = x.shape[0] // win
+            if n_win < 3:
+                return wave
+            rms = x[: n_win * win].view(n_win, win).pow(2).mean(dim=1).sqrt()
+            peak = rms.max()
+            if peak <= 0:
+                return wave
+            above = (rms > 0.02 * peak).nonzero()
+            if above.numel() == 0:
+                return wave
+            onset = int(above[0].item()) * win
+            keep_from = max(0, onset - int(sr * TTS_TRIM_LEAD_MS / 1000))
+            return wave[:, keep_from:]
+        except Exception:
+            return wave  # a failed trim must never fail the stream
+
+    def _stream_emit(self, state, final: bool):
+        """Emit any complete chunk (or, when final, everything left) to the .part file."""
+        n = len(state.accumulated_ids)
+        while True:
+            pending = n - state.streamed_frames
+            if pending <= 0:
+                break
+            if not final and pending < TTS_STREAM_CHUNK:
+                break
+            emit_end = n if final and pending < TTS_STREAM_CHUNK else \
+                min(state.streamed_frames + TTS_STREAM_CHUNK, n)
+            win_start = max(0, state.streamed_frames - TTS_STREAM_LEFT_CTX)
+            win_end = min(emit_end + TTS_STREAM_LOOKAHEAD, n)
+            t0 = time.time()
+            wave = self._vocode_frames(self._stream_raw_window(state, win_start, win_end))
+            spf = wave.shape[1] / (win_end - win_start)
+            s0 = int((state.streamed_frames - win_start) * spf)
+            s1 = wave.shape[1] if (final and emit_end == n and win_end == n) \
+                else min(int((emit_end - win_start) * spf), wave.shape[1])
+            nbytes = self._stream_append_pcm(state, wave[:, s0:s1],
+                                             final and emit_end == n)
+            state.streamed_frames = emit_end
+            state.stream_chunks += 1
+            # Positive control: a streamed and a non-streamed generation are otherwise
+            # indistinguishable in the logs, and an unreached emit path would read as
+            # "streaming didn't help" (the failure mode this campaign measured once).
+            if state.stream_chunks == 1 or state.stream_chunks % 10 == 0 or final:
+                logger.info(f"[AudioGen] STREAM chunk {state.stream_chunks}: frames "
+                            f"{win_start}-{win_end} emit {s0/spf + win_start:.0f}-{emit_end} "
+                            f"{nbytes}B vocode {time.time()-t0:.2f}s final={final}")
+
+    def _stream_finalize(self, state) -> Optional[str]:
+        """Emit the remainder, flush the tail, assemble the .wav from the streamed PCM."""
+        self._stream_emit(state, final=True)
+        if state.stream_tail is not None:  # tail of the very last piece
+            self._stream_append_pcm(state, state.stream_tail, final=True)
+            state.stream_tail = None
+        part = self._stream_part_path(state)
+        wav_path = part[: -len(".pcm.part")] + ".wav"
+        if os.environ.get("LCN_TTS_DUMP_IDS", "0").strip() == "1" and state.accumulated_ids:
+            _ids = torch.stack(state.accumulated_ids, dim=0)
+            _off = self.audio_offset_vals.to(_ids.device)
+            torch.save((_ids - _off.unsqueeze(0)).cpu(), wav_path.replace(".wav", ".ids.pt"))
+        import wave as _wave
+        with open(part, "rb") as f:
+            pcm = f.read()
+        with _wave.open(wav_path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(AUDIO_GEN_SAMPLING_RATE)
+            w.writeframes(pcm)
+        # The .wav now holds everything; the .part stays until the GATEWAY finishes
+        # tailing it (it deletes both through _discard_artifact). Removing it here
+        # would race a streaming client still draining the last bytes.
+        logger.info(f"[AudioGen] STREAM finalized: {state.stream_chunks} chunks, "
+                    f"{len(pcm)} PCM bytes -> {wav_path}")
+        return wav_path
+
     def _ensure_vocoder_path(self):
         """Ensure the vocoder weight path is valid, searching model directory."""
         if self.audio_tokenizer is None:
@@ -1503,6 +1670,13 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                             # (_free_uncond_kv self-guards: no-op without uncond state.)
                             if _kind == "image":
                                 self._free_uncond_kv(_st)
+                            # A streaming TTS that dies mid-generation leaves its partial
+                            # .pcm.part; only completion assembles + cleans it.
+                            if _kind == "audio" and _st.rid:
+                                try:
+                                    os.unlink(self._stream_part_path(_st))
+                                except OSError:
+                                    pass
                             _store.pop(_k, None)
                             self._gen_state_absent.pop(_key, None)
                             continue
@@ -1519,6 +1693,11 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                         _st = _store.get(_k)
                         if _kind == "image" and _st is not None:
                             self._free_uncond_kv(_st)  # see rid-eviction note above
+                        if _kind == "audio" and _st is not None and _st.rid:
+                            try:
+                                os.unlink(self._stream_part_path(_st))
+                            except OSError:
+                                pass
                         _store.pop(_k, None)
                         self._gen_state_absent.pop(_key, None)
 
@@ -1961,6 +2140,16 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 if audio_ids is not None:
                     state.accumulated_ids.append(audio_ids)
                     state.step_count += 1
+                    # Streaming vocode: emit a windowed chunk once enough new frames
+                    # exist. A failed emit falls back to the shipping full decode at
+                    # the end rather than losing the request's audio.
+                    if _LCN_TTS_STREAM and state.rid and not state.stream_failed:
+                        try:
+                            self._stream_emit(state, final=False)
+                        except Exception:
+                            logger.warning(f"[AudioGen] req={req_idx}: stream emit failed; "
+                                           f"falling back to full decode at end", exc_info=True)
+                            state.stream_failed = True
 
                 # Terminate on confirmed end, or on the safety backstop (NOT a task-length
                 # cutoff — just a runaway guard). On end: decode to WAV + EOS.
@@ -1970,8 +2159,16 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                     else:
                         logger.info(f"[AudioGen] req={req_idx}: confirmed end-of-audio, "
                                     f"{len(state.accumulated_ids)} frames")
-                    state.rid = self._rid_for(req_idx, forward_batch)
-                    wav_path = self._decode_audio_to_wav(state)
+                    state.rid = self._rid_for(req_idx, forward_batch) or state.rid
+                    if _LCN_TTS_STREAM and state.rid and not state.stream_failed:
+                        try:
+                            wav_path = self._stream_finalize(state)
+                        except Exception:
+                            logger.warning(f"[AudioGen] req={req_idx}: stream finalize failed; "
+                                           f"full decode fallback", exc_info=True)
+                            wav_path = self._decode_audio_to_wav(state)
+                    else:
+                        wav_path = self._decode_audio_to_wav(state)
                     if wav_path:
                         logger.info(f"[AudioGen] req={req_idx}: WAV saved to {wav_path}")
                     if req_idx in self._audio_gen_states:

@@ -285,6 +285,8 @@ async def status():
             "refiner_fast": os.environ.get("LCN_REFINER_FAST", "1") != "0",
             "refiner_steps": os.environ.get("REFINER_STEPS", "10"),
             "refiner_cfg_range": os.environ.get("LCN_REFINER_CFG_RANGE", "1.0,0.0"),
+            "tts_stream": os.environ.get("LCN_TTS_STREAM", "1") != "0",
+            "tts_chunk_frames": os.environ.get("LCN_TTS_CHUNK_FRAMES", "25"),
         },
     })
 
@@ -357,10 +359,14 @@ async def audio_speech(req: Request):
     voice = str(body.get("voice", "en"))
     ref = _resolve_voice(voice)
     prompt = _tts_prompt(text)
+    sg_body = {"text": prompt, "audio_data": [ref],
+               "sampling_params": {"max_new_tokens": 1200, "temperature": 0.5,
+                                   "top_k": 5, "top_p": 0.85}}
+    if body.get("stream"):
+        return await _audio_speech_stream(sg_body, body)
     try:
         async with _gen_slots:
-            r = await _client.post(SGLANG + "/generate", json={"text": prompt, "audio_data": [ref],
-                "sampling_params": {"max_new_tokens": 1200, "temperature": 0.5, "top_k": 5, "top_p": 0.85}})
+            r = await _client.post(SGLANG + "/generate", json=sg_body)
     except httpx.ConnectError:
         return JSONResponse({"error": {"message": "backend unavailable (model may still be loading)"}}, status_code=503)
     rj, raw = _json_or_text(r)
@@ -373,6 +379,94 @@ async def audio_speech(req: Request):
         return JSONResponse({"error": {"message": "audio generation produced no output"}}, status_code=500)
     _discard_artifact(path)
     return Response(content=data, media_type="audio/wav")
+
+
+def _wav_stream_header(sample_rate=24000, bits=16, channels=1):
+    """A WAV header with unknown length (0xFFFFFFFF chunk sizes) for chunked streaming.
+    Players and decoders accept it; the true length is whatever arrives before EOF."""
+    import struct
+    byte_rate = sample_rate * channels * bits // 8
+    block_align = channels * bits // 8
+    return (b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVE"
+            + b"fmt " + struct.pack("<IHHIIHH", 16, 1, channels, sample_rate,
+                                    byte_rate, block_align, bits)
+            + b"data" + struct.pack("<I", 0xFFFFFFFF))
+
+
+async def _audio_speech_stream(sg_body, body):
+    """Stream TTS as it is generated (requires LCN_TTS_STREAM=1 on the model side).
+
+    The model appends PCM to <rid>.pcm.part DURING generation; the gateway supplies the
+    rid (SGLang's /generate accepts a client rid), fires the backend call as a task, and
+    tails the file concurrently — first audio reaches the client ~2s in, instead of after
+    the full generation (~2.6s of compute per second of audio).
+
+    The finished .wav (assembled from the SAME streamed chunks) is the completion signal;
+    the model leaves the .part in place for the gateway to finish draining, and the
+    gateway deletes both. NOTE: generation runs ~2.2x slower than realtime on this box,
+    so a client that plays immediately will drain its buffer mid-clip — buffer ~half the
+    expected clip, or accept the pause. Time-to-first-audio is what this buys.
+    """
+    rid = uuid.uuid4().hex
+    sg_body = dict(sg_body)
+    sg_body["rid"] = rid
+    part = "%s/longcat_tts_%s.pcm.part" % (OUT, rid)
+    wav = "%s/longcat_tts_%s.wav" % (OUT, rid)
+    fmt = str(body.get("response_format", "wav")).lower()
+
+    async def gen():
+        async with _gen_slots:
+            task = asyncio.create_task(_client.post(SGLANG + "/generate", json=sg_body))
+            try:
+                if fmt != "pcm":
+                    yield _wav_stream_header()
+                pos = 0
+                while True:
+                    try:
+                        size = os.path.getsize(part)
+                    except OSError:
+                        size = 0
+                    if size > pos:
+                        with open(part, "rb") as f:
+                            f.seek(pos)
+                            chunk = f.read(size - pos)
+                        pos += len(chunk)
+                        yield chunk
+                        continue
+                    if task.done():
+                        # Generation over: drain whatever landed between the last read
+                        # and finalize, then stop. The .wav's existence marks finalize.
+                        if os.path.exists(wav):
+                            try:
+                                final_size = os.path.getsize(part)
+                            except OSError:
+                                final_size = pos
+                            if final_size > pos:
+                                continue
+                            break
+                        # task done but no wav: backend errored or streaming was off
+                        # server-side. The 200 is committed; end the stream. The
+                        # request's failure is visible in the task result / logs.
+                        err = None
+                        try:
+                            r = task.result()
+                            if r.status_code != 200:
+                                err = f"backend {r.status_code}"
+                        except Exception as e:  # noqa: BLE001
+                            err = str(e)[:120]
+                        logger.warning("[tts-stream] rid=%s ended without a finalized wav "
+                                       "(%s) — client received %d PCM bytes",
+                                       rid, err or "no error", pos)
+                        break
+                    await asyncio.sleep(0.1)
+            finally:
+                if not task.done():
+                    task.cancel()
+                _discard_artifact(part)
+                _discard_artifact(wav)
+
+    media = "audio/wav" if fmt != "pcm" else "application/octet-stream"
+    return StreamingResponse(gen(), media_type=media)
 
 
 async def _stream_chat(r):
