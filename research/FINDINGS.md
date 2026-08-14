@@ -2595,3 +2595,49 @@ that content acceptable, which is the part no metric could.
 Cumulative single-image trajectory this campaign: 246.5 s -> 196.5 s (attention fast path)
 -> ~160 s (guidance off) = **-35% total**, all with the refiner still conditioning on the
 decoded reference every step.
+
+---
+
+## Post-span adversarial review (2026-08-11)
+
+The owner asked for a review of everything landed since the MoE-tuning campaign
+(d489578..HEAD, 105 commits, ~3,570 insertions of code). Two passes: a deep manual read of
+the serving-path diffs, and an independent adversarial pass by a second model family
+(the owner's standing posture: a different model's eye on Claude-written code is the
+bias check). The second pass earned its seat — of its six findings, five were real and
+none had survived my own read.
+
+**Fixed (commit 5decacb):**
+
+1. **Stale-state ordering (the sharpest catch).** The orphaned-generation-state prune ran
+   AFTER the embedding-feedback pass and the decode state machines. One-step window: a text
+   request in a recycled pool slot could have its first decode token OVERRIDDEN by the dead
+   generation's state (forced image_pad / image_end) before eviction ran. The janitor now
+   sweeps at the top of the decode forward, before the machines eat. Same lesson as the CFG
+   bug in different clothes: the hazard sits in the ORDER of correct parts, not in any part.
+2. **Eviction leaked the CFG shadow allocation** (LCN_CFG=1 only): _free_uncond_kv was
+   called on normal completion only, so every aborted CFG image stranded its uncond request
+   slot + KV pages until restart. Both eviction paths free it now.
+3. **Anthropic transport-error streams claimed stop_reason "end_turn"** right after
+   emitting the error event — the exact contradiction the same file's abnormal-finish fix
+   exists to prevent. Null now.
+4. **Prewarm reported "ready" over a broken TTS path** (missing artifact treated as
+   success; audio failure still ended in status "ready"). Missing artifact raises; audio
+   error downgrades to "degraded".
+5. **Mixed valid/invalid audio clips answered from partial media.** Only the all-clips-bad
+   case 400'd. extract_audio_chat now returns a drop count (pure, env-free); the gateway
+   400s on nonzero unless LCN_LENIENT_MEDIA=1 — the same fail-loud policy the processor
+   already enforces, now applied consistently.
+6. **/status lied about CUDA graphs**: entrypoint defaulted them ON without exporting the
+   var, gateway read the raw env and reported "0". The entrypoint now exports the effective
+   value.
+
+**Flagged, not decided (owner's call):** the CUDA-graph DEFAULT itself is inconsistent
+across surfaces — entrypoint ships graphs ON (on the +13.6%-aggregate measurement), the
+Spark launcher passes `-e LCN_CUDAGRAPH=${LCN_CUDAGRAPH:-0}` and silently overrides to
+eager, and ROADMAP §3 still records ship-defaults as an open decision.
+
+**What survived scrutiny** (both passes, explicitly): the refiner SDPA fast path (skipped
+unpad work is consumed only by the flash branch, mutually exclusive by construction), both
+scheduler patches, the branchless embed (codebook_base equals the word-table size, so the
+torch.where masks partition exactly), and the head-batching flush guards.
