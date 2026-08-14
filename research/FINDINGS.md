@@ -2786,3 +2786,55 @@ honesty note: the five-clip live batch happened to produce no monster tail (the 
 correctly cut nothing and logged nothing), so the CUTTING path was verified separately
 against the recorded 2.88 s monster itself: 4.46 s -> 1.83 s, residual tail exactly the
 0.25 s keep. Production serve restored (tailtrim build, prewarm on).
+
+---
+
+## Multi-sentence TTS: four builds from reproduction to fix (2026-08-14)
+
+Owner heard the model speak only sentence 1 of a 4-sentence input; "try to reproduce."
+
+**Reproduction: deterministic, 6/6.** Transcript-step telemetry pinned it to the token:
+the transcript stops at exactly sentence 1's length on every multi-sentence input
+(7/7, 6/6, 9/9 across paired repeats). Not stochastic laziness — structure.
+
+**Root cause: ours.** The reference implementation (modeling_longcat_next.py ~753,
+shipped in the model dir) forces audiogen_end at the audio head's end flag and KEEPS
+GENERATING — the model then opens the next sentence's round with another audiogen_start.
+Our serving loop forced EOS at the first confirmed end, decapitating rounds 2+. The
+multi-segment machinery in lazy_decode_and_save (split at end-flag rows, cross-fade,
+concat) existed all along and had never been fed a second segment.
+
+**The fix took four builds, each failure measured before the next attempt:**
+
+1. *Bank-and-continue* (reference semantics; EOS masked between rounds via a -3 logits
+   sentinel — a sampled EOS finishes the request before any wav exists, since finished
+   requests take no further decode steps). RESULT: runaway — the model NEVER chose to
+   stop; 22+ rounds until the frame cap or client timeout.
+2. *Transcript repeat-detection stop* (+ per-round transcript logging). RESULT: the
+   logging overturned the loop theory — rounds 1-4 recited the input CORRECTLY, then
+   the model kept WRITING THE STORY ('the device hummed softly, its needle
+   trembling...'), nothing repeating, detector correctly silent against a failure that
+   wasn't there.
+3. *Input-coverage stop* (request text captured at the prefill that opens audio mode;
+   a transcript not found in it = authorship). RESULT: revealed the reopen spin — the
+   close path forced audiogen_end + wants_eos, the model answered audiogen_start, and
+   the reuse branch (checking only mode=='between') reset straight back to transcript:
+   150+ reopen/close cycles at ~10/s, transcripts degenerating to bare periods, token
+   budget expiring before ANY wav (warmup included). Also exposed: fragment re-reads
+   passing both stops (6 segments banked for 4 sentences).
+4. *Reopen guard + POSITIONED coverage* (recitation is sequential: each round must
+   continue from ~where the last ended, 20-char slack; re-reads, inventions and
+   punctuation-only rounds all close) + TTS max_new_tokens 1200→2048 (a length-expired
+   request ends without a finalize step → no wav). RESULT: GREEN — warmup 1 round,
+   2/3/4-sentence inputs produce exactly 2/3/4 rounds reciting each sentence in order,
+   and in all four cases the model then CHOSE EOS naturally (the wants_eos intent path
+   doing the primary stopping; the content stops remain as the net for authoring runs).
+
+**Owner design call, mid-arc:** "the audio generation will definitely be used for more
+than tts." The content stops assumed recitation; for voice chat, authoring IS the point.
+Scoped: prompts carrying the model card's TTS instruction get recitation semantics
+(content stops); anything else is open-ended speech bounded like text generation —
+caller's max_new_tokens, frame cap, and the model's own EOS intent.
+
+Clip durations landed on prediction: 4.75 / 6.72 / 9.23 s for 2/3/4 sentences (vs 2.0 /
+1.6 / 4.4 s truncated before the fix). Owner listen on the segment joins pending.
