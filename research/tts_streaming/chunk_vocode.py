@@ -73,22 +73,16 @@ def build_tokenizer():
         print("  missing (first 8):", missing[:8], flush=True)
 
     # Resolve the vocoder weight path the way the server does
+    # EXACTLY the server's candidate list (_ensure_vocoder_path) — an earlier version
+    # invented its own fallback glob, which matched cosy24k_vocoder.py and loaded a
+    # Python source file as weights. Mirror the shipping resolution, never improvise it.
     voc_cfg = tok.config.audio_config.cosy24kvocoder_config
     import os
     if not os.path.exists(getattr(voc_cfg, "weight_path", "") or ""):
-        for cand in (f"{MODEL_DIR}/cosy24kvocoder/cosy24kvocoder.safetensors",
-                     f"{MODEL_DIR}/cosy24kvocoder.safetensors",
-                     f"{MODEL_DIR}/cosy24kvocoder/hift.safetensors"):
+        for cand in (f"{MODEL_DIR}/cosy24k_vocoder/hift.pt", f"{MODEL_DIR}/hift.pt"):
             if os.path.exists(cand):
                 voc_cfg.weight_path = cand
                 break
-        else:
-            import glob
-            hits = glob.glob(f"{MODEL_DIR}/**/*vocoder*", recursive=True) + \
-                   glob.glob(f"{MODEL_DIR}/**/*hift*", recursive=True)
-            if hits:
-                voc_cfg.weight_path = hits[0]
-            print("vocoder path candidates:", hits[:5], flush=True)
     print("vocoder weight_path:", voc_cfg.weight_path, flush=True)
 
     tok = tok.to("cuda").eval()
@@ -100,8 +94,16 @@ def vocode(tok, ids):
     """ids [n_frames, codebooks] -> wave tensor [1, samples] (the full shipping math)."""
     if tok.cosy24kvocoder is None:
         from sglang.srt.models.cosy24k_vocoder import Cosy24kVocoder
-        tok.cosy24kvocoder = Cosy24kVocoder.from_pretrained(
-            tok.config.audio_config.cosy24kvocoder_config.weight_path).to("cuda")
+        # hift.pt is a legacy pickle from the checkpoint the server already runs;
+        # torch>=2.6 defaults weights_only=True and refuses it here (the serving
+        # process loads it through its own path). Same trust boundary either way.
+        _orig_load = torch.load
+        torch.load = lambda *a, **k: _orig_load(*a, **{**k, "weights_only": False})
+        try:
+            tok.cosy24kvocoder = Cosy24kVocoder.from_pretrained(
+                tok.config.audio_config.cosy24kvocoder_config.weight_path).to("cuda")
+        finally:
+            torch.load = _orig_load
     ids = ids.to("cuda")
     ret = tok.decode(ids, bridge_length=torch.tensor([ids.shape[0]], device="cuda"))
     mel = ret.flow_matching_mel[0][: ret.flow_matching_mel_lengths[0], :]
