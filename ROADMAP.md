@@ -792,7 +792,7 @@ optimizations that trade modalities for speed:
       checkpoint and the `scale_fmt is not ue8m0` warning is noise. Nothing to tune.
 - [ ] **Prefill tuning**: cold prefill measured ~2.6k tok/s; try larger
       `chunked_prefill_size` / `max_prefill_tokens` on the 128 GB box.
-- [ ] **fp8 KV re-bench** post-#4 (owner-validated for quality; −41% decode pre-tuning —
+- [x] **fp8 KV re-bench DONE 2026-08-14 — DEAD, −43% (22.48→12.74 tok/s), penalty fully intact post-tuning; see FINDINGS.** (was: owner-validated for quality; −41% decode pre-tuning —
       the gap may narrow once MoE kernels stop dominating)
 
 ## 6. Operational polish

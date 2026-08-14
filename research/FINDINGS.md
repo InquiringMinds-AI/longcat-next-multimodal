@@ -3016,9 +3016,19 @@ generator disconnect; (5) run.sh env forwarding word-split values with spaces
 Codex also CLEARED three hunted classes: no static-output aliasing at the head
 call sites, no graph-dict growth beyond the bounded key space, no M/K-tail or
 batch-stride defect in the shipped kernel dimensions.
-Perf candidates surfaced by the same review, not yet run: fp8 KV re-bench (−41 %
-decode PRE-tuning, quality owner-validated, never re-measured), prefill chunk
+Perf candidates surfaced by the same review: fp8 KV re-bench, prefill chunk
 tuning (~2.6k tok/s cold), and the known backbone graph-veto surgery.
+
+**fp8 KV: DEAD, definitively (2026-08-14 re-bench).** bench_decode, matched arms
+on v0516-rev2, warm, 3 runs/prompt: bf16 KV **22.48** tok/s median-of-medians vs
+fp8_e4m3 **12.74** — **−43 %**, the same penalty as the pre-tuning −41 %. The MoE
+tuning and CUDA graphs changed nothing about it: the MLA/flashinfer path on
+sm_121 evidently lacks a fast fp8-KV kernel and pays a per-step conversion.
+Capacity was fp8's only virtue and MLA already makes KV cheap (31.5 KB/token).
+Do not re-try on this stack; a future SGLang/flashinfer version bump is the only
+thing that could reopen it. (Cross-harness caveat: 22.48 here vs "40.29 warm
+median" elsewhere in this file are DIFFERENT harnesses — chat-template overhead
+and prompt shapes differ; only within-harness A/Bs are comparable.)
 
 Residuals, recorded not actioned: (a) the original awkward clip's ~0 ms slammed
 join was not reproduced; if slams recur, the shelf fix is a MINIMUM-pause floor
