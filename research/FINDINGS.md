@@ -2856,6 +2856,25 @@ pacing in ship matches the prosody."** The model's pause lengths are part of its
 prosodic delivery; normalizing them away made it worse. No change shipped —
 ship IS current behavior.
 
+**First-transcript-token bug (2026-08-14, found BY the production prewarm): every
+transcript ran minus its first word.** The first relaunch with LCN_PREWARM=1 came up
+`degraded`: the audio prewarm ("Ready.") produced NO wav. Server logs: round 1
+transcript accumulated as bare `'.'` → degenerate-round close → 0 segments. Root
+cause: every round's first transcript token is sampled on the OPEN step (prefill for
+round 1 — logged but never appended; the audiogen_start step for rounds 2+ — no
+override at all) and arrives at the transcript branch as the *input* token, which
+that branch never read. Every multi-word battery had passed because the fuzzy
+content stops tolerate a missing first word — the classic silent-instrument shape:
+the defect sat in 100% of requests and only a one-word input could surface it.
+Fix (55c52ad, build v0516-multitts5): the transcript branch appends the incoming
+token on a round's first step (control tokens excluded — a first-sample pad/end is
+a genuinely empty transcript); both decode-time opens now set the -3 sentinel so
+EOS is masked while the first token samples, matching the prefill open. Validated:
+"Ready." / "Stop." now render (transcripts complete), 2/3/4-sentence inputs give
+exactly 2/3/4 rounds with full sentences in every round log, selftest 7/7,
+degeneracy 6/6. Observed and flagged to owner, not self-judged: the one-word clips
+render QUIET (peak 0.06/0.14 vs ~0.4 typical).
+
 Residuals, recorded not actioned: (a) the original awkward clip's ~0 ms slammed
 join was not reproduced; if slams recur, the shelf fix is a MINIMUM-pause floor
 (insert silence only under ~200 ms, leaving the model's longer choices alone) —
