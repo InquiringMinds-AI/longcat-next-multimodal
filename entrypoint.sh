@@ -38,13 +38,17 @@ fi
 # limiter is --mem-fraction-static (weights ~88 GB + KV pool); we raise it just enough.
 OVERRIDE='{"architectures":["LongcatNextForCausalLM"]}'
 DEFAULT_TOKENS=131072
-# MEASURED BUDGET (128GB GB10): image/audio GENERATION heads lazily allocate ~25GB on
-# first use, OUTSIDE --mem-fraction-static. All-modality serving therefore keeps the
-# static fraction at 0.72 (~55k-token KV pool, ~5GB headroom after generation warmup).
-# LCN_AGENT=1 (agentic/understanding profile): generation endpoints are disabled at the
-# gateway, freeing that ~25GB to fund the FULL native context — 0.75 = 131072 tokens
-# (~3.9GB KV). Raising the fraction in an all-modality deployment ends near 1GB free
-# after the first image generation — global-OOM territory on unified memory.
+# MEASURED BUDGET (128GB GB10, re-measured 2026-08-11 from live logs): weights land at
+# 76.26GB (not the ~88GB an earlier version of this comment claimed), so at 0.72 the KV
+# pool hits its --max-total-tokens CAP, not the fraction: the FULL 131072-token pool
+# (3.94GB, exactly one native context at ~31.5KB/token MLA-compressed KV) allocates in
+# every profile. The binding constraint is physical headroom, not the fraction: the
+# image/audio GENERATION heads lazily allocate ~25GB on first use OUTSIDE
+# --mem-fraction-static, and with both heads warm the box settles at ~3-4GB MemAvailable
+# — one context is all that fits, by ~0.6GB. LCN_AGENT=1 disables generation at the
+# gateway so the heads never allocate; that ~25GB could fund ~6 MORE full contexts
+# (MAX_TOTAL_TOKENS≈917504) for multi-session/radix-depth workloads — capacity measured
+# but NOT yet defaulted; raise MAX_TOTAL_TOKENS explicitly if you want it.
 DEFAULT_MEMFRAC=0.72
 [ "${LCN_AGENT:-0}" = "1" ] && DEFAULT_MEMFRAC=0.75
 if [ "${LCN_YARN:-0}" = "1" ]; then
