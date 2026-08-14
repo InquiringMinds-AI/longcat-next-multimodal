@@ -69,6 +69,11 @@ class AudioGenState:
     rounds: int = 1  # round counter (positive control + runaway bound)
     between_steps: int = 0  # decode steps spent in "between" mode awaiting the next round
     wants_eos: bool = False  # between-mode: the model's masked pick was EOS — close next step
+    prompt_norm: str = ""  # normalized request text, captured at the prefill that opened
+    # audio mode. The coverage stop: a round transcript NOT found in it is the model
+    # AUTHORING A CONTINUATION (measured: after reciting all 4 input sentences it wrote
+    # 'the device hummed softly, its needle trembling…' — new fiction, round after round,
+    # nothing repeating), and closes the request before that round's audio.
     past_transcripts: list = field(default_factory=list)  # per-round transcript token tuples:
     # the loop detector — the model never CHOOSES to stop opening rounds (measured: 22+
     # rounds, same ~30-frame segment, until the frame cap), so a round whose transcript
@@ -682,6 +687,24 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             return self._tokenizer.decode([token_id])
         except Exception:
             return f"<{token_id}>"
+
+    def _decode_ids(self, ids) -> str:
+        """Decode a token-id list to text (transcript coverage checks / logging)."""
+        try:
+            self._decode_token(0)  # ensure tokenizer loaded via the same lazy path
+            return self._tokenizer.decode(list(ids))
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _norm_tts_text(s: str) -> str:
+        """Normalize text for transcript-vs-input matching: the model's recitation
+        drifts on case, curly quotes and punctuation, never on the words."""
+        s = s.lower()
+        for a, b in (("’", "'"), ("‘", "'"), ("“", '"'), ("”", '"')):
+            s = s.replace(a, b)
+        s = "".join(c if (c.isalnum() or c == " ") else " " for c in s)
+        return " ".join(s.split())
 
     def _make_full_config(self, config):
         """Create a config object compatible with the multimodal tokenizers.
@@ -2028,6 +2051,7 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                             # at the repeat.
                             _cur = list(state.transcript_tokens)
                             _looped = False
+                            _reason2 = ""
                             if _LCN_TTS_MULTI and _cur and state.past_transcripts:
                                 import difflib
                                 for _past in state.past_transcripts:
@@ -2035,13 +2059,30 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                                         None, _cur, list(_past)).ratio()
                                     if r >= 0.8:
                                         _looped = True
+                                        _reason2 = "repeats an earlier round"
                                         break
                             _txt = "".join(self._decode_token(t) for t in _cur)[:120]
+                            # Coverage stop: a transcript not found in the REQUEST TEXT
+                            # is the model authoring a continuation, not reciting — the
+                            # failure the repeat detector cannot see (nothing repeats;
+                            # measured: 20+ rounds of freshly invented story). Fuzzy
+                            # (containment, else longest-common-substring ratio) because
+                            # recitation drifts on punctuation, never on words.
+                            if _LCN_TTS_MULTI and not _looped and _cur and state.prompt_norm:
+                                _tn = self._norm_tts_text("".join(
+                                    self._decode_token(t) for t in _cur))
+                                if _tn and _tn not in state.prompt_norm:
+                                    import difflib
+                                    m = difflib.SequenceMatcher(
+                                        None, _tn, state.prompt_norm).find_longest_match(
+                                        0, len(_tn), 0, len(state.prompt_norm))
+                                    if m.size / max(len(_tn), 1) < 0.7:
+                                        _looped = True
+                                        _reason2 = "is not in the request text (model is authoring a continuation)"
                             if _looped:
                                 logger.info(f"[AudioGen] req={req_idx}: round "
-                                            f"{state.rounds} transcript repeats an "
-                                            f"earlier round ('{_txt}') — model is "
-                                            f"looping; closing after "
+                                            f"{state.rounds} transcript {_reason2} "
+                                            f"('{_txt}') — closing after "
                                             f"{len(state.done_segments)} segment(s)")
                                 nl[:] = float('-inf')
                                 nl[self._audiogen_end_id] = 0.0
@@ -2466,6 +2507,14 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                     req_idx = forward_batch.req_pool_indices[i].item()
                     state = AudioGenState(mode="transcript")
                     state.rid = self._rid_for(req_idx, forward_batch)  # stamp owner at creation
+                    # Capture the request text (this row's prompt tokens) for the
+                    # transcript coverage stop — TTS prompts are single-chunk, so the
+                    # extend region IS the whole prompt.
+                    try:
+                        state.prompt_norm = self._norm_tts_text(
+                            self._decode_ids(input_ids[offset:last_token_pos + 1].tolist()))
+                    except Exception:
+                        state.prompt_norm = ""  # coverage stop disabled; budget/frames still bound
                     self._audio_gen_states[req_idx] = state
                     # Let lm_head's transcript token pass through — the scheduler
                     # writes it to the N-gram token table for correct hash context.
