@@ -912,16 +912,21 @@ Baseline for the A/B, same box, same build (`v0516-syncfix`):
       over chunks, so the "already batch-shaped" read was wrong twice over.)
       The `all()` mask guard from the fast path stays regardless — it is cheap and correct.
 
-- [ ] **NEW, needs owner eyes: ~2/3 of refiner compute is classifier-free guidance.**
-      `lazy_decode_and_save` passes no guidance scales, so `text_guidance_scale=1.5` /
-      `image_guidance_scale=1.5` apply with `cfg_range=(0.0, 1.0)` covering every step — each CFG
-      step runs THREE transformer forwards (text, ref, uncond), 30 per image at 10 steps. That
-      compute cannot be batched away, but it can be **not spent**: `LCN_REFINER_CFG_RANGE`
-      (default `0.0,1.0` = today's output exactly) narrows guidance to early steps, where it
-      shapes composition. `0.0,0.5` → 20 forwards (~19 s of a ~196 s image); off → 10.
-      The non-CFG branch still gets `ref_image_hidden_states`, so the decoded reference conditions
-      every step either way — this drops the guidance term, not the refinement.
-      CHANGES THE OUTPUT IMAGE → human gate, not a green test. A/B in flight.
+- [x] **SHIPPED 2026-08-11: refiner guidance OFF by default — −16.9% on every image.**
+      ~2/3 of refiner compute was classifier-free guidance: `lazy_decode_and_save` passed no
+      guidance scales, so `text_gs=1.5` / `image_gs=1.5` applied with `cfg_range=(0.0,1.0)`
+      covering every step — THREE transformer forwards per step (text, ref, uncond), 30 per
+      image. That compute cannot be batched away (compute-bound), but it can be **not spent**.
+      Three-arm A/B, same build, prewarm-warmed, forward counts logged per denoise (30/20/10 —
+      the premise verified itself): A 575.6 s → B 526.4 s (−8.5%) → C 478.1 s (−16.9%) over
+      three prompts incl. a close-up portrait. The FLOP model predicted each arm within ~1 s
+      (B: −17.3 predicted / −16.4 measured; C: −34 / −32.8). Owner reviewed all nine images:
+      B "very similar images", C "c is fine" → **C is the default** (`LCN_REFINER_CFG_RANGE`
+      default `1.0,0.0`, empty interval). The non-CFG branch still receives
+      `ref_image_hidden_states`, so the decoded reference conditions every step — this dropped
+      the guidance term, not the refinement. Restore original: `LCN_REFINER_CFG_RANGE=0.0,1.0`.
+      Caveat recorded: arms were not pixel-paired (generation is stochastic), so the review
+      answered "up to standard", not "better on this scene".
 
 - [ ] **int8 the generation heads — HIGHEST VALUE, and the only item that touches single-image
       latency.** They are 71/71 BF16 (audio 2.86GB, visual 1.76GB) while the backbone is int8;

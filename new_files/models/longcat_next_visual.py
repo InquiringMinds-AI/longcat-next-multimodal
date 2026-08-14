@@ -687,9 +687,13 @@ class LongcatNextVisualTokenizer(nn.Module):
             # leaves later steps as bare denoises. The non-CFG branch still receives
             # ref_image_hidden_states, so the reference image conditions EVERY step either
             # way; only the guidance term is dropped.
-            # DEFAULT "0.0,1.0" reproduces the shipped behavior exactly. Changing it changes
-            # the output image, so it is gated on human review, not on a green test.
-            _cfg_rng = os.environ.get('LCN_REFINER_CFG_RANGE', '0.0,1.0').split(',')
+            # DEFAULT "1.0,0.0" is an empty interval: guidance never fires, every step is a
+            # bare denoise (10 forwards instead of 30, -16.9% wall on a single image). This
+            # was NOT shipped on a green test -- it changes the output image, so it went
+            # through a three-arm human review (guidance all steps / first half / off) and
+            # the owner approved guidance-off on sight ("c is fine", 2026-08-11). Restore
+            # the original refiner behavior with LCN_REFINER_CFG_RANGE=0.0,1.0.
+            _cfg_rng = os.environ.get('LCN_REFINER_CFG_RANGE', '1.0,0.0').split(',')
             cfg_range = (float(_cfg_rng[0]), float(_cfg_rng[1]))
             out = self._refiner_pipeline(
                 encoder_hidden_states=quant_features,

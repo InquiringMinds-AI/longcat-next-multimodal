@@ -2567,3 +2567,31 @@ would need the VQ codes captured and re-refined.
 Objective, non-judgmental signal: B's PNGs are consistently larger (+3% barn, +7% fisherman,
 +45% street) at identical 1040x1040. File size tracks high-frequency content, so it describes the
 character of the difference, not its quality.
+
+### Arm C measured; guidance-off is the shipped default (2026-08-11)
+
+| prompt | A: 30 forwards | B: 20 | C: 10 |
+|---|---|---|---|
+| barn | 193.5 s | 176.7 s | 160.7 s |
+| fisherman | 191.5 s | 175.1 s | 159.4 s |
+| street | 190.6 s | 174.6 s | 158.0 s |
+| **total** | **575.6 s** | **526.4 s (-8.5%)** | **478.1 s (-16.9%)** |
+
+C's forward-count log read `0 CFG steps + 10 plain` — the empty interval (`1.0,0.0`) disabled
+guidance rather than silently doing something else. The FLOP model predicted C at ~-34 s/image;
+measured -32.8 s. Three predictions, three hits within ~1 s: the refiner's cost is analytically
+understood, which is what justified cancelling the batching item on arithmetic alone.
+
+Corroborating signal on the cold path too: prewarm image time fell 348.9 s (A) -> 333.6 s (B) ->
+278.8 s (C), in the right order and roughly the right magnitudes.
+
+**Owner reviewed all nine images and approved C: "c is fine."** Guidance off is now the DEFAULT
+(`LCN_REFINER_CFG_RANGE` default `1.0,0.0` across code, launcher, and /status; original behavior
+restorable with `0.0,1.0`). Objective note kept for the record: PNG size climbs monotonically
+A->B->C at identical 1040x1040 (e.g. street 751 -> 1090 -> 1355 KB) — guidance smooths toward the
+conditioned mode, so less guidance leaves more high-frequency content; the owner's eyes judged
+that content acceptable, which is the part no metric could.
+
+Cumulative single-image trajectory this campaign: 246.5 s -> 196.5 s (attention fast path)
+-> ~160 s (guidance off) = **-35% total**, all with the refiner still conditioning on the
+decoded reference every step.

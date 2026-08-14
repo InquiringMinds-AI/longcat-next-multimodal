@@ -275,7 +275,7 @@ async def status():
             "head_batch": os.environ.get("LCN_HEAD_BATCH", "1") != "0",
             "refiner_fast": os.environ.get("LCN_REFINER_FAST", "1") != "0",
             "refiner_steps": os.environ.get("REFINER_STEPS", "10"),
-            "refiner_cfg_range": os.environ.get("LCN_REFINER_CFG_RANGE", "0.0,1.0"),
+            "refiner_cfg_range": os.environ.get("LCN_REFINER_CFG_RANGE", "1.0,0.0"),
         },
     })
 
