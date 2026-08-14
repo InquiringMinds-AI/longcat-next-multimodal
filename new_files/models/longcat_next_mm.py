@@ -2585,7 +2585,16 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                         # gateway, prewarm, and the documented raw-/generate shape)
                         # marks a recitation contract. Voice chat and other open-ended
                         # audio generation lack it and get NO content stops.
-                        state.recitation = "用这个声音合成以下内容" in _raw_prompt
+                        # Recitation is marked TWO ways, either suffices: the gateway
+                        # stamps its TTS requests with an lcntts-prefixed rid (survives
+                        # chunked prefill), and the prompt itself may carry the TTS
+                        # instruction — but THAT check reads only this extend region,
+                        # so a >chunk-size prompt via raw /generate can escape it (the
+                        # instruction lands in an earlier chunk). Known residual for
+                        # raw callers; the gateway path is covered by the rid.
+                        state.recitation = (
+                            (state.rid or "").startswith("lcntts")
+                            or "用这个声音合成以下内容" in _raw_prompt)
                     except Exception:
                         state.prompt_norm = ""  # coverage stop disabled; budget/frames still bound
                     self._audio_gen_states[req_idx] = state

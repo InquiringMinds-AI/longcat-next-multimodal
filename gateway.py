@@ -234,6 +234,7 @@ async def _prewarm_task():
         if await _read_when_ready(path) is None:
             raise RuntimeError("audio generation produced no output")
         _discard_artifact(path)
+        _discard_artifact(path[:-len(".wav")] + ".pcm.part")  # streamed-PCM sibling
         _prewarm_state["audio_s"] = round(_t.monotonic() - t0, 1)
         logger.info("[prewarm] audio path warm in %.1fs", _prewarm_state["audio_s"])
     except Exception as e:                     # noqa: BLE001
@@ -362,7 +363,12 @@ async def audio_speech(req: Request):
     voice = str(body.get("voice", "en"))
     ref = _resolve_voice(voice)
     prompt = _tts_prompt(text)
+    # The lcntts rid prefix marks a RECITATION request to the model's content
+    # stops. The model also detects the TTS instruction in the prompt, but that
+    # check reads only the final chunked-prefill extend — a >8192-token input
+    # would escape it; the rid survives chunking.
     sg_body = {"text": prompt, "audio_data": [ref],
+               "rid": "lcntts" + uuid.uuid4().hex,
                "sampling_params": {"max_new_tokens": 2048, "temperature": 0.5,
                                    "top_k": 5, "top_p": 0.85}}
     if body.get("stream"):
@@ -381,6 +387,10 @@ async def audio_speech(req: Request):
     if data is None:
         return JSONResponse({"error": {"message": "audio generation produced no output"}}, status_code=500)
     _discard_artifact(path)
+    # The streaming vocoder (LCN_TTS_STREAM=1, default) also writes <rid>.pcm.part
+    # and the model leaves it for the gateway to clean up — without this, every
+    # non-streaming TTS request leaked one PCM file into the output dir.
+    _discard_artifact(path[:-len(".wav")] + ".pcm.part")
     return Response(content=data, media_type="audio/wav")
 
 
@@ -410,63 +420,116 @@ async def _audio_speech_stream(sg_body, body):
     so a client that plays immediately will drain its buffer mid-clip — buffer ~half the
     expected clip, or accept the pause. Time-to-first-audio is what this buys.
     """
-    rid = uuid.uuid4().hex
+    rid = "lcntts" + uuid.uuid4().hex  # lcntts prefix = recitation marker (see audio_speech)
     sg_body = dict(sg_body)
     sg_body["rid"] = rid
     part = "%s/longcat_tts_%s.pcm.part" % (OUT, rid)
     wav = "%s/longcat_tts_%s.wav" % (OUT, rid)
     fmt = str(body.get("response_format", "wav")).lower()
 
+    # Fire the backend BEFORE committing the response: a dead backend errors within
+    # milliseconds, and catching that here turns "HTTP 200 with an empty WAV" into an
+    # honest 502. The slot is acquired manually so it survives into the generator.
+    await _gen_slots.acquire()
+    task = asyncio.create_task(_client.post(SGLANG + "/generate", json=sg_body))
+    done, _pending = await asyncio.wait({task}, timeout=0.4)
+    if done:
+        err = None
+        try:
+            r = task.result()
+            if r.status_code != 200:
+                err = "backend %d: %s" % (r.status_code, r.text[:200])
+        except Exception as e:  # noqa: BLE001
+            err = str(e)[:200]
+        if err:
+            _gen_slots.release()
+            _discard_artifact(part)
+            return JSONResponse({"error": {"message": err}}, status_code=502)
+
+    # Slot/artifact ownership: normally gen()'s finally releases. But a client
+    # that disconnects before the response body is ever consumed leaves gen()
+    # UNSTARTED — its finally never runs. The done-callback covers that orphan
+    # case at generation end; the once-guard prevents a double release.
+    _state = {"owned": False, "released": False}
+
+    def _release_once():
+        if not _state["released"]:
+            _state["released"] = True
+            _gen_slots.release()
+            _discard_artifact(part)
+            _discard_artifact(wav)
+
+    task.add_done_callback(lambda _t: None if _state["owned"] else _release_once())
+
     async def gen():
-        async with _gen_slots:
-            task = asyncio.create_task(_client.post(SGLANG + "/generate", json=sg_body))
-            try:
-                if fmt != "pcm":
-                    yield _wav_stream_header()
-                pos = 0
-                while True:
-                    try:
-                        size = os.path.getsize(part)
-                    except OSError:
-                        size = 0
-                    if size > pos:
-                        with open(part, "rb") as f:
-                            f.seek(pos)
-                            chunk = f.read(size - pos)
-                        pos += len(chunk)
-                        yield chunk
-                        continue
-                    if task.done():
-                        # Generation over: drain whatever landed between the last read
-                        # and finalize, then stop. The .wav's existence marks finalize.
-                        if os.path.exists(wav):
-                            try:
-                                final_size = os.path.getsize(part)
-                            except OSError:
-                                final_size = pos
-                            if final_size > pos:
-                                continue
-                            break
-                        # task done but no wav: backend errored or streaming was off
-                        # server-side. The 200 is committed; end the stream. The
-                        # request's failure is visible in the task result / logs.
-                        err = None
+        _state["owned"] = True
+        try:
+            if fmt != "pcm":
+                yield _wav_stream_header()
+            pos = 0
+            while True:
+                try:
+                    size = os.path.getsize(part)
+                except OSError:
+                    size = 0
+                if size > pos:
+                    with open(part, "rb") as f:
+                        f.seek(pos)
+                        chunk = f.read(size - pos)
+                    pos += len(chunk)
+                    yield chunk
+                    continue
+                if task.done():
+                    # Generation over: drain whatever landed between the last read
+                    # and finalize, then stop. The .wav's existence marks finalize.
+                    if os.path.exists(wav):
                         try:
-                            r = task.result()
-                            if r.status_code != 200:
-                                err = f"backend {r.status_code}"
-                        except Exception as e:  # noqa: BLE001
-                            err = str(e)[:120]
-                        logger.warning("[tts-stream] rid=%s ended without a finalized wav "
-                                       "(%s) — client received %d PCM bytes",
-                                       rid, err or "no error", pos)
+                            final_size = os.path.getsize(part)
+                        except OSError:
+                            final_size = pos
+                        if final_size > pos:
+                            continue
+                        # If the finalized wav carries MORE PCM than was streamed —
+                        # LCN_TTS_STREAM=0 server-side (no .part is ever written) or
+                        # the stream path failed and the model fell back to a full
+                        # decode — serve the remainder from the wav payload instead
+                        # of ending a header-only/truncated stream and deleting the
+                        # only good audio. (The wav's TAIL may legitimately be
+                        # shorter than the part: the tail trim; that is not a
+                        # shortfall.) 44 = the standard PCM WAV header the model's
+                        # finalize writes.
+                        try:
+                            with open(wav, "rb") as f:
+                                payload = f.read()[44:]
+                            if len(payload) > pos:
+                                logger.info("[tts-stream] rid=%s serving %d bytes from "
+                                            "the finalized wav (streamed %d)",
+                                            rid, len(payload) - pos, pos)
+                                yield payload[pos:]
+                                pos = len(payload)
+                        except OSError:
+                            pass
                         break
-                    await asyncio.sleep(0.1)
-            finally:
-                if not task.done():
-                    task.cancel()
-                _discard_artifact(part)
-                _discard_artifact(wav)
+                    # task done, no wav: with the wav fallback above this is a
+                    # GENUINE backend failure. The 200 is committed, so abort the
+                    # connection (client sees a reset/truncation) rather than
+                    # faking a clean end-of-stream.
+                    err = None
+                    try:
+                        r = task.result()
+                        if r.status_code != 200:
+                            err = f"backend {r.status_code}"
+                    except Exception as e:  # noqa: BLE001
+                        err = str(e)[:120]
+                    logger.warning("[tts-stream] rid=%s FAILED without a finalized wav "
+                                   "(%s) — aborting stream after %d PCM bytes",
+                                   rid, err or "no error", pos)
+                    raise RuntimeError("tts stream failed: " + (err or "no wav"))
+                await asyncio.sleep(0.1)
+        finally:
+            if not task.done():
+                task.cancel()
+            _release_once()
 
     media = "audio/wav" if fmt != "pcm" else "application/octet-stream"
     return StreamingResponse(gen(), media_type=media)
