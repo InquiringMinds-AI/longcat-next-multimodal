@@ -45,7 +45,8 @@ class FlashVarLenAttention(nn.Module):
         self.causal = causal
         self.window_size = window_size
 
-    def forward(self, hidden_states: torch.Tensor, seq_len: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, seq_len: torch.Tensor = None,
+                cu_len: torch.Tensor = None, max_seqlen=None):
         bsz, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -55,8 +56,27 @@ class FlashVarLenAttention(nn.Module):
         value_states = self.v_proj(hidden_states)
         value_states = value_states.view(bsz, self.num_heads, self.head_dim).contiguous()
 
-        cu_len = F.pad(torch.cumsum(seq_len, dim=0), (1, 0), "constant", 0).to(torch.int32)
-        max_seqlen = torch.max(seq_len).to(torch.int32).detach()
+        # Fast path: the depth-head caller passes precomputed cu_len (cached on
+        # device) and max_seqlen (a Python int) for EQUAL-length sequences —
+        # and equal-length causal attention needs none of the varlen machinery.
+        # Plain batched SDPA is mathematically identical, has no cu_seqlens
+        # (the fallback's per-call .tolist() was a blocking D2H copy — 32 host
+        # syncs per generation step and the CUDA-graph capture blocker) and no
+        # per-element Python loop. The seq_len varlen path is kept for any
+        # caller with genuinely ragged lengths.
+        if cu_len is not None and isinstance(max_seqlen, int) \
+                and tuple(self.window_size) == (-1, -1):
+            nb = bsz // max_seqlen
+            q = query_states.view(nb, max_seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+            k = key_states.view(nb, max_seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+            v = value_states.view(nb, max_seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+            o = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
+            attn_output = o.transpose(1, 2).reshape(bsz, self.embed_dim)
+            return self.out_proj(attn_output)
+        if cu_len is None:
+            cu_len = F.pad(torch.cumsum(seq_len, dim=0), (1, 0), "constant", 0).to(torch.int32)
+        if max_seqlen is None:
+            max_seqlen = torch.max(seq_len).to(torch.int32).detach()
 
         attn_fn = flash_attn_varlen_func if flash_attn_varlen_func is not None else _sdpa_varlen_fallback
         attn_output = attn_fn(query_states, key_states, value_states, cu_len, cu_len, max_seqlen,
@@ -90,8 +110,18 @@ class CasualDepthTransformerLayer(nn.Module):
         bsz = x.shape[0]
         res = x
         x = self.layernorm1(x)
-        seqlens = torch.tensor([self.depth] * bsz, dtype=torch.int32, device=x.device)
-        _x = self.self_attention(x.view(-1, self.transformer_dim), seqlens)
+        # seq lens here are ALWAYS [depth]*bsz — building that tensor host-side
+        # per call was a pageable H2D copy on every attention call (32/step in
+        # the generation trace) and the CUDA-graph capture blocker. Cache the
+        # cumulative form per (bsz, device), built ON DEVICE, and pass the max
+        # as a Python int.
+        _ck = (bsz, x.device)
+        if getattr(self, "_cu_cache_key", None) != _ck:
+            self._cu_cache_key = _ck
+            self._cu_cache = (torch.arange(0, bsz + 1, device=x.device,
+                                           dtype=torch.int32) * self.depth)
+        _x = self.self_attention(x.view(-1, self.transformer_dim),
+                                 cu_len=self._cu_cache, max_seqlen=self.depth)
         _x = _x.view(bsz, self.depth, self.transformer_dim).contiguous()
 
         _res = _x + res  # (bs, sl, d)
