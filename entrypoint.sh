@@ -121,6 +121,15 @@ export LCN_TTS_TRIM_LEAD_MS="${LCN_TTS_TRIM_LEAD_MS:-150}"
 # its bytes. 0 disables.
 export LCN_TTS_TRIM_TAIL_MS="${LCN_TTS_TRIM_TAIL_MS:-250}"
 
+# int8 depth-head FFN: ON by default since 2026-08-14, on measurement + owner
+# A/B ("all in all, the examples are all up to standard"): TTS -34-36%/frame
+# (~2.2x slower-than-realtime -> ~1.4x), single image -7.9%, +3.3GB memory
+# (bf16 FFN weights freed after per-slot int8 quantization). Attention and the
+# per-level output heads stay bf16 — see int8_head_ffn.py for the measured
+# scope. LCN_INT8_HEADS=0 restores the reference einsum path, byte-identical
+# to pre-feature behavior. Exported so GET /status reports the EFFECTIVE state.
+export LCN_INT8_HEADS="${LCN_INT8_HEADS:-1}"
+
 # Radix (prefix) cache: ON by default — warm-prefix reuse is what makes agentic clients
 # (Claude Code re-sends a ~15k-token system prompt every turn) responsive. Viable only
 # WITH the expandable_segments allocator above (radix keeps KV resident, which amplified

@@ -2900,6 +2900,16 @@ Net: TTS is the headline (frame ~177→~115ms), image modest, +3.3GB memory.
 Eight paired artifacts delivered to the owner; the flag stays OFF in
 production until that verdict.
 
+**Owner verdict (2026-08-14): APPROVED — "all in all, the examples are all up
+to standard." Default flipped ON** (entrypoint export, up-script passthrough,
+/status fallback; library default in the model code stays 0). One observation
+recorded with its caveat: the owner heard the off-arm TTS as accented European
+and the on-arm as Asian — ONE sample per arm cannot distinguish quantization
+shifting the voice from an ordinary stochastic draw ([[feedback-rare-event-
+ab-power]] applies). If voice-character stability ever matters (it does not
+for this deployment's default voice), the instrument is N repeated generations
+per arm on a fixed prompt, judged blind — not this pair.
+
 Residuals, recorded not actioned: (a) the original awkward clip's ~0 ms slammed
 join was not reproduced; if slams recur, the shelf fix is a MINIMUM-pause floor
 (insert silence only under ~200 ms, leaving the model's longer choices alone) —

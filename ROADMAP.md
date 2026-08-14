@@ -936,14 +936,17 @@ Baseline for the A/B, same box, same build (`v0516-syncfix`):
       Caveat recorded: arms were not pixel-paired (generation is stochastic), so the review
       answered "up to standard", not "better on this scene".
 
-- [ ] **int8 the generation heads — HIGHEST VALUE, and the only item that touches single-image
-      latency.** They are 71/71 BF16 (audio 2.86GB, visual 1.76GB) while the backbone is int8;
-      they are read 8x per frame. On a box where "its all ram bandwidth choking us out" (owner),
-      halving their width halves the traffic of every generation. Needs owner eyes/ears on
-      output — this changes what the images and voice actually are.
-- [ ] **Micro-benchmark the depth head, sweeping BOTH batch (1/2/4/8) AND dtype (bf16/int8),
-      WITH THE MODEL UNLOADED.** Sizes both items above before either is built. Needs
-      1.2-2.4GB, so never against a live server at ~117GB in use.
+- [x] **SHIPPED 2026-08-14 (v0516-int8h, default ON after owner A/B: "all up to standard") —
+      int8 the generation heads**, scoped by the micro-bench to the FFN ONLY: int8 GEMV wins
+      x2.3 at rows 1-4 but LOSES at 8+ rows, so attention (rows=8*batch) and the per-level
+      output heads stay bf16 while the FFN (~89% of transformer bytes, per-slot GEMVs at
+      rows=batch) went per-channel int8 with the bf16 originals freed (+3.3GB). Measured on
+      paired arms: TTS -34-36%/frame (~2.2x slower-than-realtime -> ~1.4x), single image
+      -7.9%. LCN_INT8_HEADS=0 restores the reference einsum path. See research/FINDINGS.md.
+- [x] **Micro-benchmark DONE 2026-08-14** (research/int8_heads/bench_depth_head.py) — and it
+      earned its gate-position twice: COLD reads only (the first sweep timed cache-warm
+      weights, >800GB/s implied), and the rows-inversion above reshaped the build. Also
+      anchored the audio head at ~135ms of the 177ms TTS frame (76%) at B=1.
 - [x] **BUILT 2026-08-11 — batch `CasualDepthTransformerHead` across concurrent generating
       requests** (was: one batch-1 call per request per level per step). `_image_gen_decode_step`
       now collects the requests needing a visual token into `pending` and `_image_gen_flush`
