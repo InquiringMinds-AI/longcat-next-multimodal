@@ -137,11 +137,15 @@ def save(path, wave):
 
 
 def main():
-    ids_path = sys.argv[1]
+    tok = build_tokenizer()
+    for ids_path in sys.argv[1:]:
+        _one(tok, ids_path)
+
+
+def _one(tok, ids_path):
     ids = torch.load(ids_path)  # [n_frames, codebooks], raw (offset-free), clamped
     n = ids.shape[0]
     print(f"{ids_path}: {n} frames, {ids.shape[1]} codebooks", flush=True)
-    tok = build_tokenizer()
     base = ids_path[: -len(".ids.pt")]
 
     # --- full (reference: the shipping math, minus segment splitting) ---

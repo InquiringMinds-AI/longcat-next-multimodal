@@ -57,6 +57,13 @@ class AudioGenState:
     transcript_tokens: list = field(default_factory=list)  # accumulated transcript token IDs (from lm_head argmax)
     end_run: int = 0  # consecutive level-0 end-flags seen (for END_CONFIRM)
     ended: bool = False  # set when a confirmed end-of-audio cluster is reached
+    # End-intent telemetry: an isolated end flag is re-sampled into an acoustic frame
+    # (see _generate_audio_codebook_step), so a model that signals end INTERMITTENTLY
+    # is forced to keep "speaking" near-silence until two flags land consecutively.
+    # These make that visible per generation: tail length correlating with resamples
+    # after first_end_flag_step is the silent-tail mechanism, measured not assumed.
+    end_flag_resamples: int = 0  # isolated end flags converted to acoustic frames
+    first_end_flag_step: int = -1  # frame index of the FIRST end flag seen
     rid: str = ""  # per-request id → unique output filename (concurrency-safe retrieval)
     # --- streaming vocode (LCN_TTS_STREAM) ---
     streamed_frames: int = 0  # frames whose PCM has been emitted to the .part file
@@ -949,12 +956,15 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             if level == 0:
                 tok = self._sample_codebook_logits(logits, level, prev_ids)
                 if int(tok) == end_token_idx:
+                    if state.first_end_flag_step < 0:
+                        state.first_end_flag_step = state.step_count
                     state.end_run += 1
                     if state.end_run >= AUDIO_END_CONFIRM:
                         state.ended = True
                         return None  # confirmed genuine end — do NOT store this flag frame
                     # isolated/stray end-flag: re-sample level 0 with the end slot masked so
                     # the frame carries real speech content (the model keeps speaking).
+                    state.end_flag_resamples += 1
                     logits[0, end_token_idx] = float('-inf')
                     tok = self._sample_codebook_logits(logits, level, prev_ids)
                 else:
@@ -2158,7 +2168,9 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                         logger.warning(f"[AudioGen] req={req_idx}: hit safety cap ({state.max_audio_steps} frames)")
                     else:
                         logger.info(f"[AudioGen] req={req_idx}: confirmed end-of-audio, "
-                                    f"{len(state.accumulated_ids)} frames")
+                                    f"{len(state.accumulated_ids)} frames "
+                                    f"(first end flag at frame {state.first_end_flag_step}, "
+                                    f"{state.end_flag_resamples} isolated flags resampled)")
                     state.rid = self._rid_for(req_idx, forward_batch) or state.rid
                     if _LCN_TTS_STREAM and state.rid and not state.stream_failed:
                         try:
