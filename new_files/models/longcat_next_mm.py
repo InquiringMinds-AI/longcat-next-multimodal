@@ -2980,14 +2980,23 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         # TTS win with no adverse listen — so the deployment default is
         # 'audio' only.
         _int8_sel = os.environ.get('LCN_INT8_HEADS', '0').strip().lower()
+        # 'audio4': int4-g128 trial on the audio head (bench: -18% head time,
+        # relerr 15x int8's — ears-gated, not a default candidate until judged).
         _int8_on = {'1': ('visual', 'audio'), 'both': ('visual', 'audio'),
-                    'audio': ('audio',), 'visual': ('visual',)}.get(_int8_sel, ())
+                    'audio': ('audio',), 'visual': ('visual',),
+                    'audio4': ('audio:int4',)}.get(_int8_sel, ())
         if _int8_on:
-            from sglang.srt.models.int8_head_ffn import attach_int8_ffn
+            from sglang.srt.models.int8_head_ffn import attach_int8_ffn, attach_int4_ffn
             for _name, _head in (("visual", self.visual_head), ("audio", self.audio_head)):
-                if _head is not None and _name in _int8_on:
+                if _head is None:
+                    continue
+                if _name in _int8_on:
                     _freed = attach_int8_ffn(_head, len(_head.codebook_sizes))
                     logger.info(f"[INT8-HEADS] {_name} head FFN -> per-slot int8 "
+                                f"({_freed/(1<<20):.0f}MB bf16 freed)")
+                elif f"{_name}:int4" in _int8_on:
+                    _freed = attach_int4_ffn(_head, len(_head.codebook_sizes))
+                    logger.info(f"[INT8-HEADS] {_name} head FFN -> per-slot int4-g128 "
                                 f"({_freed/(1<<20):.0f}MB bf16 freed)")
 
         # LCN_HEAD_GRAPH: CUDA-graph replay of the per-level head forward — the
