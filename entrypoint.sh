@@ -139,6 +139,18 @@ export LCN_INT8_HEADS="${LCN_INT8_HEADS:-audio}"
 # that head. LCN_HEAD_GRAPH=0 disables.
 export LCN_HEAD_GRAPH="${LCN_HEAD_GRAPH:-1}"
 
+# Chunked-prefill size (opt-in): SGLang's default is 8192. Larger chunks
+# amortize per-chunk overhead on long prompts at the cost of chunkier
+# scheduling; exposed for the prefill-throughput sweep (cold prefill measured
+# ~2.6k tok/s at the default).
+CHUNK_FLAGS=""
+if [ -n "${LCN_CHUNKED_PREFILL:-}" ]; then
+  CHUNK_FLAGS="--chunked-prefill-size ${LCN_CHUNKED_PREFILL}"
+  # max-prefill-tokens (default 16384) caps tokens per forward batch and would
+  # silently truncate a larger chunk back to 16384 — raise it alongside.
+  [ "${LCN_CHUNKED_PREFILL}" -gt 16384 ] && CHUNK_FLAGS="$CHUNK_FLAGS --max-prefill-tokens ${LCN_CHUNKED_PREFILL}"
+fi
+
 # Radix (prefix) cache: ON by default — warm-prefix reuse is what makes agentic clients
 # (Claude Code re-sends a ~15k-token system prompt every turn) responsive. Viable only
 # WITH the expandable_segments allocator above (radix keeps KV resident, which amplified
@@ -155,7 +167,7 @@ python3 -m sglang.launch_server \
   --mem-fraction-static "${MEM_FRACTION:-$DEFAULT_MEMFRAC}" \
   --max-total-tokens "${MAX_TOTAL_TOKENS:-$DEFAULT_TOKENS}" \
   --attention-backend flashinfer \
-  $GRAPH_FLAG $RADIX_FLAG $NGRAM_FLAGS $KV_FLAGS --skip-server-warmup \
+  $GRAPH_FLAG $RADIX_FLAG $NGRAM_FLAGS $KV_FLAGS $CHUNK_FLAGS --skip-server-warmup \
   --watchdog-timeout 600 &
 SGLANG_PID=$!
 
