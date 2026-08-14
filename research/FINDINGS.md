@@ -2918,6 +2918,26 @@ ab-power]] applies). If voice-character stability ever matters (it does not
 for this deployment's default voice), the instrument is N repeated generations
 per arm on a fixed prompt, judged blind — not this pair.
 
+**The 36ms GPU-idle gap SOLVED by reading the timeline — it is ~4,600 kernel-launch
+latencies, and the "eager overhead DEAD" verdict is OVERTURNED (2026-08-14).**
+Fresh 50-step trace on v0516-int8h2 (live server, /start_profile mid-raster):
+step span 117.0ms, GPU busy 70.4ms, idle 46.5ms — but gaps ≥0.5ms total only
+0.8ms/step. The idle is 4,639 gaps/step almost all under 25µs: per-launch
+latency, invisible to every aggregate view and to any per-gap threshold.
+Kernel census/step: 3,128 elementwise launches carrying only 5.96ms of GPU work
+(1.9µs avg!), 492 _int8_gemv (the full 8-level head pass), 165 cublas gemv,
+174 flash-attn, 562 memcpy, 56 MoE. The head interior dominates the count.
+Why the old refutation was wrong: it measured TEXT throughput graphs-on/off
+(6%) — text decode is a few hundred LARGE bandwidth-bound kernels whose memory
+time hides launch latency; generation is thousands of TINY kernels where launch
+latency IS the step. Wrong instrument, wrong kernel-size distribution — the
+seventh theory is the first with the mechanism visible in the data.
+Remedy candidates (head is shape-static per level → graphable): torch.compile
+reduce-overhead on head.forward, or manual per-level CUDA-graph capture.
+Ceiling if the launch tax vanishes: step ~117→~75ms (−35% single image), with
+the audio path inheriting the same structure. Gated like int8 was: offline
+bench first (analyze tooling: research/int8_heads/analyze_gap_trace.py).
+
 Residuals, recorded not actioned: (a) the original awkward clip's ~0 ms slammed
 join was not reproduced; if slams recur, the shelf fix is a MINIMUM-pause floor
 (insert silence only under ~200 ms, leaving the model's longer choices alone) —
