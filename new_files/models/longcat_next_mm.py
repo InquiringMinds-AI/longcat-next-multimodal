@@ -2985,16 +2985,20 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         # generation step is launch-latency-bound (~4.4k launches, ~42ms/step
         # distributed idle; see lcn_head_graph.py). The call sites route through
         # these attrs; without the flag they are the bare heads (zero-cost).
-        self._visual_head_call = self.visual_head
-        self._audio_head_call = self.audio_head
+        # object.__setattr__: nn.Module.__setattr__ registers a Module value as
+        # a child under this name and then REFUSES a non-Module reassignment
+        # (crashed the first hgraph launch at load time) — and the routing attr
+        # must not enter the module tree / state_dict anyway.
+        object.__setattr__(self, '_visual_head_call', self.visual_head)
+        object.__setattr__(self, '_audio_head_call', self.audio_head)
         if os.environ.get('LCN_HEAD_GRAPH', '0').strip() == '1':
             from sglang.srt.models.lcn_head_graph import GraphedHeadRunner
             if self.visual_head is not None:
-                self._visual_head_call = GraphedHeadRunner(
-                    self.visual_head, len(self.visual_head.codebook_sizes), "visual")
+                object.__setattr__(self, '_visual_head_call', GraphedHeadRunner(
+                    self.visual_head, len(self.visual_head.codebook_sizes), "visual"))
             if self.audio_head is not None:
-                self._audio_head_call = GraphedHeadRunner(
-                    self.audio_head, len(self.audio_head.codebook_sizes), "audio")
+                object.__setattr__(self, '_audio_head_call', GraphedHeadRunner(
+                    self.audio_head, len(self.audio_head.codebook_sizes), "audio"))
             logger.info("[HeadGraph] enabled — graphs capture lazily per (bsz, level)")
 
     def _dequant_layers_from_checkpoint(self, n_layers, start_layer=0):
