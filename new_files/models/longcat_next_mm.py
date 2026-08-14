@@ -2973,10 +2973,19 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         # freed (~1.7GB back across both heads). Scope and measured basis in
         # int8_head_ffn.py (bench: research/int8_heads/bench_depth_head.py).
         # Default OFF — a generation-path change gated on the owner's paired A/B.
-        if os.environ.get('LCN_INT8_HEADS', '0').strip() == '1':
+        # Per-head selection: '1'/'both', 'audio', 'visual', or '0'/unset.
+        # The 2026-08-14 5v5 owner A/B found hard spatial-geometry failures
+        # clustering in the int8 VISUAL arm (3/5 vs 1/5, plus a novel
+        # cat-embedded-in-wall mode) while audio int8 carries the -34%/frame
+        # TTS win with no adverse listen — so the deployment default is
+        # 'audio' only.
+        _int8_sel = os.environ.get('LCN_INT8_HEADS', '0').strip().lower()
+        _int8_on = {'1': ('visual', 'audio'), 'both': ('visual', 'audio'),
+                    'audio': ('audio',), 'visual': ('visual',)}.get(_int8_sel, ())
+        if _int8_on:
             from sglang.srt.models.int8_head_ffn import attach_int8_ffn
             for _name, _head in (("visual", self.visual_head), ("audio", self.audio_head)):
-                if _head is not None:
+                if _head is not None and _name in _int8_on:
                     _freed = attach_int8_ffn(_head, len(_head.codebook_sizes))
                     logger.info(f"[INT8-HEADS] {_name} head FFN -> per-slot int8 "
                                 f"({_freed/(1<<20):.0f}MB bf16 freed)")

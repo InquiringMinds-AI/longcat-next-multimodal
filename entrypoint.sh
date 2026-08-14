@@ -121,14 +121,15 @@ export LCN_TTS_TRIM_LEAD_MS="${LCN_TTS_TRIM_LEAD_MS:-150}"
 # its bytes. 0 disables.
 export LCN_TTS_TRIM_TAIL_MS="${LCN_TTS_TRIM_TAIL_MS:-250}"
 
-# int8 depth-head FFN: ON by default since 2026-08-14, on measurement + owner
-# A/B ("all in all, the examples are all up to standard"): TTS -34-36%/frame
-# (~2.2x slower-than-realtime -> ~1.4x), single image -7.9%, +3.3GB memory
-# (bf16 FFN weights freed after per-slot int8 quantization). Attention and the
-# per-level output heads stay bf16 — see int8_head_ffn.py for the measured
-# scope. LCN_INT8_HEADS=0 restores the reference einsum path, byte-identical
-# to pre-feature behavior. Exported so GET /status reports the EFFECTIVE state.
-export LCN_INT8_HEADS="${LCN_INT8_HEADS:-1}"
+# int8 depth-head FFN, PER-HEAD ('audio' default since 2026-08-14): the audio
+# head keeps int8 (TTS -34-36%/frame, ~2.2x slower-than-realtime -> ~1.4x, no
+# adverse listen) but the VISUAL head returned to bf16 after the owner's 5v5
+# cat A/B found hard spatial-geometry failures clustering in the int8 visual
+# arm (3/5 vs 1/5, incl. a novel cat-embedded-in-wall mode; images ~8% slower
+# than full-int8 as the price). Values: audio | visual | both/1 | 0.
+# Attention and per-level output heads always stay bf16 (int8_head_ffn.py).
+# Exported so GET /status reports the EFFECTIVE state.
+export LCN_INT8_HEADS="${LCN_INT8_HEADS:-audio}"
 
 # Per-level CUDA-graph replay of the depth-head forward: ON by default since
 # 2026-08-14 — the generation loop was launch-latency-bound; graphs are
