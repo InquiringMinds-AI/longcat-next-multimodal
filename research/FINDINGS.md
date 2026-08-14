@@ -2908,8 +2908,25 @@ steady state historically. Launch-to-launch MemAvailable varies by GBs; claim
 the tensor-level free, not system headroom. Corroboration that the speed is
 real, from prewarm itself: image warm 239.9s→216.4s, audio warm 20.1s→16.3s.
 
-**Owner verdict (2026-08-14): APPROVED — "all in all, the examples are all up
-to standard." Default flipped ON** (entrypoint export, up-script passthrough,
+**REVISED same day — int8 VISUAL is out; default is now per-head 'audio' (build
+v0516-int8audio).** The initial approval rested on ONE image pair per prompt. In
+later spot-checks the owner noticed a novel failure ("the unseen parts of the cat
+don't fit in the apparent room geometry... not a problem I have observed in
+previous iterations") while a simple apple was "apparently flawless" — so a 5v5
+same-prompt A/B ran with int8 the only variable. Owner-judged result: hard
+spatial failures 3/5 int8-on vs 1/5 off (two cat-embedded-in-wall/window cases
+in the on-arm), best image in the off-arm, big-head anatomy once per arm (model
+base rate). n=5 is clustering evidence, not proof, and is recorded as such —
+but with the owner's prior observation it points one way, and the cost of
+believing it is only the visual head's ~8% (image ~131.6→~142s). AUDIO int8
+stays: the TTS win is large and no adverse listen exists. LCN_INT8_HEADS now
+takes audio|visual|both|0. Method note: the single-pair A/B that approved
+'both' was underpowered for a STOCHASTIC failure-rate change — rate questions
+need repeats, and the owner's trained eye on ONE novel failure mode was the
+better instrument than the approval itself.
+
+**Original owner verdict (2026-08-14, superseded for visual): "all in all, the
+examples are all up to standard." Default was flipped ON** (entrypoint export, up-script passthrough,
 /status fallback; library default in the model code stays 0). One observation
 recorded with its caveat: the owner heard the off-arm TTS as accented European
 and the on-arm as Asian — ONE sample per arm cannot distinguish quantization
