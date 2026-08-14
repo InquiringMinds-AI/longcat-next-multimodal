@@ -2776,3 +2776,13 @@ non-streamed path. Root cause is model behavior, unfixable at the sampling layer
 without a behavioral clamp; the trim is the same remedy class the project already
 ships for lead silence. Generation-time waste (~0.5-1 s typical) remains and is
 accepted; recovering it would need an early-stop clamp with truncation risk.
+
+### Tail trim owner-verified; streaming-TTS arc closed (2026-08-14)
+
+Owner on the trimmed clips: "'coffee is on the desk (breathes in)' 'it works now' — no
+long silent tail." The 250 ms keep preserved the audible breath-off while cutting the
+dead air — the naturalness/abruptness tradeoff landing where intended. Verification
+honesty note: the five-clip live batch happened to produce no monster tail (the trim
+correctly cut nothing and logged nothing), so the CUTTING path was verified separately
+against the recorded 2.88 s monster itself: 4.46 s -> 1.83 s, residual tail exactly the
+0.25 s keep. Production serve restored (tailtrim build, prewarm on).
