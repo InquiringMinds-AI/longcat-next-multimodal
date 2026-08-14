@@ -2349,6 +2349,11 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                         logger.info(f"[AudioGen] req={req_idx}: ROUND {state.rounds} — model "
                                     f"opened another transcript after {len(state.done_segments)} "
                                     f"banked segment(s)")
+                        # The round's FIRST transcript token is sampled on THIS step —
+                        # mask EOS while it samples (the prefill open does the same; a
+                        # sampled EOS finishes the request before any wav exists). The
+                        # -3 sentinel masks it and records the intent.
+                        overrides[i] = -3
                         continue
                 else:
                     # Enter audio mode — start transcript phase
@@ -2361,7 +2366,10 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                     state.rid = self._rid_for(req_idx, forward_batch)
                     self._audio_gen_states[req_idx] = state
                     logger.info(f"[AudioGen] req={req_idx}: entered audio mode, starting transcript phase")
-                    # No override — let lm_head generate transcript text
+                    # lm_head samples the first transcript token this step — mask EOS
+                    # like the prefill open does (-3: mask + record intent), otherwise
+                    # let it generate freely.
+                    overrides[i] = -3
                     continue
 
             if token == self._audiotext_start_id and state is not None \
@@ -2434,6 +2442,20 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             # sees it on next step. Transcript ends when lm_head generates
             # audiotext_pad_token_id or EOS.
             if state is not None and state.mode == "transcript":
+                if state.transcript_steps == 0 and not state.transcript_tokens \
+                        and token not in (2, self._audiotext_pad_id,
+                                          self._audiotext_start_id,
+                                          self._audiogen_start_id,
+                                          self._audiogen_end_id):
+                    # The round's first transcript token was sampled on the OPEN step
+                    # (prefill for round 1, the audiogen_start step for rounds 2+) and
+                    # arrives here as the input token — without this append every
+                    # transcript is missing its first word. Multi-word inputs survived
+                    # the loss on fuzzy stops; a one-word input ("Ready.") degenerated
+                    # to bare '.' and closed with NO audio (prewarm failure,
+                    # 2026-08-14). Control tokens excluded: a first-sample pad/end is
+                    # a genuinely empty transcript and must stay one.
+                    state.transcript_tokens.append(token)
                 state.transcript_steps += 1
                 # Deferred to post-logits: check for transcript end, otherwise
                 # let the lm_head's choice pass through (no override)
