@@ -2744,3 +2744,35 @@ through the streamed finalize), degeneracy 6/6. **Final gate PENDING: owner list
 the live streamed clip (7 chunks, 6 held-tail crossfade seams — the one thing no test
 can hear).** Known knob if TTFA needs to shrink: a ramped schedule (small first chunk,
 ~12 frames → ~3.5 s) — not built, awaiting need.
+
+### Silent-tail investigation: hypothesis half-refuted by its own instrument (2026-08-14)
+
+Owner (listening to the prosody pairs): streaming seams "imperceptible" — the streaming
+mechanism CLEARED on exactly-paired twins — "but the 'short' clips have a silent tail
+that runs more than half the duration." Measured: 2.88 s / 64.6% on the worst clip;
+stochastic (1 of 5 quick repros hit 46.6%, others 15-18%).
+
+Hypothesis: AUDIO_END_CONFIRM=2 requires two CONSECUTIVE end flags and re-samples an
+isolated flag into an acoustic frame — a flickering end signal would be forced to keep
+"speaking" near-silence. Instrumented rather than fixed: two counters on the existing
+completion log line (first end-flag step, isolated flags resampled), then 21 telemetried
+generations correlated against measured tails.
+
+**The data split the blame three ways, and mostly acquitted the gate:**
+- The model generates silence AS CONTENT before its first end flag — the largest share
+  (worst: first flag at frame 60 of 61 on a ~25-frame sentence).
+- In 5/21 clips the model dithers 3-12 frames between flags (these own the top tails,
+  0.34-1.92 s) — but those frames are freely sampled non-flag codes, not forced.
+- The gate's own cost is ~1 resampled frame (~80 ms) in the typical case.
+
+The gate STAYS: first flags landed in trailing silence in 21/21, never mid-speech —
+suggestive that CONFIRM=1 is safe, but 21 samples cannot bound a rare mid-speech stray,
+and a false end truncates real speech (the asymmetric harm).
+
+**Fix shipped (9989e5c): trailing-silence trim, the lead trim's exact twin** — cut to
+LCN_TTS_TRIM_TAIL_MS (default 250 ms) after the last active audio, same 10 ms /
+2%-of-peak-RMS thresholds, applied to the streamed finalize's assembled PCM and the
+non-streamed path. Root cause is model behavior, unfixable at the sampling layer
+without a behavioral clamp; the trim is the same remedy class the project already
+ships for lead silence. Generation-time waste (~0.5-1 s typical) remains and is
+accepted; recovering it would need an early-stop clamp with truncation risk.
