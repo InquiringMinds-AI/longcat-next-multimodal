@@ -2994,6 +2994,32 @@ lands ~100 ms, still short. Sub-realtime TTS on this box is therefore OUT OF
 REACH of serving work alone at int8 quality; parked as a known ceiling
 unless a new lever appears.
 
+**Second adversarial review (2026-08-14, Codex CLI over 5decacb..HEAD ≈2,950 added
+lines): five real defects, five fixes, plus a docs-truth sweep.** Method note: the
+codex plugin's rescue agent proved LAUNCH-ONLY (its result retrieval is
+user-invocation-gated) — the working pattern is driving `codex exec` directly with
+an output file. Findings, each verified against the code before fixing:
+(1) every non-streaming TTS request AND prewarm leaked its `.pcm.part` (the model
+leaves it for the gateway; the gateway deleted only the wav) — corroborated by the
+part files visible in every earlier output-dir listing; (2) a streaming request
+against a non-streaming server (LCN_TTS_STREAM=0) or the full-decode fallback ended
+a header-only/truncated stream and DELETED the only good wav — the drain now
+serves the shortfall from the finalized wav payload; (3) recitation detection read
+only the final chunked-prefill extend, so a >8,192-token TTS input escaped the
+content stops — the gateway now stamps an `lcntts` rid prefix that survives
+chunking (prompt check retained for raw /generate; residual documented); (4)
+streaming committed 200 + WAV header before backend acceptance — 0.4 s preflight
+→ honest 502 on fast failure, connection abort (not clean EOF) on genuine
+mid-stream failure, once-guarded slot/artifact ownership for the never-started-
+generator disconnect; (5) run.sh env forwarding word-split values with spaces
+(Codex repro'd against a stubbed docker; fix verified the same way — bash array).
+Codex also CLEARED three hunted classes: no static-output aliasing at the head
+call sites, no graph-dict growth beyond the bounded key space, no M/K-tail or
+batch-stride defect in the shipped kernel dimensions.
+Perf candidates surfaced by the same review, not yet run: fp8 KV re-bench (−41 %
+decode PRE-tuning, quality owner-validated, never re-measured), prefill chunk
+tuning (~2.6k tok/s cold), and the known backbone graph-veto surgery.
+
 Residuals, recorded not actioned: (a) the original awkward clip's ~0 ms slammed
 join was not reproduced; if slams recur, the shelf fix is a MINIMUM-pause floor
 (insert silence only under ~200 ms, leaving the model's longer choices alone) —
