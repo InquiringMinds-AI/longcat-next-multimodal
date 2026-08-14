@@ -2641,3 +2641,32 @@ eager, and ROADMAP §3 still records ship-defaults as an open decision.
 unpad work is consumed only by the flash branch, mutually exclusive by construction), both
 scheduler patches, the branchless embed (codebook_base equals the word-table size, so the
 torch.where masks partition exactly), and the head-batching flush guards.
+
+### CUDA-graph default settled; KV-capacity question opened and sized (2026-08-11)
+
+The review's three-surface drift (entrypoint ON / launcher OFF / ROADMAP undecided) was
+resolved by measurement rather than argument. The blocker was that the graphs-ON
+justification ("9.95 GB free after generation warmup") predated audio prewarm, so
+graphs + FULL all-modality warm had never been measured on one box. Measured: **5.55 GB
+MemAvailable** at prewarm-ready with graphs on — above the eager runs' 3.3-3.96 GB, i.e.
+the ~1.7 GB capture cost disappears inside the ±1-2 GB run-to-run misc variance. Graphs
+are now default-ON on all three surfaces, and the entrypoint exports the effective value
+so /status reports truth.
+
+The owner then asked the right capacity question: how many FULL 128k contexts fit?
+From the live allocation line (`#tokens: 131072, KV size: 3.94 GB`): **31.5 KB/token**
+— MLA compression (kv_lora_rank=512, 14 layers) makes KV the SMALLEST of the three big
+allocations, unusual for a 75B-class server. Answers:
+
+| profile | configured | could hold |
+|---|---|---|
+| all-modality | 1 context | 1 (physics: one more costs 3.94 GB against ~3-5 GB free) |
+| agent mode | 1 context | ~7 (the heads' unclaimed ~25 GB funds ~6 more) |
+
+Two stale-comment corrections landed on the way: weights are 76.26 GB measured (comment
+said ~88), and the FULL 131072 pool allocates at 0.72 in every profile — the
+--max-total-tokens CAP binds, not the fraction (comment claimed a ~55k pool).
+
+Agent-mode 7-context test (owner: "we should test that"): MAX_TOTAL_TOKENS=917504,
+MEM_FRACTION=0.82 (weights+KV = 103.9 GB = 0.814 of the box, so 0.75 would refuse the
+pool). Predicted ~5 GB free steady. Result recorded below when measured.

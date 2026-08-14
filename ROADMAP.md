@@ -398,8 +398,16 @@ Results (2026-07-31, image :v0516-spec = both phases):
       maybe better. they still have defects though. the audio is good too."
       — generation paths confirmed non-regressed (residual geometry defect
       class persists, the known model/quant-bound baseline). GATE PASSED.
-- [ ] Decide ship defaults (likely: both features stay opt-in env gates;
-      LCN_AGENT deployments are the natural place for LCN_CUDAGRAPH=1)
+- [x] DECIDED 2026-08-11 — CUDA graphs ON by default everywhere; NGRAM stays opt-in.
+      The entrypoint had already flipped graphs on (2026-08-10, +13.6% aggregate at
+      concurrency 16) but the Spark launcher silently overrode to eager and /status
+      misreported — the adversarial review surfaced the three-surface drift. Resolution:
+      the feared memory squeeze was MEASURED AWAY — graphs + full all-modality prewarm
+      settles at 5.55 GB MemAvailable, above the eager runs' 3.3-3.96 (the ±1-2 GB misc
+      component dominates the ~1.7 GB capture cost). Launcher default now 1; entrypoint
+      exports the effective value so /status tells the truth. NGRAM remains an opt-in
+      gate: it pays only on repetitive agent loops and carries the spec-fallback
+      machinery — not a general-traffic default.
 
 ## 4. MoE kernel tuning (after #3 — tune the final decode path once)
 
