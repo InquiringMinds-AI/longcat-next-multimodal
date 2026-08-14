@@ -990,7 +990,10 @@ Baseline for the A/B, same box, same build (`v0516-syncfix`):
 
 ## 7. Final numbers + legibility (last — documents whatever the above produced)
 
-- [ ] Re-run the full bench suite on the final configuration; update README numbers
-- [ ] README: lead with the Claude Code / agent-mode headline (currently mid-file)
-- [ ] HF model card: agent mode + Anthropic route + updated serving guidance
+- [x] DONE 2026-08-14 — README fully revised: leads with the measured performance table,
+      serving-profile decision table, agent operations section; zh-CN ported in full.
+      (The "final configuration" numbers in it are the paired-arm measurements on the
+      shipping defaults — a fresh full-suite re-run remains worthwhile at set-down.)
+- [x] DONE 2026-08-14 — agent/Claude Code has its own README section + capability-table row.
+- [x] DONE 2026-08-14 — MODEL_CARD: agent mode + Anthropic route + measured performance line.
 - [ ] Short terminal recording of Claude Code driving the container

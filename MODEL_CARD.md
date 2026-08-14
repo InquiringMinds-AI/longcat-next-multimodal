@@ -22,7 +22,10 @@ modality on a single NVIDIA GB10 system (`sm_121`)** through one SGLang process:
 generation, image understanding and generation, audio understanding and voice-clone
 generation, and video understanding. Developed and validated on a DGX Spark.
 
-Serving code, Dockerfile, and an OpenAI-compatible gateway:
+Serving code, Dockerfile, and an OpenAI-compatible gateway — plus an **Anthropic Messages
+API route** (Claude Code works against it directly) and an **agent serving profile**
+(`LCN_AGENT=1`: generation memory never allocated, radix-cached prefixes, a measured
+~6×128k-context multi-session recipe):
 **https://github.com/InquiringMinds-AI/longcat-next-multimodal**
 
 ## What's in this repo
@@ -71,8 +74,12 @@ scripts are in the serving repo under `quantize/` (`smoothquant_export.py` for t
   off / remote-only for maximum memory headroom).
 - **Context: native 128k**, or **256k via YaRN** (`LCN_YARN=1`, opt-in). MLA keeps the KV cache
   cheap, so long context costs little memory.
-- Quickstart, the OpenAI-compatible API, and per-modality examples are in the serving repo
-  README.
+- **Measured serving performance** (GB10, defaults, single request): warm 1040×1040 image in
+  ~2.4 min; TTS at ~1.4× slower-than-realtime with ~6.5 s to first streamed audio;
+  +13.6 % aggregate text decode at 16 concurrent. Every number's measurement is recorded in
+  the serving repo's `research/FINDINGS.md`.
+- Quickstart, the OpenAI-compatible API, per-modality examples, and the tuning/serving-profile
+  guide are in the serving repo README.
 
 ## License
 

@@ -22,10 +22,22 @@ services:
       # Required bearer token IF you expose the port off-loopback (clients send
       # `Authorization: Bearer <secret>`). Leave unset for the loopback-only default.
       - LCN_API_KEY=${LCN_API_KEY:-}
-      # optional tuning:
+      # optional tuning (full reference + defaults: README "Tuning (env vars)";
+      # verify what actually took effect via GET /status):
+      # - LCN_AGENT=1         # agent profile: generation endpoints 403, head memory never allocated
       # - LCN_YARN=1          # extend context 128k -> 256k via YaRN (opt-in; see README)
-      # - MEM_FRACTION=0.72   # 0.74 is the default under LCN_YARN
-      # - MAX_TOTAL_TOKENS=131072
+      # - MEM_FRACTION=0.72   # 0.74 is the default under LCN_YARN. Read the README's
+      #                       # hard-power-off warning before raising.
+      # - MAX_TOTAL_TOKENS=131072   # 917504 + MEM_FRACTION=0.88 + LCN_AGENT=1 = the
+      #                       # measured ~6-context multi-session recipe
+      # - LCN_CUDAGRAPH=1     # decode CUDA graphs (default ON; 0 restores eager)
+      # - LCN_HEAD_GRAPH=1    # generation-head graph replay (default ON; math-identical)
+      # - LCN_INT8_HEADS=audio  # per-head int8 FFN: audio (default) | visual | both | 0.
+      #                       # 'both' is ~8% faster images at a measured spatial-quality cost.
+      # - LCN_NGRAM=1         # n-gram speculative decoding (opt-in; coexists with generation)
+      # - LCN_TTS_STREAM=1    # streaming TTS vocoder (default ON)
+      # - LCN_TTS_MULTI=1     # multi-sentence TTS rounds (default ON)
+      # - LCN_TTS_TRIM_LEAD_MS=150  # onset silence trim; LCN_TTS_TRIM_TAIL_MS=250 the tail twin
       # - IMAGE_GEN_CFG_SCALE=3.0
       # - LCN_REFINER_CFG_RANGE=0.0,1.0  # refiner classifier-free guidance range. DEFAULT
       #                       # 1.0,0.0 (empty interval = guidance OFF; every denoise step is
@@ -33,9 +45,11 @@ services:
       #                       # Owner-reviewed: a three-arm A/B (all steps / first half / off)
       #                       # read as equivalent quality. Set 0.0,1.0 to restore the
       #                       # original full-guidance refiner, 0.0,0.5 for the middle ground.
+      # - LCN_KEEP_ARTIFACTS=1  # keep generated files in ./outputs (default: delete after serving)
       # - LCN_VERBOSE=0
-      # - LCN_PREWARM=1       # warm the generation heads at startup (~4 min) instead of
-      #                       # making the first real request pay ~140s of lazy allocation
+      # - LCN_PREWARM=1       # warm BOTH generation paths at startup (~4-5 min; /status
+      #                       # reports pending/running/ready — 'degraded' = a path failed)
+      #                       # instead of making the first real request pay the lazy costs
     # Bounded restart, not "always": the entrypoint exits 1 when a managed process dies,
     # so a transient failure recovers unattended, while a genuine misconfiguration stops
     # after 3 attempts instead of crash-looping a ~90GB model load against a 128GB box.
