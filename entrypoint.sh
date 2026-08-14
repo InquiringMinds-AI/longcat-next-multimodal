@@ -114,6 +114,12 @@ export LCN_NGRAM_EOS="${LCN_NGRAM_EOS:--1}"
 # back to ~150ms (the model extends injected silence by momentum). 0/0 disables.
 export LCN_TTS_SILENCE_FRAMES="${LCN_TTS_SILENCE_FRAMES:-1}"
 export LCN_TTS_TRIM_LEAD_MS="${LCN_TTS_TRIM_LEAD_MS:-150}"
+# Trailing twin of the lead trim. The model generates trailing silence AS CONTENT
+# before (and while dithering around) its end flag — measured up to ~2.9s on short
+# clips, telemetry 2026-08-14 — so the rendered tail is cut back to 250ms after the
+# last active audio. Applies to the assembled .wav; a live stream has already sent
+# its bytes. 0 disables.
+export LCN_TTS_TRIM_TAIL_MS="${LCN_TTS_TRIM_TAIL_MS:-250}"
 
 # Radix (prefix) cache: ON by default — warm-prefix reuse is what makes agentic clients
 # (Claude Code re-sends a ~15k-token system prompt every turn) responsive. Viable only

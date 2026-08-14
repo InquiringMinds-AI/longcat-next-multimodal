@@ -128,6 +128,14 @@ TTS_SILENCE_FRAMES = _envi("LCN_TTS_SILENCE_FRAMES", 0)
 # rendered lead back to a fixed small beat regardless of how much silence the
 # model chose to generate. 0 disables trimming entirely.
 TTS_TRIM_LEAD_MS = _envi("LCN_TTS_TRIM_LEAD_MS", 0)
+# Trailing-silence trim, the lead trim's twin. Root cause is MODEL behavior, measured
+# 2026-08-14 over 21 telemetried generations: the model generates silence AS CONTENT
+# before its first end flag (up to ~35 frames on short clips — the owner heard a 2.88s
+# tail on a 4.5s clip), and in ~1/4 of clips dithers a further 3-12 frames between
+# flags. The confirm gate itself costs ~1 frame. None of that is fixable at the
+# sampling layer without a behavioral clamp, so the artifact is trimmed post-hoc:
+# everything after (last active audio + this many ms) is cut. 0 disables.
+TTS_TRIM_TAIL_MS = _envi("LCN_TTS_TRIM_TAIL_MS", 0)
 # End-of-audio is confirmed by this many CONSECUTIVE level-0 end-flags (canonical guard):
 # an isolated/stray end-flag is re-sampled to a real acoustic code so the model speaks for
 # exactly as long as its task needs — no arbitrary minimum-length floor.
@@ -592,6 +600,20 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                 logger.info(f"[ImageGen] Freed uncond KV: {state.uncond_seq_len} tokens")
             except Exception as e:
                 logger.warning(f"[ImageGen] Failed to free uncond KV: {e}")
+
+    def _trim_wav_tail(self, path):
+        """File-level twin of _trim_tail_pcm for the non-streamed decode path."""
+        try:
+            import scipy.io.wavfile as wavfile
+            sr, data = wavfile.read(path)
+            mono = data if data.ndim == 1 else data[:, 0]
+            pcm = mono.astype('<i2').tobytes()
+            trimmed = self._trim_tail_pcm(pcm)
+            if len(trimmed) < len(pcm):
+                import numpy as np
+                wavfile.write(path, sr, np.frombuffer(trimmed, dtype='<i2'))
+        except Exception:
+            pass  # trim is cosmetic; never fail the request over it
 
     def _trim_wav_lead(self, path):
         """Cut the rendered leading silence back to TTS_TRIM_LEAD_MS.
@@ -1104,6 +1126,8 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             )
             if TTS_TRIM_LEAD_MS > 0:
                 self._trim_wav_lead(save_path)
+            if TTS_TRIM_TAIL_MS > 0:
+                self._trim_wav_tail(save_path)
             logger.info(f"Audio saved to {save_path}")
             return save_path
 
@@ -1232,6 +1256,36 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                             f"{win_start}-{win_end} emit {s0/spf + win_start:.0f}-{emit_end} "
                             f"{nbytes}B vocode {time.time()-t0:.2f}s final={final}")
 
+    def _trim_tail_pcm(self, pcm: bytes) -> bytes:
+        """Cut trailing silence back to TTS_TRIM_TAIL_MS after the last active audio.
+
+        Same thresholds as the lead trim (10 ms windows, active = >2% of peak RMS).
+        Runs on the ASSEMBLED pcm at finalize — a live stream has already sent its
+        bytes, so this cleans the .wav every non-streaming client and artifact gets;
+        a streaming client simply stops when the stream ends."""
+        try:
+            import numpy as np
+            x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32767.0
+            sr = AUDIO_GEN_SAMPLING_RATE
+            win = max(1, int(sr * 0.010))
+            n_win = len(x) // win
+            if n_win < 3:
+                return pcm
+            rms = np.sqrt((x[: n_win * win].reshape(n_win, win) ** 2).mean(axis=1))
+            peak = rms.max()
+            if peak <= 0:
+                return pcm
+            active = np.nonzero(rms > 0.02 * peak)[0]
+            if len(active) == 0:
+                return pcm
+            keep_to = min(len(x), (int(active[-1]) + 1) * win + int(sr * TTS_TRIM_TAIL_MS / 1000))
+            if keep_to >= len(x):
+                return pcm
+            logger.info(f"[AudioGen] trimmed {(len(x)-keep_to)/sr:.2f}s of trailing silence")
+            return pcm[: keep_to * 2]  # int16 -> 2 bytes/sample
+        except Exception:
+            return pcm  # a failed trim must never fail the request
+
     def _stream_finalize(self, state) -> Optional[str]:
         """Emit the remainder, flush the tail, assemble the .wav from the streamed PCM."""
         self._stream_emit(state, final=True)
@@ -1247,6 +1301,8 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         import wave as _wave
         with open(part, "rb") as f:
             pcm = f.read()
+        if TTS_TRIM_TAIL_MS > 0:
+            pcm = self._trim_tail_pcm(pcm)
         with _wave.open(wav_path, "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
