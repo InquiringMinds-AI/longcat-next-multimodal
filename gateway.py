@@ -286,6 +286,7 @@ async def status():
             "refiner_steps": os.environ.get("REFINER_STEPS", "10"),
             "refiner_cfg_range": os.environ.get("LCN_REFINER_CFG_RANGE", "1.0,0.0"),
             "tts_stream": os.environ.get("LCN_TTS_STREAM", "1") != "0",
+            "tts_multi": os.environ.get("LCN_TTS_MULTI", "1") != "0",
             "tts_chunk_frames": os.environ.get("LCN_TTS_CHUNK_FRAMES", "25"),
         },
     })
