@@ -69,6 +69,11 @@ class AudioGenState:
     rounds: int = 1  # round counter (positive control + runaway bound)
     between_steps: int = 0  # decode steps spent in "between" mode awaiting the next round
     wants_eos: bool = False  # between-mode: the model's masked pick was EOS — close next step
+    past_transcripts: list = field(default_factory=list)  # per-round transcript token tuples:
+    # the loop detector — the model never CHOOSES to stop opening rounds (measured: 22+
+    # rounds, same ~30-frame segment, until the frame cap), so a round whose transcript
+    # substantially repeats an earlier round's marks the loop and closes the request
+    # BEFORE that round's audio is generated.
     prev_segment_tail: Optional[torch.Tensor] = None  # last frame of the banked segment:
     # round N+1's first frame conditions on it (the reference's audio_ids grow globally,
     # so its round N+1 feedback is round N's last frame; ours reset per segment)
@@ -2011,11 +2016,46 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                                 reason = "EOS"
                             else:
                                 reason = f"max ({state.max_transcript_steps})"
-                            logger.info(f"[AudioGen] req={req_idx}: transcript ended ({reason}) "
-                                       f"after {state.transcript_steps} steps, forcing audiotext_start")
-                            nl[:] = float('-inf')
-                            nl[self._audiotext_start_id] = 0.0
-                            state.transcript_done = True
+                            # Loop detection (multi-round): the model never CHOOSES to
+                            # stop opening rounds — measured 22+ rounds of the same
+                            # ~30-frame segment until the frame cap — so a transcript
+                            # that substantially repeats an earlier round's IS the stop
+                            # signal. Fuzzy (not exact) because recitation is sampled at
+                            # temp>0 and a looped sentence can vary by a token or two.
+                            # Closing here, BEFORE this round's audio, keeps the wav to
+                            # one rendition per sentence. Tradeoff accepted + logged: an
+                            # input that legitimately repeats a sentence verbatim ends
+                            # at the repeat.
+                            _cur = list(state.transcript_tokens)
+                            _looped = False
+                            if _LCN_TTS_MULTI and _cur and state.past_transcripts:
+                                import difflib
+                                for _past in state.past_transcripts:
+                                    r = difflib.SequenceMatcher(
+                                        None, _cur, list(_past)).ratio()
+                                    if r >= 0.8:
+                                        _looped = True
+                                        break
+                            _txt = "".join(self._decode_token(t) for t in _cur)[:120]
+                            if _looped:
+                                logger.info(f"[AudioGen] req={req_idx}: round "
+                                            f"{state.rounds} transcript repeats an "
+                                            f"earlier round ('{_txt}') — model is "
+                                            f"looping; closing after "
+                                            f"{len(state.done_segments)} segment(s)")
+                                nl[:] = float('-inf')
+                                nl[self._audiogen_end_id] = 0.0
+                                state.mode = "between"
+                                state.wants_eos = True
+                                state.between_steps = 0
+                            else:
+                                state.past_transcripts.append(tuple(_cur))
+                                logger.info(f"[AudioGen] req={req_idx}: transcript ended ({reason}) "
+                                           f"after {state.transcript_steps} steps "
+                                           f"('{_txt}'), forcing audiotext_start")
+                                nl[:] = float('-inf')
+                                nl[self._audiotext_start_id] = 0.0
+                                state.transcript_done = True
                         else:
                             # Emit the picked token as a one-hot. It passes through to the
                             # scheduler -> N-gram token table, so the next step's hash
@@ -2029,6 +2069,7 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                             if _LCN_VERBOSE and state.transcript_steps <= 12:
                                 logger.info(f"[AudioGen] req={req_idx}: transcript step {state.transcript_steps}, "
                                            f"emit={picked} ('{self._decode_token(picked)}')")
+                            state.transcript_tokens.append(picked)  # per-round; loop detector input
                             nl[:] = float('-inf')
                             nl[picked] = 0.0
                 elif forced_token == -3:
