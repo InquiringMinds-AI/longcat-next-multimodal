@@ -288,6 +288,7 @@ async def status():
             "tts_stream": os.environ.get("LCN_TTS_STREAM", "1") != "0",
             "tts_multi": os.environ.get("LCN_TTS_MULTI", "1") != "0",
             "tts_chunk_frames": os.environ.get("LCN_TTS_CHUNK_FRAMES", "25"),
+            "int8_heads": os.environ.get("LCN_INT8_HEADS", "0") == "1",
         },
     })
 

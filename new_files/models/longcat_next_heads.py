@@ -96,6 +96,13 @@ class CasualDepthTransformerLayer(nn.Module):
 
         _res = _x + res  # (bs, sl, d)
         res = self.layernorm2(_res)
+        # LCN_INT8_HEADS: the FFN is ~89% of layer bytes and runs per-slot at
+        # rows=batch, where int8 GEMV measured ~2.3x over bf16 on GB10 (see
+        # int8_head_ffn.py for scope + why attention stays bf16). Attached by
+        # attach_int8_ffn(); absent = the reference einsum path, byte-identical
+        # to before this feature existed.
+        if getattr(self, "_int8_ffn", None) is not None:
+            return _res + self._int8_ffn.forward(res)
         x = torch.einsum('bld,tld->blt', res, torch.reshape(self.linear1.weight, (self.transformer_ffn_scale * self.transformer_dim // self.depth, self.depth, self.transformer_dim)))
         x = torch.nn.functional.gelu(x)
         x = torch.einsum('blt,dlt->bld',x, torch.reshape(self.linear2.weight, (self.transformer_dim, self.depth, self.transformer_ffn_scale * self.transformer_dim // self.depth)))

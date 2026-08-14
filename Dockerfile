@@ -16,6 +16,7 @@ COPY new_files/models/longcat_next_mm.py        ${SG}/models/longcat_next_mm.py
 COPY new_files/models/longcat_next_audio.py     ${SG}/models/longcat_next_audio.py
 COPY new_files/models/longcat_next_visual.py    ${SG}/models/longcat_next_visual.py
 COPY new_files/models/longcat_next_heads.py     ${SG}/models/longcat_next_heads.py
+COPY new_files/models/int8_head_ffn.py          ${SG}/models/int8_head_ffn.py
 COPY new_files/models/longcat_next_processor.py ${SG}/models/longcat_next_processor.py
 COPY new_files/models/longcat_flash.py          ${SG}/models/longcat_flash.py
 COPY new_files/models/image_refiner.py          ${SG}/models/image_refiner.py

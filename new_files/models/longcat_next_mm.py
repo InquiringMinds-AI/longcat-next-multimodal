@@ -2969,6 +2969,18 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             total = self.config.num_hidden_layers
             self._dequant_layers_from_checkpoint(n_bf16_last, start_layer=total - n_bf16_last)
 
+        # LCN_INT8_HEADS: per-slot int8 for the depth-head FFNs; bf16 originals
+        # freed (~1.7GB back across both heads). Scope and measured basis in
+        # int8_head_ffn.py (bench: research/int8_heads/bench_depth_head.py).
+        # Default OFF — a generation-path change gated on the owner's paired A/B.
+        if os.environ.get('LCN_INT8_HEADS', '0').strip() == '1':
+            from sglang.srt.models.int8_head_ffn import attach_int8_ffn
+            for _name, _head in (("visual", self.visual_head), ("audio", self.audio_head)):
+                if _head is not None:
+                    _freed = attach_int8_ffn(_head, len(_head.codebook_sizes))
+                    logger.info(f"[INT8-HEADS] {_name} head FFN -> per-slot int8 "
+                                f"({_freed/(1<<20):.0f}MB bf16 freed)")
+
     def _dequant_layers_from_checkpoint(self, n_layers, start_layer=0):
         """Dequantize N layers starting from start_layer by reloading BF16 weights."""
         import os, glob
