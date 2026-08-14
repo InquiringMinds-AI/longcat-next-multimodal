@@ -2938,6 +2938,30 @@ Ceiling if the launch tax vanishes: step ~117→~75ms (−35% single image), wit
 the audio path inheriting the same structure. Gated like int8 was: offline
 bench first (analyze tooling: research/int8_heads/analyze_gap_trace.py).
 
+**Launch-tax remedies: dense-SDPA fast path (+5%) and per-level head CUDA graphs
+(+5.6% real), plus an instrument lesson that reframes both traces (2026-08-14).**
+Chronology, each step measured: (1) torch.compile reduce-overhead on the head is
+DEAD — ×0.47–1.10, slower than eager. (2) Graph capture failed twice, each
+failure naming a host copy: first the per-call seqlens H2D build in the layer,
+then the varlen fallback's .tolist() D2H (the image ships NO flash-attn — every
+head attention ran _sdpa_varlen_fallback with a per-call sync + Python loop).
+(3) The head's sequences are always equal-length, so varlen was never needed:
+dense batched SDPA is bit-identical (relerr 0.00e+00) — shipped eager, worth
+−5% e2e image and −32 host syncs/step. (4) GraphedHeadRunner (lcn_head_graph.py,
+commit 109d6fb after an nn.Module __setattr__ launch crash): lazy per-(bsz≤8,
+level) capture, shared pool, side-stream autotune warmup, capture-time
+replay-vs-eager torch.equal proof, permanent-eager fallback. All 16 graphs
+captured live; e2e image 139.4→131.6s (−5.6% real), audio steady-state flat.
+INSTRUMENT LESSON: the profiler INFLATES host-bound loops (~20ms/step on the
+eager build via per-op instrumentation) — profiled spans said 114→89ms while
+unprofiled e2e said ~94→~89; never quote profiled step time as ground truth
+when the loop is host-bound, and A/B under the SAME instrumentation only.
+Day's image total: 159.8 → 131.6s warm (−17.6%). Remaining idle (~19ms
+profiled, less real) is sync points + the BACKBONE's eager launch stream —
+which the generation graph-veto forces; relaxing that veto (backbone replay
+while the mm state machines run) is the one big lever left, and it is deep
+surgery into the 2026-07 spec/graph machinery. Not started.
+
 Residuals, recorded not actioned: (a) the original awkward clip's ~0 ms slammed
 join was not reproduced; if slams recur, the shelf fix is a MINIMUM-pause floor
 (insert silence only under ~200 ms, leaving the model's longer choices alone) —
