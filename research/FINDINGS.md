@@ -2875,6 +2875,31 @@ exactly 2/3/4 rounds with full sentences in every round log, selftest 7/7,
 degeneracy 6/6. Observed and flagged to owner, not self-judged: the one-word clips
 render QUIET (peak 0.06/0.14 vs ~0.4 typical).
 
+**int8 depth-head FFN: benched, built, measured (2026-08-14, build v0516-int8h,
+commit 4cfa813; owner A/B pending).** The ROADMAP-gated micro-bench ran first
+(research/int8_heads/bench_depth_head.py, model unloaded, COLD reads — the first
+sweep timed cache-warm weights and implied >800 GB/s, rewritten to cycle ≥512MB
+of copies per shape). Findings that set the scope: the depth head is the frame
+majority on BOTH paths (visual ~52ms of 174ms/frame — matching the 51.6ms
+production number — audio ~135ms of 177ms at B=1); int8 GEMV is ×2.37/×2.27
+over bf16 at 1–4 rows but LOSES at 8+ rows (×0.82). Attention runs at
+rows=8×batch → stays bf16; the FFN einsum decomposes to per-slot GEMVs at
+rows=batch and holds ~89% of transformer bytes → quantized (per-slot,
+per-channel symmetric, runtime; the einsum's ignored .bias ignored identically;
+bf16 originals freed — 1024MB visual + 2304MB audio measured back at load).
+Output heads stay bf16 for quality. Env LCN_INT8_HEADS, default OFF; /status
+reports it; unit gate test_int8_ffn.py (relerr ~1.3e-2 at quantization noise,
+slot-shuffled negative control ~100× worse).
+
+Paired arms on the same build (identical prompts, flag the only change):
+image cafe warm 147.2s vs 159.8s (−7.9%); TTS normalized per audio byte
+(lengths differ — the ON storm clip generated 24% MORE audio): coffee −34%,
+storm −36%, matching the bench's audio prediction. First-image pair invalid
+(ON additionally paid one-time Triton autotune). Selftest 7/7 on the ON arm.
+Net: TTS is the headline (frame ~177→~115ms), image modest, +3.3GB memory.
+Eight paired artifacts delivered to the owner; the flag stays OFF in
+production until that verdict.
+
 Residuals, recorded not actioned: (a) the original awkward clip's ~0 ms slammed
 join was not reproduced; if slams recur, the shelf fix is a MINIMUM-pause floor
 (insert silence only under ~200 ms, leaving the model's longer choices alone) —
