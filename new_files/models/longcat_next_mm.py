@@ -1057,6 +1057,16 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             # Use lazy_decode_and_save from the audio tokenizer
             _tag = state.rid or str(int(time.time()))
             save_path = f"{os.environ.get('LCN_OUTPUT_DIR', '/tmp')}/longcat_tts_{_tag}.wav"
+            # LCN_TTS_DUMP_IDS=1 (debug): persist the raw codebook ids beside the wav.
+            # Exists for the streaming-vocoder work: chunked vocoding changes the audio
+            # math (the flow-matching decoder sees a window, not the utterance), so its
+            # quality gate needs PERFECTLY PAIRED artifacts — the same generation's ids
+            # vocoded full vs chunked, isolating the windowing as the only variable.
+            # That pairing is only possible if the ids survive the request.
+            if os.environ.get("LCN_TTS_DUMP_IDS", "0").strip() == "1":
+                torch.save(raw_ids.cpu(), save_path.replace(".wav", ".ids.pt"))
+                logger.info(f"[AudioGen] dumped {raw_ids.shape[0]} frames of codebook ids "
+                            f"to {save_path.replace('.wav', '.ids.pt')}")
             self.audio_tokenizer.lazy_decode_and_save(
                 raw_ids,
                 sampling_rate=AUDIO_GEN_SAMPLING_RATE,
