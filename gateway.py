@@ -221,7 +221,7 @@ async def _prewarm_task():
         async with _gen_slots:
             r = await _client.post(SGLANG + "/generate", json={
                 "text": _tts_prompt("Ready."), "audio_data": [DEFAULT_VOICE],
-                "sampling_params": {"max_new_tokens": 1200, "temperature": 0.5,
+                "sampling_params": {"max_new_tokens": 2048, "temperature": 0.5,
                                     "top_k": 5, "top_p": 0.85}})
         if r.status_code != 200:
             raise RuntimeError("backend error: " + r.text[:200])
@@ -361,7 +361,7 @@ async def audio_speech(req: Request):
     ref = _resolve_voice(voice)
     prompt = _tts_prompt(text)
     sg_body = {"text": prompt, "audio_data": [ref],
-               "sampling_params": {"max_new_tokens": 1200, "temperature": 0.5,
+               "sampling_params": {"max_new_tokens": 2048, "temperature": 0.5,
                                    "top_k": 5, "top_p": 0.85}}
     if body.get("stream"):
         return await _audio_speech_stream(sg_body, body)

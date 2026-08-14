@@ -74,6 +74,11 @@ class AudioGenState:
     # the coverage/repeat stops apply. Without it (voice chat, free speech via raw
     # /generate), the model composing new sentences is the POINT — no content stops;
     # the caller's max_new_tokens, the frame cap, and the model's own EOS intent bound it.
+    coverage_pos: int = 0  # char offset into prompt_norm reached by recitation so far:
+    # each round must CONTINUE from (about) here — recitation is sequential, so a round
+    # found only BEHIND this position is a re-read (measured: fragment re-recitations
+    # passed both a repeat check and unpositioned containment) and one found nowhere is
+    # invention; both close the request.
     prompt_norm: str = ""  # normalized request text, captured at the prefill that opened
     # audio mode. The coverage stop: a round transcript NOT found in it is the model
     # AUTHORING A CONTINUATION (measured: after reciting all 4 input sentences it wrote
@@ -2078,14 +2083,33 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                                     and _cur and state.prompt_norm:
                                 _tn = self._norm_tts_text("".join(
                                     self._decode_token(t) for t in _cur))
-                                if _tn and _tn not in state.prompt_norm:
-                                    import difflib
-                                    m = difflib.SequenceMatcher(
-                                        None, _tn, state.prompt_norm).find_longest_match(
-                                        0, len(_tn), 0, len(state.prompt_norm))
-                                    if m.size / max(len(_tn), 1) < 0.7:
-                                        _looped = True
-                                        _reason2 = "is not in the request text (model is authoring a continuation)"
+                                # POSITIONED coverage: recitation is sequential, so the
+                                # round must continue from (about) where the last ended.
+                                # A small backward slack tolerates overlapping fragment
+                                # boundaries; a round found only far behind is a re-read
+                                # (fragment re-recitations passed both the repeat check
+                                # and unpositioned containment), nowhere is invention,
+                                # and a punctuation-only round is degeneracy. All close.
+                                _from = max(0, state.coverage_pos - 20)
+                                if not _tn:
+                                    _looped = True
+                                    _reason2 = "is empty/punctuation-only (degenerate round)"
+                                else:
+                                    _idx = state.prompt_norm.find(_tn, _from)
+                                    if _idx >= 0:
+                                        state.coverage_pos = _idx + len(_tn)
+                                    else:
+                                        import difflib
+                                        _rem = state.prompt_norm[_from:]
+                                        m = difflib.SequenceMatcher(
+                                            None, _tn, _rem).find_longest_match(
+                                            0, len(_tn), 0, len(_rem))
+                                        if m.size / max(len(_tn), 1) >= 0.7:
+                                            state.coverage_pos = _from + m.b + m.size
+                                        else:
+                                            _looped = True
+                                            _reason2 = ("is not in the remaining request text "
+                                                        "(re-read or authored continuation)")
                             if _looped:
                                 logger.info(f"[AudioGen] req={req_idx}: round "
                                             f"{state.rounds} transcript {_reason2} "
@@ -2295,37 +2319,50 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
             if token == self._audiogen_start_id:
                 self._trigger_sticky = False  # latch consumed (see __init__)
                 if state is not None and state.mode == "between":
-                    # Round N+1: the model chose to keep going after audiogen_end.
-                    # REUSE the state — done_segments and the held stream tail are the
-                    # request's accumulated audio; a fresh state would orphan them.
-                    state.mode = "transcript"
-                    state.rounds += 1
-                    state.between_steps = 0
-                    state.transcript_done = False
-                    state.transcript_steps = 0
-                    state.transcript_tokens = []
-                    state.end_run = 0
-                    state.ended = False
-                    state.first_end_flag_step = -1
-                    state.end_flag_resamples = 0
-                    # Positive control: single-round and multi-round generations are
-                    # otherwise indistinguishable until the wav is played.
-                    logger.info(f"[AudioGen] req={req_idx}: ROUND {state.rounds} — model "
-                                f"opened another transcript after {len(state.done_segments)} "
-                                f"banked segment(s)")
+                    if state.wants_eos or state.rounds >= TTS_MAX_ROUNDS:
+                        # We are CLOSING this request (loop/coverage stop or round
+                        # bound) — the model asking for another round does not reopen
+                        # it. Without this check the close never happened: the stop
+                        # forced audiogen_end, the model answered audiogen_start, and
+                        # the reuse path reset the state right back to transcript mode
+                        # — measured as 150+ reopen/close cycles at ~10/s, the token
+                        # budget expiring before any wav was written. Fall THROUGH to
+                        # the between watcher, which finalizes and ends the request.
+                        state.wants_eos = True  # covers the rounds-bound case too
+                    else:
+                        # Round N+1: the model chose to keep going after audiogen_end.
+                        # REUSE the state — done_segments and the held stream tail are
+                        # the request's accumulated audio; a fresh state would orphan
+                        # them.
+                        state.mode = "transcript"
+                        state.rounds += 1
+                        state.between_steps = 0
+                        state.transcript_done = False
+                        state.transcript_steps = 0
+                        state.transcript_tokens = []
+                        state.end_run = 0
+                        state.ended = False
+                        state.first_end_flag_step = -1
+                        state.end_flag_resamples = 0
+                        # Positive control: single-round and multi-round generations
+                        # are otherwise indistinguishable until the wav is played.
+                        logger.info(f"[AudioGen] req={req_idx}: ROUND {state.rounds} — model "
+                                    f"opened another transcript after {len(state.done_segments)} "
+                                    f"banked segment(s)")
+                        continue
+                else:
+                    # Enter audio mode — start transcript phase
+                    # Let lm_head generate text normally (transcript of what to speak)
+                    state = AudioGenState(mode="transcript")
+                    # Stamp the owning request AT CREATION. rid was previously only set
+                    # at completion (for the output filename), so stale-state eviction
+                    # had nothing to compare against while the state was live -- which
+                    # is exactly when the comparison is needed.
+                    state.rid = self._rid_for(req_idx, forward_batch)
+                    self._audio_gen_states[req_idx] = state
+                    logger.info(f"[AudioGen] req={req_idx}: entered audio mode, starting transcript phase")
+                    # No override — let lm_head generate transcript text
                     continue
-                # Enter audio mode — start transcript phase
-                # Let lm_head generate text normally (transcript of what to speak)
-                state = AudioGenState(mode="transcript")
-                # Stamp the owning request AT CREATION. rid was previously only set at
-                # completion (for the output filename), so stale-state eviction had nothing
-                # to compare against while the state was live -- which is exactly when the
-                # comparison is needed.
-                state.rid = self._rid_for(req_idx, forward_batch)
-                self._audio_gen_states[req_idx] = state
-                logger.info(f"[AudioGen] req={req_idx}: entered audio mode, starting transcript phase")
-                # No override — let lm_head generate transcript text
-                continue
 
             if token == self._audiotext_start_id and state is not None \
                     and state.mode == "transcript":
