@@ -991,7 +991,7 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
 
         for level in range(num_codebooks):
             # Run audio head at this level
-            logits = self.audio_head(
+            logits = self._audio_head_call(
                 hidden_state,
                 next_token_ids,
                 self._codebook_embed_fn,
@@ -1490,7 +1490,7 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
         next_token_ids = torch.zeros(bs, num_codebooks, dtype=torch.long, device=device)
 
         for level in range(num_codebooks):
-            logits = self.visual_head(
+            logits = self._visual_head_call(
                 batched_hidden, next_token_ids, self._codebook_embed_fn, level,
             )
 
@@ -2980,6 +2980,22 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                     _freed = attach_int8_ffn(_head, len(_head.codebook_sizes))
                     logger.info(f"[INT8-HEADS] {_name} head FFN -> per-slot int8 "
                                 f"({_freed/(1<<20):.0f}MB bf16 freed)")
+
+        # LCN_HEAD_GRAPH: CUDA-graph replay of the per-level head forward — the
+        # generation step is launch-latency-bound (~4.4k launches, ~42ms/step
+        # distributed idle; see lcn_head_graph.py). The call sites route through
+        # these attrs; without the flag they are the bare heads (zero-cost).
+        self._visual_head_call = self.visual_head
+        self._audio_head_call = self.audio_head
+        if os.environ.get('LCN_HEAD_GRAPH', '0').strip() == '1':
+            from sglang.srt.models.lcn_head_graph import GraphedHeadRunner
+            if self.visual_head is not None:
+                self._visual_head_call = GraphedHeadRunner(
+                    self.visual_head, len(self.visual_head.codebook_sizes), "visual")
+            if self.audio_head is not None:
+                self._audio_head_call = GraphedHeadRunner(
+                    self.audio_head, len(self.audio_head.codebook_sizes), "audio")
+            logger.info("[HeadGraph] enabled — graphs capture lazily per (bsz, level)")
 
     def _dequant_layers_from_checkpoint(self, n_layers, start_layer=0):
         """Dequantize N layers starting from start_layer by reloading BF16 weights."""
