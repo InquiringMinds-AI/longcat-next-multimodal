@@ -2900,6 +2900,14 @@ Net: TTS is the headline (frame ~177→~115ms), image modest, +3.3GB memory.
 Eight paired artifacts delivered to the owner; the flag stays OFF in
 production until that verdict.
 
+Memory caveat from the first default-ON production launch: the +3.3GB is
+ALLOCATOR-level (bf16 storages replaced with empty tensors), and MemAvailable
+did not cleanly reflect it — 4.7GB steady with prewarm vs 5.6GB on the
+previous (bf16) prewarm launch and ~3.96GB recorded for the all-modality
+steady state historically. Launch-to-launch MemAvailable varies by GBs; claim
+the tensor-level free, not system headroom. Corroboration that the speed is
+real, from prewarm itself: image warm 239.9s→216.4s, audio warm 20.1s→16.3s.
+
 **Owner verdict (2026-08-14): APPROVED — "all in all, the examples are all up
 to standard." Default flipped ON** (entrypoint export, up-script passthrough,
 /status fallback; library default in the model code stays 0). One observation
