@@ -2838,3 +2838,30 @@ caller's max_new_tokens, frame cap, and the model's own EOS intent.
 
 Clip durations landed on prediction: 4.75 / 6.72 / 9.23 s for 2/3/4 sentences (vs 2.0 /
 1.6 / 4.4 s truncated before the fix). Owner listen on the segment joins pending.
+
+**Join listen and the pause A/B (2026-08-14): joins ACQUITTED, no serving change.**
+Owner's first listen: "the prosody of the joins in multi 4 make it really awkward."
+Measurement showed the mechanism was faithful (our cross-fade join mirrors the
+reference's decode_save_concat2 exactly; ours 1200 samples vs its 800) but the
+inter-sentence pause is UNCONTROLLED — it is whatever trailing/leading silence the
+model generated around each end flag, and across the delivered clips it ranged
+from ~0 ms (two sentences slammed together in the awkward multi-4) to ~510 ms.
+
+Discriminating instrument (research/tts_streaming/join_variants.py): one fresh
+4-sentence generation with LCN_TTS_DUMP_IDS=1, same codebook ids vocoded per
+segment, joined two ways — `ship` (the shipping cross-fade; pauses came out
+360/770/1330 ms) and `gap` (segment edges silence-trimmed to zero, uniform 300 ms
+inserted). Verdict: **"I like ship better than gap. gap is acceptable, but the
+pacing in ship matches the prosody."** The model's pause lengths are part of its
+prosodic delivery; normalizing them away made it worse. No change shipped —
+ship IS current behavior.
+
+Residuals, recorded not actioned: (a) the original awkward clip's ~0 ms slammed
+join was not reproduced; if slams recur, the shelf fix is a MINIMUM-pause floor
+(insert silence only under ~200 ms, leaving the model's longer choices alone) —
+preserves the preferred pacing, guards only the degenerate draw. (b) The model
+also generates long pauses INSIDE sentences (a 1.08 s mid-sentence pause in this
+generation's last segment, present in both variants) — model delivery, unreachable
+by any join treatment. (c) Reference includes the end-flag row inside each vocoded
+chunk (end = pos+1); we drop it — audibly indistinguishable in every clip to date,
+parked.
