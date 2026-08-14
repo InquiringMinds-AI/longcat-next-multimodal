@@ -69,6 +69,11 @@ class AudioGenState:
     rounds: int = 1  # round counter (positive control + runaway bound)
     between_steps: int = 0  # decode steps spent in "between" mode awaiting the next round
     wants_eos: bool = False  # between-mode: the model's masked pick was EOS — close next step
+    recitation: bool = False  # the prompt carries the TTS instruction ("synthesize the
+    # following content with this voice") → the transcript is a RECITATION CONTRACT and
+    # the coverage/repeat stops apply. Without it (voice chat, free speech via raw
+    # /generate), the model composing new sentences is the POINT — no content stops;
+    # the caller's max_new_tokens, the frame cap, and the model's own EOS intent bound it.
     prompt_norm: str = ""  # normalized request text, captured at the prefill that opened
     # audio mode. The coverage stop: a round transcript NOT found in it is the model
     # AUTHORING A CONTINUATION (measured: after reciting all 4 input sentences it wrote
@@ -2052,7 +2057,8 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                             _cur = list(state.transcript_tokens)
                             _looped = False
                             _reason2 = ""
-                            if _LCN_TTS_MULTI and _cur and state.past_transcripts:
+                            if _LCN_TTS_MULTI and state.recitation and _cur \
+                                    and state.past_transcripts:
                                 import difflib
                                 for _past in state.past_transcripts:
                                     r = difflib.SequenceMatcher(
@@ -2068,7 +2074,8 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                             # measured: 20+ rounds of freshly invented story). Fuzzy
                             # (containment, else longest-common-substring ratio) because
                             # recitation drifts on punctuation, never on words.
-                            if _LCN_TTS_MULTI and not _looped and _cur and state.prompt_norm:
+                            if _LCN_TTS_MULTI and state.recitation and not _looped \
+                                    and _cur and state.prompt_norm:
                                 _tn = self._norm_tts_text("".join(
                                     self._decode_token(t) for t in _cur))
                                 if _tn and _tn not in state.prompt_norm:
@@ -2511,8 +2518,15 @@ class LongcatNextForCausalLM(LongcatFlashForCausalLM):
                     # transcript coverage stop — TTS prompts are single-chunk, so the
                     # extend region IS the whole prompt.
                     try:
-                        state.prompt_norm = self._norm_tts_text(
-                            self._decode_ids(input_ids[offset:last_token_pos + 1].tolist()))
+                        _raw_prompt = self._decode_ids(
+                            input_ids[offset:last_token_pos + 1].tolist())
+                        state.prompt_norm = self._norm_tts_text(_raw_prompt)
+                        # Recitation vs free speech, decided by the request itself: the
+                        # TTS instruction (the model card's own phrasing, used by the
+                        # gateway, prewarm, and the documented raw-/generate shape)
+                        # marks a recitation contract. Voice chat and other open-ended
+                        # audio generation lack it and get NO content stops.
+                        state.recitation = "用这个声音合成以下内容" in _raw_prompt
                     except Exception:
                         state.prompt_norm = ""  # coverage stop disabled; budget/frames still bound
                     self._audio_gen_states[req_idx] = state
